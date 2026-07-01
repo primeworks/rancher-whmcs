@@ -51,88 +51,103 @@ class DomainOrderManager
     }
 
     // -----------------------------------------------------------------------
-    // Payment (WHMCS)
+    // Payment (WHMCS credit balance)
     // -----------------------------------------------------------------------
 
+    /**
+     * Charges the client's WHMCS credit balance.
+     * Creates a paid invoice for the paper trail.
+     */
     public function capturePayment($clientId, $amount, $currencyCode, $description)
     {
+        $clientId = (int)$clientId;
+        $amount   = round((float)$amount, 2);
+
+        // Check balance
+        try {
+            $credit  = \WHMCS\Database\Capsule::table('tblclients')->where('id', $clientId)->value('credit');
+            $balance = $credit !== null ? (float)$credit : 0.0;
+        } catch (\Exception $e) {
+            return array('success' => false, 'error' => 'Could not read credit balance: ' . $e->getMessage());
+        }
+
+        if ($balance < $amount) {
+            return array(
+                'success' => false,
+                'error'   => 'Insufficient credit balance. Available: $' . number_format($balance, 2)
+                           . ', required: $' . number_format($amount, 2) . '.',
+            );
+        }
+
+        // Create invoice
         try {
             $invoiceResult = localAPI('CreateInvoice', array(
-                'userid'            => $clientId,
-                'status'            => 'Unpaid',
-                'itemdescription1'  => $description,
-                'itemamount1'       => $amount,
-                'itemtaxed1'        => false,
-                'paymentmethod'     => '',
+                'userid'           => $clientId,
+                'status'           => 'Unpaid',
+                'itemdescription1' => $description,
+                'itemamount1'      => $amount,
+                'itemtaxed1'       => false,
+                'paymentmethod'    => 'credit',
             ));
-
             if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
-                return array(
-                    'success' => false,
-                    'error'   => 'Failed to create invoice: ' . (isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult)),
-                );
+                $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
+                return array('success' => false, 'error' => 'Could not create invoice: ' . $err);
             }
-
             $invoiceId = (int)$invoiceResult['invoiceid'];
-
-            $captureResult = localAPI('CaptureRemoteCardPayment', array(
-                'invoiceid' => $invoiceId,
-            ));
-
-            if (!isset($captureResult['result']) || $captureResult['result'] !== 'success') {
-                $error = isset($captureResult['message']) ? $captureResult['message'] : json_encode($captureResult);
-                Logger::info("DomainOrderManager: capture FAILED invoice={$invoiceId} client={$clientId} error={$error}");
-                return array('success' => false, 'invoiceId' => $invoiceId, 'error' => $error);
-            }
-
-            $transactionId = $this->findTransactionIdForInvoice($invoiceId);
-
-            Logger::info("DomainOrderManager: capture SUCCESS invoice={$invoiceId} client={$clientId} amount={$amount} txn={$transactionId}");
-
-            return array('success' => true, 'invoiceId' => $invoiceId, 'transactionId' => $transactionId);
-
         } catch (\Exception $e) {
-            Logger::error("DomainOrderManager: capturePayment exception: " . $e->getMessage());
+            return array('success' => false, 'error' => 'Invoice creation error: ' . $e->getMessage());
+        }
+
+        // Apply credit to invoice atomically — deducts balance and marks paid.
+        try {
+            $creditResult = localAPI('ApplyCredit', array(
+                'invoiceid' => $invoiceId,
+                'amount'    => number_format($amount, 2, '.', ''),
+                'noemail'   => true,
+            ));
+            if (!isset($creditResult['result']) || $creditResult['result'] !== 'success') {
+                $err = isset($creditResult['message']) ? $creditResult['message'] : json_encode($creditResult);
+                try { localAPI('UpdateInvoice', array('invoiceid' => $invoiceId, 'status' => 'Cancelled')); } catch (\Exception $ve) {}
+                return array('success' => false, 'error' => 'Credit deduction failed: ' . $err);
+            }
+        } catch (\Exception $e) {
+            try { localAPI('UpdateInvoice', array('invoiceid' => $invoiceId, 'status' => 'Cancelled')); } catch (\Exception $ve) {}
+            return array('success' => false, 'error' => 'Credit deduction error: ' . $e->getMessage());
+        }
+
+        Logger::info("DomainOrderManager: charged \${$amount} from client {$clientId} credit, invoice #{$invoiceId}");
+        return array('success' => true, 'invoiceId' => $invoiceId, 'transactionId' => 'credit');
+    }
+
+    public function refundPayment($invoiceId, $transactionId, $amount)
+    {
+        try {
+            $clientId = \WHMCS\Database\Capsule::table('tblinvoices')->where('id', (int)$invoiceId)->value('userid');
+            if (!$clientId) {
+                return array('success' => false, 'error' => 'Invoice not found');
+            }
+            $result = localAPI('AddCredit', array(
+                'clientid'    => (int)$clientId,
+                'description' => 'Refund for invoice #' . $invoiceId . ' — domain order could not be completed',
+                'amount'      => round((float)$amount, 2),
+            ));
+            if (!isset($result['result']) || $result['result'] !== 'success') {
+                $err = isset($result['message']) ? $result['message'] : json_encode($result);
+                Logger::error("DomainOrderManager: credit refund failed invoice #{$invoiceId}: {$err}");
+                return array('success' => false, 'error' => $err);
+            }
+            try { localAPI('UpdateInvoice', array('invoiceid' => $invoiceId, 'status' => 'Cancelled')); } catch (\Exception $e) {}
+            Logger::info("DomainOrderManager: refunded \${$amount} credit to client {$clientId} invoice #{$invoiceId}");
+            return array('success' => true, 'refundTransactionId' => 'credit-refund');
+        } catch (\Exception $e) {
+            Logger::error("DomainOrderManager: refundPayment exception: " . $e->getMessage());
             return array('success' => false, 'error' => $e->getMessage());
         }
     }
 
     private function findTransactionIdForInvoice($invoiceId)
     {
-        try {
-            $txn = \WHMCS\Database\Capsule::table('tblaccounts')
-                ->where('invoiceid', $invoiceId)
-                ->orderBy('id', 'desc')
-                ->first();
-            return $txn ? $txn->transid : '';
-        } catch (\Exception $e) {
-            return '';
-        }
-    }
-
-    public function refundPayment($invoiceId, $transactionId, $amount)
-    {
-        try {
-            $result = localAPI('RefundTransaction', array(
-                'transid'    => $transactionId,
-                'refundtype' => 'remote',
-                'amount'     => $amount,
-                'inputbox'   => 'Domain order could not be completed after repeated attempts',
-            ));
-
-            if (!isset($result['result']) || $result['result'] !== 'success') {
-                $error = isset($result['message']) ? $result['message'] : json_encode($result);
-                Logger::error("DomainOrderManager: refund FAILED invoice={$invoiceId} txn={$transactionId} error={$error}");
-                return array('success' => false, 'error' => $error);
-            }
-
-            Logger::info("DomainOrderManager: refund SUCCESS invoice={$invoiceId} txn={$transactionId} amount={$amount}");
-            return array('success' => true, 'refundTransactionId' => isset($result['refundtransid']) ? $result['refundtransid'] : '');
-
-        } catch (\Exception $e) {
-            Logger::error("DomainOrderManager: refundPayment exception: " . $e->getMessage());
-            return array('success' => false, 'error' => $e->getMessage());
-        }
+        return 'credit';
     }
 
     // -----------------------------------------------------------------------

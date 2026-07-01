@@ -16,143 +16,8 @@ if (!defined('WHMCS')) {
     die('This file cannot be accessed directly.');
 }
 
-require_once ROOTDIR . '/modules/servers/rancherfleet/lib/Logger.php';
-require_once ROOTDIR . '/modules/servers/rancherfleet/lib/RetryQueue.php';
-
-// ---------------------------------------------------------------------------
-// Migration AJAX Hook
-// ---------------------------------------------------------------------------
-
-if (!class_exists('RfmAjaxHandler')) {
-    class RfmAjaxHandler
-    {
-        public static function buildClients()
-        {
-            $server = \WHMCS\Database\Capsule::table('tblservers')
-                ->where('type', 'rancherfleet')
-                ->where('active', 1)
-                ->first();
-            if (!$server) {
-                throw new \Exception('No active RancherFleet server found.');
-            }
-            $server    = (array)$server;
-            $hash      = json_decode(isset($server['accesshash']) ? $server['accesshash'] : '{}', true);
-            $url       = 'https://' . rtrim($server['hostname'], '/');
-            $token     = $server['password'];
-            $clusterId = isset($hash['target_cluster_id']) ? $hash['target_cluster_id'] : (isset($hash['cluster_id']) ? $hash['cluster_id'] : '');
-            $rancher   = new \RancherFleet\RancherClient($url, $token, $clusterId);
-            $exec      = new \RancherFleet\Migration\RancherExec($rancher, $clusterId);
-            return array($rancher, $exec, $clusterId);
-        }
-
-        public static function buildDepInfo($exec, $ns, $dep)
-        {
-            $r = $exec->getDeploymentRaw($ns, $dep);
-            $containers = isset($r['spec']['template']['spec']['containers']) ? $r['spec']['template']['spec']['containers'] : array();
-            $cname = $dep; $image = '';
-            foreach ($containers as $c) {
-                $cname = isset($c['name'])  ? $c['name']  : $dep;
-                $image = isset($c['image']) ? $c['image'] : '';
-                break;
-            }
-            return array(
-                'name'           => $dep,
-                'namespace'      => $ns,
-                'image'          => $image,
-                'container_name' => $cname,
-                'replicas'       => isset($r['spec']['replicas'])        ? (int)$r['spec']['replicas']        : 0,
-                'ready'          => isset($r['status']['readyReplicas']) ? (int)$r['status']['readyReplicas'] : 0,
-            );
-        }
-
-        public static function handle($action)
-        {
-            switch ($action) {
-                case 'get_deployments':
-                    list($rancher, $exec) = self::buildClients();
-                    return array('success' => true, 'deployments' => $exec->discoverOdooDeployments());
-
-                case 'get_databases':
-                    $ns  = isset($_POST['namespace'])  ? $_POST['namespace']  : '';
-                    $dep = isset($_POST['deployment']) ? $_POST['deployment'] : '';
-                    list($rancher, $exec) = self::buildClients();
-                    $pod = $exec->getRunningPod($ns, $dep);
-                    if (!$pod) {
-                        return array('success' => false, 'error' => 'No running pod found. Deployment may be suspended.');
-                    }
-                    $podName    = $pod['metadata']['name'];
-                    $containers = isset($pod['spec']['containers']) ? $pod['spec']['containers'] : array();
-                    $cname      = $dep;
-                    foreach ($containers as $c) { $cname = isset($c['name']) ? $c['name'] : $dep; break; }
-                    $envVars  = $exec->getPodEnvVars($pod, $cname);
-                    $dbConfig = $exec->extractDbConfig($envVars);
-                    $dbs      = $exec->listDatabases($ns, $podName, $cname, $dbConfig);
-                    $fs       = $exec->detectFilestore($ns, $dep);
-                    return array(
-                        'success'   => true,
-                        'databases' => array_values($dbs),
-                        'db_host'   => $dbConfig['host'],
-                        'db_port'   => $dbConfig['port'],
-                        'db_user'   => $dbConfig['user'],
-                        'pod_name'  => $podName,
-                        'container' => $cname,
-                        'filestore' => $fs,
-                    );
-
-                case 'run_safety_tests':
-                    $sourceNs  = isset($_POST['source_ns'])  ? $_POST['source_ns']  : '';
-                    $sourceDep = isset($_POST['source_dep']) ? $_POST['source_dep'] : '';
-                    $sourceDb  = isset($_POST['source_db'])  ? $_POST['source_db']  : '';
-                    $destNs    = isset($_POST['dest_ns'])    ? $_POST['dest_ns']    : '';
-                    $destDep   = isset($_POST['dest_dep'])   ? $_POST['dest_dep']   : '';
-                    $destDb    = isset($_POST['dest_db'])    ? $_POST['dest_db']    : '';
-                    $overwrite = isset($_POST['overwrite'])  && $_POST['overwrite'] === '1';
-                    list($rancher, $exec) = self::buildClients();
-                    $si      = self::buildDepInfo($exec, $sourceNs, $sourceDep);
-                    $di      = self::buildDepInfo($exec, $destNs,   $destDep);
-                    $checker = new \RancherFleet\Migration\MigrationSafetyChecker($exec, $rancher);
-                    $results = $checker->runAll($si, $di, array(
-                        'source_db' => $sourceDb, 'dest_db' => $destDb, 'allow_overwrite' => $overwrite,
-                    ));
-                    return array(
-                        'success'     => true,
-                        'results'     => $results,
-                        'summary'     => \RancherFleet\Migration\MigrationSafetyChecker::summary($results),
-                        'can_migrate' => \RancherFleet\Migration\MigrationSafetyChecker::allPassed($results),
-                    );
-
-                case 'run_migration':
-                    require_once ROOTDIR . '/modules/addons/rancherfleet_migration/rancherfleet_migration.php';
-                    return rfm_ajaxRunMigration();
-
-                default:
-                    return array('success' => false, 'error' => 'Unknown action: ' . $action);
-            }
-        }
-    }
-}
-
-add_hook('AdminAreaPage', 1, function($vars) {
-    if (!isset($_GET['rfm_ajax'])) return;
-    if (!isset($_GET['module']) || $_GET['module'] !== 'rancherfleet_migration') return;
-    $action = isset($_POST['rfm_action']) ? $_POST['rfm_action'] : '';
-    if (!$action) return;
-
-    require_once ROOTDIR . '/modules/servers/rancherfleet/lib/RancherClient.php';
-    require_once ROOTDIR . '/modules/addons/rancherfleet_migration/RancherExec.php';
-    require_once ROOTDIR . '/modules/addons/rancherfleet_migration/MigrationSafetyChecker.php';
-
-    try {
-        $response = RfmAjaxHandler::handle($action);
-    } catch (\Exception $e) {
-        $response = array('success' => false, 'error' => $e->getMessage());
-    }
-
-    while (ob_get_level() > 0) { ob_end_clean(); }
-    header('Content-Type: application/json');
-    echo json_encode($response);
-    exit;
-});
+require_once __DIR__ . '/../../modules/servers/rancherfleet/lib/Logger.php';
+require_once __DIR__ . '/../../modules/servers/rancherfleet/lib/RetryQueue.php';
 
 // ---------------------------------------------------------------------------
 // Hook 1: Cron — Process Retry Queue
@@ -172,7 +37,7 @@ add_hook('CronJob', 1, function($vars) {
 
     // Load WHMCS module functions
     if (!function_exists('rancherfleet_CreateNamespace')) {
-        @include_once ROOTDIR . '/modules/servers/rancherfleet/rancherfleet.php';
+        @include_once __DIR__ . '/../../modules/servers/rancherfleet/rancherfleet.php';
     }
 
     foreach ($dueEntries as $entry) {
@@ -212,66 +77,6 @@ add_hook('CronJob', 1, function($vars) {
         } catch (\Exception $e) {
             RancherFleet\Logger::error("RetryQueue cron: exception for service={$serviceId}: " . $e->getMessage());
             RancherFleet\RetryQueue::enqueue($serviceId, $phase, $namespace, $e->getMessage());
-        }
-    }
-});
-
-// ---------------------------------------------------------------------------
-// Hook 1b: Cron — Process Pending Domain Orders
-// ---------------------------------------------------------------------------
-
-/**
- * Independent from the infrastructure RetryQueue above — domain orders
- * already have a captured customer payment and a hard attempt cap that
- * triggers a refund, which is different enough in shape from the
- * uncapped, no-money infrastructure retries that a separate store
- * (DomainRetryStore) and a separate cron pass are used rather than
- * threading domain orders through the same queue.
- */
-add_hook('CronJob', 1, function($vars) {
-    require_once ROOTDIR . '/modules/servers/rancherfleet/lib/Domains/ResellersPanelClient.php';
-    require_once ROOTDIR . '/modules/servers/rancherfleet/lib/Domains/CloudflareClient.php';
-    require_once ROOTDIR . '/modules/servers/rancherfleet/lib/Domains/DomainRetryStore.php';
-    require_once ROOTDIR . '/modules/servers/rancherfleet/lib/Domains/DomainRecordStore.php';
-    require_once ROOTDIR . '/modules/servers/rancherfleet/lib/Domains/IngressHelper.php';
-    require_once ROOTDIR . '/modules/servers/rancherfleet/lib/Domains/DomainOrderManager.php';
-
-    RancherFleet\Logger::info("DomainRetry cron: checking for due orders");
-
-    $dueOrders = RancherFleet\Domains\DomainRetryStore::getDueOrders();
-
-    if (empty($dueOrders)) {
-        RancherFleet\Logger::info("DomainRetry cron: no orders due");
-        return;
-    }
-
-    RancherFleet\Logger::info("DomainRetry cron: processing " . count($dueOrders) . " order(s)");
-
-    if (!function_exists('rancherfleet_buildDomainClients')) {
-        @include_once ROOTDIR . '/modules/servers/rancherfleet/rancherfleet.php';
-    }
-
-    foreach ($dueOrders as $token => $orderData) {
-        RancherFleet\Logger::info("DomainRetry cron: retrying token={$token} domain={$orderData['domainName']} attempt=" . ((int)$orderData['attempts'] + 1));
-
-        try {
-            $serviceId = isset($orderData['serviceId']) ? (int)$orderData['serviceId'] : 0;
-            $params    = $serviceId ? rancherfleet_loadParamsForService($serviceId) : array();
-            if (empty($params)) {
-                RancherFleet\Logger::error("DomainRetry cron: could not load params for service={$serviceId} (order token={$token})");
-                continue;
-            }
-
-            list(, $orderManager) = rancherfleet_buildDomainClients($params);
-            $resultMsg = $orderManager->retryPendingOrder($token, $orderData);
-
-            RancherFleet\Logger::info("DomainRetry cron: token={$token} result: {$resultMsg}");
-
-        } catch (\Exception $e) {
-            RancherFleet\Logger::error("DomainRetry cron: exception for token={$token}: " . $e->getMessage());
-            // Still record this as a failed attempt so it doesn't retry
-            // again immediately on the next cron tick.
-            RancherFleet\Domains\DomainRetryStore::recordFailure($token, $e->getMessage());
         }
     }
 });
@@ -398,7 +203,7 @@ add_hook('ShutdownHook', 1, function($vars) {
  * @param  int   $serviceId
  * @return array WHMCS params array, or empty array on failure
  */
-if (!function_exists('rancherfleet_loadParamsForService')) { function rancherfleet_loadParamsForService($serviceId)
+function rancherfleet_loadParamsForService($serviceId)
 {
     try {
         $service = \WHMCS\Database\Capsule::table('tblhosting')
@@ -442,4 +247,4 @@ if (!function_exists('rancherfleet_loadParamsForService')) { function rancherfle
         RancherFleet\Logger::error("loadParamsForService: " . $e->getMessage());
         return array();
     }
-} }
+}

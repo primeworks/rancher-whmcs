@@ -20,13 +20,6 @@ class RancherClient
     private $clusterId;
     private $timeout = 30;
 
-    /**
-     * Cache of resolved cluster display names, keyed by "{baseUrl}|{clusterId}".
-     * Static so it persists across multiple RancherClient instances created
-     * within the same PHP request (e.g. repeated rancherfleet_buildClients() calls).
-     */
-    private static $clusterNameCache = array();
-
     public function __construct($baseUrl, $token, $clusterId)
     {
         $this->baseUrl   = rtrim($baseUrl, '/');
@@ -51,58 +44,25 @@ class RancherClient
 
     public function testConnection()
     {
-        // Resolve the cluster display name (cached)
-        $name = $this->getClusterName();
+        // Fetch configured cluster info
+        $url      = $this->baseUrl . '/v3/clusters/' . $this->clusterId;
+        $response = $this->request('GET', $url);
+        $name     = isset($response['name']) ? $response['name'] : $this->clusterId;
 
-        // Check if Fleet CRDs are reachable on the LOCAL (Fleet management) cluster.
-        // Fleet GitRepo/Bundle CRDs always live on 'local', not on the downstream
-        // cluster that $this->clusterId points at.
+        // Check if Fleet CRDs exist on this cluster
         try {
-            $fleetResp   = $this->localClusterRequest('GET', '/apis/fleet.cattle.io/v1alpha1');
+            $fleetUrl    = $this->k8sUrl('/apis/fleet.cattle.io/v1alpha1');
+            $fleetResp   = $this->request('GET', $fleetUrl);
             $resources   = isset($fleetResp['resources']) ? $fleetResp['resources'] : array();
             $kinds = array();
             foreach ($resources as $r) {
                 $kinds[] = isset($r['kind']) ? $r['kind'] : '?';
             }
-            Logger::info("Fleet CRDs on local cluster: " . implode(', ', $kinds));
+            Logger::info("Fleet CRDs on cluster: " . implode(', ', $kinds));
         } catch (\Exception $e) {
-            Logger::info("Fleet CRDs not found on local cluster: " . $e->getMessage());
+            Logger::info("Fleet CRDs not found on cluster c-bm96f: " . $e->getMessage());
         }
 
-        return $name;
-    }
-
-    /**
-     * Returns the cluster's display NAME (e.g. "production-cluster"), as
-     * distinct from its ID (e.g. "c-bm96f").
-     *
-     * Fleet's GitRepo `spec.targets[].clusterName` matches against the Fleet
-     * Cluster CRD's `metadata.name`, which Rancher sets to this display name —
-     * NOT the management cluster ID used in `/k8s/clusters/{id}/...` paths.
-     *
-     * Result is cached (per baseUrl+clusterId) for the lifetime of the PHP
-     * process, since multiple buildClients() calls may occur per request.
-     * Falls back to the cluster ID if the lookup fails for any reason.
-     */
-    public function getClusterName()
-    {
-        $cacheKey = $this->baseUrl . '|' . $this->clusterId;
-        if (isset(self::$clusterNameCache[$cacheKey])) {
-            return self::$clusterNameCache[$cacheKey];
-        }
-
-        $name = $this->clusterId;
-        try {
-            $url      = $this->baseUrl . '/v3/clusters/' . $this->clusterId;
-            $response = $this->request('GET', $url);
-            if (!empty($response['name'])) {
-                $name = $response['name'];
-            }
-        } catch (\Exception $e) {
-            Logger::info("getClusterName: lookup failed for '{$this->clusterId}', falling back to ID: " . $e->getMessage());
-        }
-
-        self::$clusterNameCache[$cacheKey] = $name;
         return $name;
     }
 
@@ -891,10 +851,10 @@ class RancherClient
         );
     }
 
-    public function rawRequest($method, $path, $body = array(), $extraHeaders = array())
+    public function rawRequest($method, $path, $body = array())
     {
         $url = $this->k8sUrl($path);
-        return $this->request($method, $url, $body, $extraHeaders);
+        return $this->request($method, $url, $body);
     }
 
     /**
@@ -913,27 +873,6 @@ class RancherClient
         // but without the cluster proxy prefix, for paths like
         // /k8s/clusters/local/... which address the local Fleet cluster.
         $url = $this->baseUrl . $path;
-        return $this->request($method, $url, $body);
-    }
-
-    /**
-     * Makes a request against the LOCAL (Fleet management) cluster's k8s API,
-     * regardless of which cluster this RancherClient instance targets for
-     * workloads.
-     *
-     * Fleet GitRepo/Bundle CRDs always live on the local cluster — even when
-     * spec.targets[].clusterName points at a downstream cluster. Using
-     * rawRequest() (which proxies through $this->clusterId, the DOWNSTREAM
-     * cluster) returns 404 for these paths.
-     *
-     * @param  string $method
-     * @param  string $path    e.g. /apis/fleet.cattle.io/v1alpha1/namespaces/fleet-default/gitrepos
-     * @param  array  $body
-     * @return array
-     */
-    public function localClusterRequest($method, $path, $body = array())
-    {
-        $url = $this->baseUrl . '/k8s/clusters/local' . $path;
         return $this->request($method, $url, $body);
     }
 

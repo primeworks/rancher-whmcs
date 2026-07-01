@@ -1,0 +1,141 @@
+# --- Backup CronJob ---
+# Runs daily at 3am UTC. Produces:
+#   /backups/db-0000-{date}.dump        (pg_dump custom format)
+#   /backups/filestore-0000-{date}.tar.gz
+#   /backups/manifest.json              (index read by WHMCS client area)
+# Retains 3 days of backups.
+# Mounts the Odoo PVC subPaths: filestore -> /var/lib/odoo, backups -> /backups
+# DB credentials from Secret rfm-db-admin-0000.
+# Webhook config (URL, secret, service_id) from Secret rfm-webhook-0000.
+# 0000 replaced with order number at provisioning time.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rfm-backup-0000
+  namespace: default
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: OnFailure
+          volumes:
+            - name: odoo-data
+              persistentVolumeClaim:
+                claimName: odoo-0000
+            - name: rfm-webhook-config
+              secret:
+                secretName: rfm-webhook-0000
+          containers:
+            - name: backup
+              image: postgres:16-alpine
+              env:
+                - name: PGHOST
+                  value: postgres16.default.svc.cluster.local
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: rfm-db-admin-0000
+                      key: username
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: rfm-db-admin-0000
+                      key: password
+                - name: ORDER_NUM
+                  value: "0000"
+                - name: DB_NAME
+                  value: odoo-0000
+                - name: RETENTION_DAYS
+                  value: "3"
+              volumeMounts:
+                - name: odoo-data
+                  mountPath: /var/lib/odoo
+                  subPath: filestore
+                - name: odoo-data
+                  mountPath: /backups
+                  subPath: backups
+                - name: rfm-webhook-config
+                  mountPath: /etc/rfm-webhook
+                  readOnly: true
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  DATE=$(date +%Y-%m-%d)
+                  BACKUP_DIR=/backups
+                  mkdir -p "$BACKUP_DIR"
+                  echo "=== Backup started: $DATE ==="
+
+                  # Install curl if not present (alpine)
+                  apk add --no-cache curl >/dev/null 2>&1 || true
+
+                  # Database backup
+                  DB_FILE="$BACKUP_DIR/db-${ORDER_NUM}-${DATE}.dump"
+                  echo "Dumping database ${DB_NAME}..."
+                  pg_dump -Fc -d "$DB_NAME" -f "$DB_FILE"
+                  DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+                  echo "Database backup: $DB_FILE ($DB_SIZE bytes)"
+
+                  # Filestore backup
+                  FS_FILE="$BACKUP_DIR/filestore-${ORDER_NUM}-${DATE}.tar.gz"
+                  echo "Archiving filestore..."
+                  tar -czf "$FS_FILE" -C /var/lib/odoo . 2>/dev/null || true
+                  FS_SIZE=$(stat -c%s "$FS_FILE" 2>/dev/null || echo 0)
+                  echo "Filestore backup: $FS_FILE ($FS_SIZE bytes)"
+
+                  # Delete backups older than RETENTION_DAYS
+                  echo "Removing old backups..."
+                  find "$BACKUP_DIR" -maxdepth 1 \
+                    \( -name "db-${ORDER_NUM}-*.dump" \
+                    -o -name "filestore-${ORDER_NUM}-*.tar.gz" \) \
+                    -mtime "+${RETENTION_DAYS}" -delete
+
+                  # Write manifest.json
+                  MANIFEST="$BACKUP_DIR/manifest.json"
+                  printf '[\n' > "$MANIFEST"
+                  FIRST=1
+                  for FILE in $(ls -t \
+                    "$BACKUP_DIR"/db-${ORDER_NUM}-*.dump \
+                    "$BACKUP_DIR"/filestore-${ORDER_NUM}-*.tar.gz 2>/dev/null); do
+                    FNAME=$(basename "$FILE")
+                    FSIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+                    FMTIME=$(stat -c%Y "$FILE" 2>/dev/null || echo 0)
+                    TYPE="db"
+                    echo "$FNAME" | grep -q "^filestore-" && TYPE="filestore"
+                    if [ "$FIRST" = "0" ]; then printf ',\n' >> "$MANIFEST"; fi
+                    printf '  {"name":"%s","size":%s,"mtime":%s,"type":"%s"}' \
+                      "$FNAME" "$FSIZE" "$FMTIME" "$TYPE" >> "$MANIFEST"
+                    FIRST=0
+                  done
+                  printf '\n]\n' >> "$MANIFEST"
+                  echo "Manifest written"
+
+                  # Notify WHMCS webhook
+                  WEBHOOK_URL=$(cat /etc/rfm-webhook/url 2>/dev/null || echo "")
+                  WEBHOOK_SECRET=$(cat /etc/rfm-webhook/secret 2>/dev/null || echo "")
+                  SERVICE_ID=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "")
+                  if [ -n "$WEBHOOK_URL" ] && [ -n "$WEBHOOK_SECRET" ] && [ -n "$SERVICE_ID" ]; then
+                    echo "Notifying WHMCS..."
+                    MANIFEST_JSON=$(cat "$MANIFEST")
+                    PAYLOAD=$(printf \
+                      '{"service_id":%s,"order_num":"%s","secret":"%s","files":%s}' \
+                      "$SERVICE_ID" "$ORDER_NUM" "$WEBHOOK_SECRET" "$MANIFEST_JSON")
+                    curl -sf -X POST \
+                      -H "Content-Type: application/json" \
+                      -d "$PAYLOAD" \
+                      "$WEBHOOK_URL" \
+                      && echo "Webhook OK" \
+                      || echo "Webhook failed (non-fatal)"
+                  fi
+
+                  echo "=== Backup complete ==="

@@ -197,6 +197,15 @@ function rancherfleet_ConfigOptions()
             'Default'      => '',
             'Description'  => 'Postgres admin password for the DB Admin Username above.',
         ),
+        'Backup Auth Secret' => array(
+            'FriendlyName' => 'Backup Auth Secret',
+            'Type'         => 'password',
+            'Size'         => '60',
+            'Default'      => '',
+            'Description'  => 'A long random string used to sign backup download tokens. '
+                            . 'Must match the secret in backup-auth.php on your web server. '
+                            . 'Generate one with: openssl rand -hex 32',
+        ),
     );
 }
 
@@ -498,8 +507,245 @@ function rancherfleet_clearGraceSuspend(array $params)
 }
 
 // ---------------------------------------------------------------------------
-// Phase C: Secret injection from WHMCS custom fields
+// Backup system helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Creates (or updates) the rfm-db-admin-{orderNum} and rfm-webhook-{orderNum}
+ * Kubernetes Secrets in the client namespace.
+ * rfm-db-admin holds Postgres credentials for the backup CronJob.
+ * rfm-webhook holds the WHMCS webhook URL, shared secret, and service ID
+ * so the CronJob can notify WHMCS when a backup completes.
+ */
+function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $orderNum)
+{
+    $dbUser    = isset($params['configoption20']) ? trim($params['configoption20']) : 'postgres';
+    $dbPass    = isset($params['configoption21']) ? trim($params['configoption21']) : '';
+    $authSecret = isset($params['configoption22']) ? trim($params['configoption22']) : '';
+    $serviceId = (int)$params['serviceid'];
+
+    if (empty($dbUser)) {
+        RancherFleet\Logger::info("createDbAdminSecret: DB Admin Username not set, skipping");
+        return;
+    }
+
+    // Determine WHMCS base URL for the webhook
+    $whmcsUrl = function_exists('App') ? \App::getSystemUrl() : '';
+    $webhookUrl = rtrim($whmcsUrl, '/') . '/modules/servers/rancherfleet/backup_webhook.php';
+
+    $secrets = array(
+        'rfm-db-admin-' . $orderNum => array(
+            'username' => base64_encode($dbUser),
+            'password' => base64_encode($dbPass),
+        ),
+        'rfm-webhook-' . $orderNum => array(
+            'url'        => base64_encode($webhookUrl),
+            'secret'     => base64_encode($authSecret),
+            'service_id' => base64_encode((string)$serviceId),
+        ),
+    );
+
+    foreach ($secrets as $secretName => $data) {
+        $secretBody = array(
+            'apiVersion' => 'v1',
+            'kind'       => 'Secret',
+            'metadata'   => array(
+                'name'      => $secretName,
+                'namespace' => $namespace,
+            ),
+            'type' => 'Opaque',
+            'data' => $data,
+        );
+
+        try {
+            try {
+                $rancher->rawRequest('POST',
+                    '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets',
+                    $secretBody
+                );
+                RancherFleet\Logger::info("createDbAdminSecret: created {$secretName} in {$namespace}");
+            } catch (RancherFleet\RancherApiException $e) {
+                if ($e->getHttpCode() === 409) {
+                    $rancher->rawRequest('PATCH',
+                        '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets/' . rawurlencode($secretName),
+                        array('data' => $data),
+                        array('Content-Type: application/strategic-merge-patch+json')
+                    );
+                    RancherFleet\Logger::info("createDbAdminSecret: patched {$secretName}");
+                } else {
+                    throw $e;
+                }
+            }
+        } catch (\Exception $e) {
+            RancherFleet\Logger::error("createDbAdminSecret: FAILED {$secretName} in {$namespace}: " . $e->getMessage());
+        }
+    }
+}
+
+/**
+ * Reads the backup manifest.json from the pod's /backups/ directory
+ * via the Kubernetes API (no exec — reads the file as a ConfigMap-style
+ * GET against the pod's filesystem via the Rancher proxy).
+ *
+ * Strategy: find a running Odoo pod in the namespace, then use the
+ * Kubernetes exec-free file-read approach — actually we read via a
+ * one-shot Job that writes manifest.json to a known location, then
+ * reads it back. Since manifest.json is written by the CronJob, we
+ * simply read it via a pod ephemeral container... 
+ *
+ * Simpler: mount the same PVC in a short-lived read Job and cat the
+ * manifest — but that takes 10-30s. Instead, we read the manifest
+ * indirectly: the Odoo pod already mounts the PVC at /var/lib/odoo,
+ * and /backups is a subPath on the same PVC. We use the Rancher API
+ * to exec `cat /backups/manifest.json` in the Odoo pod.
+ *
+ * Since exec uses wss:// which doesn't work from cPanel, we fall back
+ * to storing the manifest content in the WHMCS database (tbladdonmodules)
+ * each time the CronJob completes — via a completion webhook POST to
+ * a WHMCS hook. Until then, we return a cached copy if available.
+ *
+ * @param  int    $serviceId
+ * @return array  array of backup entries, each with name/size/mtime/type
+ */
+function rancherfleet_getBackupFiles($serviceId)
+{
+    try {
+        $row = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_backups')
+            ->where('setting', 'manifest_' . (int)$serviceId)
+            ->value('value');
+
+        if ($row) {
+            $data = json_decode($row, true);
+            return is_array($data) ? $data : array();
+        }
+    } catch (\Exception $e) {
+        // ignore
+    }
+    return array();
+}
+
+/**
+ * Updates the cached backup manifest for a service.
+ * Called from the backup completion webhook hook.
+ */
+function rancherfleet_storeBackupManifest($serviceId, array $files)
+{
+    $json   = json_encode($files);
+    $exists = \WHMCS\Database\Capsule::table('tbladdonmodules')
+        ->where('module', 'rancherfleet_backups')
+        ->where('setting', 'manifest_' . (int)$serviceId)
+        ->exists();
+
+    if ($exists) {
+        \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_backups')
+            ->where('setting', 'manifest_' . (int)$serviceId)
+            ->update(array('value' => $json));
+    } else {
+        \WHMCS\Database\Capsule::table('tbladdonmodules')->insert(array(
+            'module'  => 'rancherfleet_backups',
+            'setting' => 'manifest_' . (int)$serviceId,
+            'value'   => $json,
+        ));
+    }
+}
+
+/**
+ * Generates a signed download token for a backup file.
+ * Token format: HMAC-SHA256(secret, "{orderNum}|{filename}|{expires}")
+ * encoded as hex, valid for 60 seconds.
+ *
+ * @param  string $secret    From Module Settings
+ * @param  string $orderNum
+ * @param  string $filename
+ * @return array  array('url' => string, 'token' => string, 'expires' => int)
+ */
+function rancherfleet_generateBackupToken($secret, $orderNum, $filename)
+{
+    $expires = time() + 60;
+    $data    = $orderNum . '|' . $filename . '|' . $expires;
+    $token   = hash_hmac('sha256', $data, $secret);
+    $url     = 'https://backups.webdiscode.com/' . rawurlencode($orderNum)
+             . '/' . rawurlencode($filename)
+             . '?token=' . $token . '&expires=' . $expires . '&order=' . rawurlencode($orderNum);
+    return array('url' => $url, 'token' => $token, 'expires' => $expires);
+}
+
+/**
+ * Renders the Backups card in the client area.
+ */
+function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $serviceUrl)
+{
+    $serviceId = (int)$params['serviceid'];
+    $files     = rancherfleet_getBackupFiles($serviceId);
+
+    $html  = '<div class="rfm-ca-card">';
+    $html .= '<h4>Backups</h4>';
+
+    if (empty($files)) {
+        $html .= '<div style="font-size:12px;color:#888;">No backups available yet. Backups run automatically at 3am UTC daily and are retained for 3 days. Check back after the first scheduled run.</div>';
+        $html .= '</div>';
+        return $html;
+    }
+
+    // Group by date
+    $byDate = array();
+    foreach ($files as $f) {
+        $date = isset($f['mtime']) ? date('Y-m-d', (int)$f['mtime']) : 'Unknown';
+        $byDate[$date][] = $f;
+    }
+    krsort($byDate); // newest first
+
+    // Get signing secret from Module Settings
+    // configoption22 = Backup Auth Secret (to be added after SQL verification)
+    $secret = isset($params['configoption22']) ? trim($params['configoption22']) : '';
+
+    foreach ($byDate as $date => $entries) {
+        $html .= '<div style="margin-bottom:14px;">';
+        $html .= '<div style="font-size:12px;font-weight:bold;color:#555;margin-bottom:6px;border-bottom:1px solid #f0f0f0;padding-bottom:4px;">'
+               . htmlspecialchars($date) . '</div>';
+
+        foreach ($entries as $f) {
+            $fname    = isset($f['name']) ? $f['name'] : '';
+            $fsize    = isset($f['size']) ? (int)$f['size'] : 0;
+            $ftype    = isset($f['type']) ? $f['type'] : 'unknown';
+            $sizeStr  = $fsize > 1048576
+                ? number_format($fsize / 1048576, 1) . ' MB'
+                : number_format($fsize / 1024, 1) . ' KB';
+            $typeLabel = $ftype === 'db' ? '&#128200; Database' : '&#128196; Filestore';
+            $typeColor = $ftype === 'db' ? '#2980b9' : '#27ae60';
+
+            $html .= '<div style="display:flex;align-items:center;justify-content:space-between;'
+                   . 'padding:7px 0;border-bottom:1px solid #f8f8f8;font-size:12px;">';
+            $html .= '<span><span style="color:' . $typeColor . ';font-weight:bold;">' . $typeLabel . '</span>'
+                   . ' &mdash; <span style="color:#888;">' . htmlspecialchars($sizeStr) . '</span></span>';
+
+            if ($secret) {
+                $token = rancherfleet_generateBackupToken($secret, $orderNum, $fname);
+                $html .= '<form method="post" action="' . $serviceUrl . '" style="margin:0;">';
+                $html .= '<input type="hidden" name="clientaction" value="backup_download">';
+                $html .= '<input type="hidden" name="backup_file" value="' . htmlspecialchars($fname) . '">';
+                $html .= '<button type="submit" style="background:#2980b9;color:#fff;border:none;'
+                       . 'border-radius:4px;padding:5px 12px;font-size:11px;font-weight:bold;cursor:pointer;">'
+                       . '&#11015; Download</button>';
+                $html .= '</form>';
+            } else {
+                $html .= '<span style="font-size:11px;color:#aaa;">Download unavailable — Backup Auth Secret not configured</span>';
+            }
+
+            $html .= '</div>';
+        }
+        $html .= '</div>';
+    }
+
+    $html .= '<p style="font-size:11px;color:#aaa;margin-top:8px;">'
+           . 'Backups are retained for 3 days. Download links expire after 60 seconds.</p>';
+    $html .= '</div>';
+    return $html;
+}
+
+
 
 /**
  * Reads per-service custom fields prefixed with "secret_" and injects them
@@ -820,6 +1066,9 @@ function rancherfleet_CreateAccount(array $params)
 
         // Phase C: Inject secrets from product custom fields
         rancherfleet_doInjectSecrets($params, $namespace);
+
+        // Phase C: Create DB admin Secret for backup CronJob
+        rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
 
     } catch (Exception $e) {
         rancherfleet_doRollback($params, $completed);
@@ -1231,6 +1480,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Execute Grace Suspend'  => 'ExecuteGraceSuspend',
         'Dry Run'                => 'DryRunProvision',
         'Clear Retry Queue'      => 'ClearRetryQueue',
+        'Push Backup CronJob'    => 'PushBackupCronJob',
     );
 }
 
@@ -1845,6 +2095,49 @@ function rancherfleet_ClearRetryQueue(array $params)
     RancherFleet\Logger::info("ClearRetryQueue: cleared for service={$serviceId}");
 
     return "Success: Retry queue cleared for '{$namespace}'.";
+}
+
+/**
+ * Pushes the backup CronJob manifest to an existing client's Git branch
+ * and creates the DB admin Secret in their namespace.
+ * Used for clients provisioned before the backup feature was added.
+ */
+function rancherfleet_PushBackupCronJob(array $params)
+{
+    try {
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // Read the backup CronJob manifest template
+        $templatePath = __DIR__ . '/backup-cronjob.yaml';
+        if (!file_exists($templatePath)) {
+            return 'Error: backup-cronjob.yaml not found in module directory. Upload it alongside rancherfleet.php.';
+        }
+
+        $content = file_get_contents($templatePath);
+
+        // Substitute 0000 with orderNum (same mechanism as bootstrapClientFolder)
+        $content = str_replace('0000', $orderNum, $content);
+
+        // Push to the client's branch
+        $clientBranch = $github->clientBranch($namespace);
+        $github->writeFileToBranch('backup-cronjob.yaml', $content, $clientBranch,
+            "chore: add backup CronJob for {$namespace}");
+
+        // Create the DB admin Secret in the namespace
+        rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+
+        rancherfleet_logHistory($params, 'Backup CronJob Pushed', $namespace);
+        RancherFleet\Logger::info("PushBackupCronJob: SUCCESS for {$namespace}");
+
+        return "Success: Backup CronJob pushed to branch '{$clientBranch}' and DB admin Secret created in '{$namespace}'. Fleet will reconcile within ~15s.";
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("PushBackupCronJob FAILED: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2595,6 +2888,16 @@ function rancherfleet_ClientArea(array $params)
         $message = rancherfleet_handleDomainReconnect($params, $namespace, $orderNum);
     } elseif ($action === 'storage_upgrade') {
         $message = rancherfleet_handleStorageUpgrade($params, $namespace, $orderNum);
+    } elseif ($action === 'backup_download') {
+        $filename = isset($_POST['backup_file']) ? basename($_POST['backup_file']) : '';
+        if ($filename) {
+            $secret = isset($params['configoption22']) ? trim($params['configoption22']) : '';
+            if ($secret) {
+                $token = rancherfleet_generateBackupToken($secret, $orderNum, $filename);
+                header('Location: ' . $token['url']);
+                exit;
+            }
+        }
     }
 
     // Build the output
@@ -3688,6 +3991,11 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         // -----------------------------------------------------------------------
         $serviceUrl = htmlspecialchars($_SERVER['REQUEST_URI'] ?? '');
         $html .= rancherfleet_storagePanelHtml($params, $namespace, $serviceUrl, $orderNum);
+
+        // -----------------------------------------------------------------------
+        // Backups
+        // -----------------------------------------------------------------------
+        $html .= rancherfleet_backupPanelHtml($params, $namespace, $orderNum, $serviceUrl);
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("ClientArea error: " . $e->getMessage());

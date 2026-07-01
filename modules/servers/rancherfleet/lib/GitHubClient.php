@@ -306,6 +306,20 @@ class GitHubClient
      * @return string          Raw file content (decoded from base64)
      */
     /**
+     * Writes (creates or updates) a single file on an existing branch.
+     * Public wrapper around createOrUpdateFile for use by admin button handlers.
+     *
+     * @param  string $filename   File name (no path prefix — written to branch root)
+     * @param  string $content    Raw file content
+     * @param  string $branch     Branch name
+     * @param  string $message    Commit message
+     */
+    public function writeFileToBranch($filename, $content, $branch, $message)
+    {
+        $this->createOrUpdateFile($filename, $message, $content, $branch);
+    }
+
+    /**
      * Updates the storage size for a named PVC in the client's Git branch.
      *
      * Scans all files on the client branch, finds the one containing both
