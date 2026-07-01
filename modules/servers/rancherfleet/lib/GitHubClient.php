@@ -320,6 +320,66 @@ class GitHubClient
     }
 
     /**
+     * Lists all files at the root of the template branch (odoo-0000).
+     * Public wrapper around listTemplateFiles() for callers that need to
+     * patch an existing client branch with newer template content.
+     *
+     * @return array  Array of file objects from GitHub contents API
+     */
+    public function getTemplateFileList()
+    {
+        return $this->listTemplateFiles();
+    }
+
+    /**
+     * Fetches the raw content of a file from the template branch.
+     *
+     * @param  string $path
+     * @return string
+     */
+    public function getTemplateFileContent($path)
+    {
+        return $this->getFileContent($path, $this->templateBranch);
+    }
+
+    /**
+     * Fetches the raw content of a file from a client's branch.
+     * Returns null (instead of throwing) if the file does not exist on
+     * that branch — used to detect newly-added template files that an
+     * older client branch has never had.
+     *
+     * @param  string $namespace
+     * @param  string $path
+     * @return string|null
+     */
+    public function getClientFileContent($namespace, $path)
+    {
+        $clientBranch = $this->clientBranch($namespace);
+        try {
+            return $this->getFileContent($path, $clientBranch);
+        } catch (GitHubApiException $e) {
+            if ($e->getHttpCode() === 404) {
+                return null;
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Public wrapper around substituteNamespace() for callers outside the
+     * bootstrap flow that need the same 0000 -> orderNum substitution.
+     *
+     * @param  string $content
+     * @param  string $namespace
+     * @param  int    $serviceId
+     * @return string
+     */
+    public function applyNamespaceSubstitution($content, $namespace, $serviceId)
+    {
+        return $this->substituteNamespace($content, $namespace, $serviceId);
+    }
+
+    /**
      * Updates the storage size for a named PVC in the client's Git branch.
      *
      * Scans all files on the client branch, finds the one containing both

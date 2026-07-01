@@ -1481,6 +1481,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Dry Run'                => 'DryRunProvision',
         'Clear Retry Queue'      => 'ClearRetryQueue',
         'Push Backup CronJob'    => 'PushBackupCronJob',
+        'Patch Template Updates' => 'PatchTemplateUpdates',
     );
 }
 
@@ -2136,6 +2137,173 @@ function rancherfleet_PushBackupCronJob(array $params)
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("PushBackupCronJob FAILED: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase F: Patch an existing client branch with the latest template
+// improvements, while preserving whatever Postgres/Odoo version and PVC
+// storage size that client is already running in production.
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts version/size markers from a manifest file's CURRENT content on
+ * a client branch, so they can be restored after applying newer template
+ * content. This is what stops a template patch from silently upgrading a
+ * production instance's Postgres/Odoo version or shrinking paid-for storage.
+ *
+ * @param  string $content  Existing file content from the client branch
+ * @return array
+ */
+function rancherfleet_extractVersionMarkers($content)
+{
+    $markers = array();
+
+    if (preg_match('/image:\s*[\'"]?postgres:([\w.\-]+)[\'"]?/i', $content, $m)) {
+        $markers['pg_image_tag'] = $m[1];
+    }
+
+    if (preg_match('/postgres(\d+)\.default\.svc\.cluster\.local/i', $content, $m)) {
+        $markers['pg_host_version'] = $m[1];
+    }
+
+    if (preg_match('/image:\s*[\'"]?([^\s\'"]*odoo[^\s\'":]*):([\w.\-]+)[\'"]?/i', $content, $m)) {
+        $markers['odoo_image_repo'] = $m[1];
+        $markers['odoo_image_tag']  = $m[2];
+    }
+
+    if (preg_match('/\bstorage:\s*(\S+Gi)/i', $content, $m)) {
+        $markers['pvc_storage'] = $m[1];
+    }
+
+    return $markers;
+}
+
+/**
+ * Re-applies previously captured version/size markers into new template
+ * content, so every other improvement in the template is applied except
+ * the Postgres version, Odoo version, and provisioned PVC storage size.
+ *
+ * @param  string $content  New content fetched from the template branch
+ * @param  array  $markers  Output of rancherfleet_extractVersionMarkers()
+ * @return string
+ */
+function rancherfleet_preserveVersionMarkers($content, array $markers)
+{
+    if (isset($markers['pg_image_tag'])) {
+        $content = preg_replace(
+            '/(image:\s*[\'"]?postgres:)[\w.\-]+([\'"]?)/i',
+            '${1}' . $markers['pg_image_tag'] . '$2',
+            $content
+        );
+    }
+
+    if (isset($markers['pg_host_version'])) {
+        $content = preg_replace(
+            '/postgres\d+(\.default\.svc\.cluster\.local)/i',
+            'postgres' . $markers['pg_host_version'] . '$1',
+            $content
+        );
+    }
+
+    if (isset($markers['odoo_image_repo']) && isset($markers['odoo_image_tag'])) {
+        $content = preg_replace(
+            '/(image:\s*[\'"]?)[^\s\'"]*odoo[^\s\'":]*:[\w.\-]+([\'"]?)/i',
+            '${1}' . $markers['odoo_image_repo'] . ':' . $markers['odoo_image_tag'] . '$2',
+            $content
+        );
+    }
+
+    if (isset($markers['pvc_storage'])) {
+        $content = preg_replace(
+            '/(\bstorage:\s*)\S+Gi/i',
+            '${1}' . $markers['pvc_storage'],
+            $content,
+            1
+        );
+    }
+
+    return $content;
+}
+
+function rancherfleet_PatchTemplateUpdates(array $params)
+{
+    try {
+        list($rancher, $github) = rancherfleet_buildClients($params);
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+
+        if (!$github->branchExists($namespace)) {
+            return "Error: client branch '{$namespace}' does not exist - nothing to patch.";
+        }
+
+        $templateFiles = $github->getTemplateFileList();
+        if (empty($templateFiles)) {
+            return 'Error: no files found on template branch.';
+        }
+
+        $added     = array();
+        $updated   = array();
+        $unchanged = array();
+
+        foreach ($templateFiles as $item) {
+            if (!isset($item['type']) || $item['type'] !== 'file') {
+                continue;
+            }
+
+            $filename   = $item['name'];
+            $newContent = $github->getTemplateFileContent($item['path']);
+            $newContent = $github->applyNamespaceSubstitution($newContent, $namespace, $orderNum);
+
+            $existing = $github->getClientFileContent($namespace, $filename);
+
+            if ($existing === null) {
+                // Template file the client never had (added since they were
+                // provisioned) - nothing to preserve, safe to add as-is.
+                $github->writeFileToBranch(
+                    $filename,
+                    $newContent,
+                    $namespace,
+                    "chore: patch {$namespace} - add new template file {$filename}"
+                );
+                $added[] = $filename;
+                continue;
+            }
+
+            $markers = rancherfleet_extractVersionMarkers($existing);
+            $patched = rancherfleet_preserveVersionMarkers($newContent, $markers);
+
+            if ($patched === $existing) {
+                $unchanged[] = $filename;
+                continue;
+            }
+
+            $github->writeFileToBranch(
+                $filename,
+                $patched,
+                $namespace,
+                "chore: patch {$namespace} - apply template updates (postgres/odoo versions and storage size preserved)"
+            );
+            $updated[] = $filename;
+        }
+
+        $summary = "Patched '{$namespace}': "
+                 . count($updated)   . ' file(s) updated, '
+                 . count($added)     . ' file(s) added, '
+                 . count($unchanged) . ' file(s) already current.';
+
+        if (!empty($updated)) $summary .= ' Updated: ' . implode(', ', $updated) . '.';
+        if (!empty($added))   $summary .= ' Added: '   . implode(', ', $added) . '.';
+
+        rancherfleet_logHistory($params, 'Template Patched', $summary);
+        RancherFleet\Logger::info("PatchTemplateUpdates: {$summary}");
+
+        return "Success: {$summary} Postgres/Odoo versions and storage size were left untouched. Fleet will auto-sync the change within ~15s.";
+
+    } catch (\Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("PatchTemplateUpdates FAILED:\n" . $detail);
         return 'Error: ' . $e->getMessage();
     }
 }

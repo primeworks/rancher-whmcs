@@ -113,6 +113,36 @@ All database operations use Kubernetes Jobs (not exec):
 - Credentials from `rfm-db-admin-{orderNum}` Secret
 - Webhook config from `rfm-webhook-{orderNum}` Secret
 
+## Patching existing client branches with newer template improvements
+
+`rancherfleet_PatchTemplateUpdates()` (admin button "Patch Template Updates") lets
+an admin bring an older, already-provisioned client branch up to date with
+whatever has changed on `odoo-0000` since that client was bootstrapped —
+without upgrading the Postgres/Odoo version they're running in production or
+shrinking storage they've paid to upgrade.
+
+- Walks every file at the root of `odoo-0000`, fetches the client's current
+  version of the same filename (if any), and:
+  - **File doesn't exist on the client branch** → added as-is (namespace-substituted)
+    — there's nothing to preserve, so this is how new template files (like
+    `backup-cronjob.yaml` was for old clients) reach older instances.
+  - **File exists on both** → `rancherfleet_extractVersionMarkers()` pulls the
+    Postgres image tag, the `postgres{N}.default.svc.cluster.local` host
+    version, the Odoo image repo+tag, and the PVC `storage:` size out of the
+    client's *current* file, then `rancherfleet_preserveVersionMarkers()`
+    re-stamps those exact values into the new template content before it's
+    written back. Everything else in the file (resource blocks, new fields,
+    fixed bugs, etc.) comes from the template.
+  - Unchanged files (after marker preservation) are left alone — no commit.
+- No Fleet/GitRepo changes needed — Fleet auto-syncs on branch commit (same as
+  `PushBackupCronJob` and `updatePvcStorageInManifest`).
+- Does **not** delete files removed from the template, and does **not** touch
+  CPU/memory requests — use `ApplyQuota` for resource-tier changes.
+- If you add a *new* kind of version-locked value to the templates later
+  (e.g. a Redis version), extend both `rancherfleet_extractVersionMarkers()`
+  and `rancherfleet_preserveVersionMarkers()` with a matching regex pair —
+  otherwise a patch run will silently overwrite it with the template default.
+
 ## Persistent state (tbladdonmodules JSON blobs)
 
 | module | setting | purpose |
