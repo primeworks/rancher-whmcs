@@ -58,7 +58,6 @@ class RancherClient
             foreach ($resources as $r) {
                 $kinds[] = isset($r['kind']) ? $r['kind'] : '?';
             }
-            Logger::info("Fleet CRDs on cluster: " . implode(', ', $kinds));
         } catch (\Exception $e) {
             Logger::info("Fleet CRDs not found on cluster c-bm96f: " . $e->getMessage());
         }

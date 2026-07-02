@@ -2409,12 +2409,18 @@ function rancherfleet_PushBackupSidecar(array $params)
             return "No changes: backup sidecar already injected or injection failed.";
         }
 
+        RancherFleet\Logger::info("PushBackupSidecar: sidecar container injected for {$namespace}");
+
         // Write back to the client branch
         $github->writeFileToBranch('odoo.yml', $updatedYaml, $clientBranch,
             "chore: inject backup sidecar container for {$namespace}");
 
+        RancherFleet\Logger::info("PushBackupSidecar: odoo.yml written to branch for {$namespace}");
+
         // Create the DB admin Secret in the namespace (ensures rfm-db-admin and rfm-webhook Secrets exist)
         rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+
+        RancherFleet\Logger::info("PushBackupSidecar: DB admin secret updated for {$namespace}");
 
         rancherfleet_logHistory($params, 'Backup Sidecar Injected', $namespace);
         RancherFleet\Logger::info("PushBackupSidecar: SUCCESS for {$namespace}");
@@ -4526,13 +4532,43 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         if (!$isSuspended && !empty($status['pods'])) {
             $firstPod = $status['pods'][0];
             try {
-                $rawLogs = $rancher->getPodLogs(
-                    $namespace,
-                    $firstPod['name'],
-                    $firstPod['container_name'],
-                    3600,
-                    200
-                );
+                $rawLogs = null;
+                try {
+                    $rawLogs = $rancher->getPodLogs(
+                        $namespace,
+                        $firstPod['name'],
+                        $firstPod['container_name'],
+                        3600,
+                        200
+                    );
+                } catch (RancherApiException $logEx) {
+                    if ($logEx->getHttpCode() === 404) {
+                        // Pod name stale — fetch current pods and retry with first Running pod
+                        $freshPods = $rancher->listPods($namespace);
+                        $runningPod = null;
+                        foreach ($freshPods as $pod) {
+                            if (isset($pod['status']['phase']) && $pod['status']['phase'] === 'Running') {
+                                $runningPod = $pod;
+                                break;
+                            }
+                        }
+                        if ($runningPod) {
+                            $podName = isset($runningPod['metadata']['name']) ? $runningPod['metadata']['name'] : '';
+                            $containerName = '';
+                            $podContainers = isset($runningPod['spec']['containers']) ? $runningPod['spec']['containers'] : array();
+                            foreach ($podContainers as $pc) {
+                                $containerName = isset($pc['name']) ? $pc['name'] : '';
+                                break;
+                            }
+                            if ($podName && $containerName) {
+                                $rawLogs = $rancher->getPodLogs($namespace, $podName, $containerName, 3600, 200);
+                            }
+                        }
+                    }
+                    if (!$rawLogs) {
+                        throw $logEx;
+                    }
+                }
 
                 // Colorise log lines
                 $lines      = explode("\n", $rawLogs);
