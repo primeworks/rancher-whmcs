@@ -2385,6 +2385,9 @@ function rancherfleet_PushBackupCronJob(array $params)
  */
 function rancherfleet_PushBackupSidecar(array $params)
 {
+    $orderNum  = null;
+    $namespace = null;
+
     try {
         $orderNum  = rancherfleet_getOrderNumber($params);
         $namespace = 'whmcs-client-' . $orderNum;
@@ -2395,40 +2398,69 @@ function rancherfleet_PushBackupSidecar(array $params)
         $clientBranch = $github->clientBranch($namespace);
 
         // Read odoo.yml from the client branch
-        $odooYaml = $github->getClientFileContent($namespace, 'odoo.yml');
-        if (!$odooYaml) {
-            return "Error: odoo.yml not found on client branch '{$clientBranch}'.";
+        try {
+            $odooYaml = $github->getClientFileContent($namespace, 'odoo.yml');
+            if (!$odooYaml) {
+                return "Error: odoo.yml not found on client branch '{$clientBranch}'.";
+            }
+        } catch (\Exception $readEx) {
+            throw new \Exception("Failed to read odoo.yml from GitHub: " . $readEx->getMessage());
         }
 
         RancherFleet\Logger::info("PushBackupSidecar: read odoo.yml for {$namespace}");
 
         // Inject the backup sidecar container and volumes
-        $updatedYaml = rancherfleet_injectBackupSidecar($odooYaml, $orderNum);
+        try {
+            $updatedYaml = rancherfleet_injectBackupSidecar($odooYaml, $orderNum);
+        } catch (\Exception $injectEx) {
+            throw new \Exception("Failed to inject backup sidecar: " . $injectEx->getMessage());
+        }
+
+        if (!$updatedYaml) {
+            throw new \Exception("injectBackupSidecar returned empty YAML");
+        }
 
         if ($updatedYaml === $odooYaml) {
-            return "No changes: backup sidecar already injected or injection failed.";
+            RancherFleet\Logger::info("PushBackupSidecar: sidecar already present, no changes needed");
+            return "No changes: backup sidecar already injected.";
         }
 
         RancherFleet\Logger::info("PushBackupSidecar: sidecar container injected for {$namespace}");
 
         // Write back to the client branch
-        $github->writeFileToBranch('odoo.yml', $updatedYaml, $clientBranch,
-            "chore: inject backup sidecar container for {$namespace}");
+        try {
+            $github->writeFileToBranch('odoo.yml', $updatedYaml, $clientBranch,
+                "chore: inject backup sidecar container for {$namespace}");
+        } catch (\Exception $writeEx) {
+            throw new \Exception("Failed to write odoo.yml to GitHub: " . $writeEx->getMessage());
+        }
 
         RancherFleet\Logger::info("PushBackupSidecar: odoo.yml written to branch for {$namespace}");
 
         // Create the DB admin Secret in the namespace (ensures rfm-db-admin and rfm-webhook Secrets exist)
-        rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+        try {
+            rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+        } catch (\Exception $secretEx) {
+            throw new \Exception("Failed to create DB admin secret: " . $secretEx->getMessage());
+        }
 
         RancherFleet\Logger::info("PushBackupSidecar: DB admin secret updated for {$namespace}");
 
-        rancherfleet_logHistory($params, 'Backup Sidecar Injected', $namespace);
-        RancherFleet\Logger::info("PushBackupSidecar: SUCCESS for {$namespace}");
+        try {
+            rancherfleet_logHistory($params, 'Backup Sidecar Injected', $namespace);
+        } catch (\Exception $historyEx) {
+            // History logging is non-critical; log but don't fail
+            RancherFleet\Logger::warn("PushBackupSidecar: failed to log history: " . $historyEx->getMessage());
+        }
 
+        RancherFleet\Logger::info("PushBackupSidecar: SUCCESS for {$namespace}");
         return "Success: Backup sidecar injected into '{$clientBranch}' odoo.yml. DB admin Secret updated. Fleet will auto-sync within ~15s.";
 
     } catch (\Exception $e) {
-        RancherFleet\Logger::error("PushBackupSidecar FAILED: " . $e->getMessage());
+        $nsDisplay = $namespace ? " [{$namespace}]" : '';
+        $msg = "PushBackupSidecar FAILED{$nsDisplay}: " . $e->getMessage();
+        RancherFleet\Logger::error($msg);
+        RancherFleet\Logger::error("Stack trace: " . $e->getTraceAsString());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -2542,10 +2574,14 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
 
     if (preg_match($pattern, $yamlContent, $matches)) {
         // Insert the sidecar container before the volumes section
-        $yamlContent = preg_replace($pattern, '$1$2' . "\n" . $sidecarContainer . '\3', $yamlContent);
+        $newContent = preg_replace($pattern, '$1$2' . "\n" . $sidecarContainer . '\3', $yamlContent);
+        if (!$newContent) {
+            throw new \Exception("preg_replace failed to inject sidecar container");
+        }
+        $yamlContent = $newContent;
+        RancherFleet\Logger::info("injectBackupSidecar: sidecar container injected into containers section");
     } else {
-        RancherFleet\Logger::warn("injectBackupSidecar: could not find containers section");
-        return $yamlContent;
+        throw new \Exception("Could not find 'containers:' section with 'odoo' container in odoo.yml. Pattern did not match.");
     }
 
     // Add volumes: rfm-db-admin and rfm-webhook-config if not already present
@@ -2559,7 +2595,7 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
     // Check if volumes already exist
     if (strpos($yamlContent, 'rfm-db-admin') === false) {
         // Insert before the closing "volumes:" section (find last volume and add after it)
-        $yamlContent = preg_replace_callback(
+        $newContent = preg_replace_callback(
             '/(\s+volumes:.*?)(\n[a-zA-Z])/s',
             function ($m) use ($dbAdminVolume, $webhookVolume) {
                 $volumesEnd = strrpos($m[1], '- name:');
@@ -2574,6 +2610,13 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
             $yamlContent,
             1
         );
+        if (!$newContent) {
+            throw new \Exception("preg_replace_callback failed to add volumes for backup secrets");
+        }
+        $yamlContent = $newContent;
+        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes injected into volumes section");
+    } else {
+        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes already present");
     }
 
     RancherFleet\Logger::info("injectBackupSidecar: successfully injected backup sidecar");
