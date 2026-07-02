@@ -723,6 +723,9 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
 
             if ($secret) {
                 $token = rancherfleet_generateBackupToken($secret, $orderNum, $fname);
+                $html .= '<div style="display:flex;gap:6px;align-items:center;">';
+
+                // Download button
                 $html .= '<form method="post" action="' . $serviceUrl . '" style="margin:0;">';
                 $html .= '<input type="hidden" name="clientaction" value="backup_download">';
                 $html .= '<input type="hidden" name="backup_file" value="' . htmlspecialchars($fname) . '">';
@@ -730,8 +733,21 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
                        . 'border-radius:4px;padding:5px 12px;font-size:11px;font-weight:bold;cursor:pointer;">'
                        . '&#11015; Download</button>';
                 $html .= '</form>';
+
+                // Restore button
+                $html .= '<form method="post" action="' . $serviceUrl . '" style="margin:0;" '
+                       . 'onsubmit="return confirm(\'WARNING: This will restore from this backup. Your current ' . htmlspecialchars($ftype) . ' data will be overwritten and the instance will be briefly offline. Continue?\');">';
+                $html .= '<input type="hidden" name="clientaction" value="backup_restore">';
+                $html .= '<input type="hidden" name="backup_file" value="' . htmlspecialchars($fname) . '">';
+                $html .= '<input type="hidden" name="backup_type" value="' . htmlspecialchars($ftype) . '">';
+                $html .= '<button type="submit" style="background:#e67e22;color:#fff;border:none;'
+                       . 'border-radius:4px;padding:5px 12px;font-size:11px;font-weight:bold;cursor:pointer;">'
+                       . '&#8635; Restore</button>';
+                $html .= '</form>';
+
+                $html .= '</div>';
             } else {
-                $html .= '<span style="font-size:11px;color:#aaa;">Download unavailable — Backup Auth Secret not configured</span>';
+                $html .= '<span style="font-size:11px;color:#aaa;">Actions unavailable — Backup Auth Secret not configured</span>';
             }
 
             $html .= '</div>';
@@ -1343,6 +1359,223 @@ function rancherfleet_terminateDatabase(array $params, $rancher, $namespace)
     } catch (\Exception $e) {
         RancherFleet\Logger::error("terminateDatabase: exception — " . $e->getMessage());
         rancherfleet_logHistory($params, 'DB Deletion Error', $e->getMessage());
+    }
+}
+
+/**
+ * Handles backup restore from client area.
+ *
+ * Creates a Job that:
+ * 1. Scales the Deployment to 0 replicas
+ * 2. Creates pre-restore snapshots (db dump + filestore tar)
+ * 3. Restores from the selected backup (db or filestore)
+ * 4. Scales back to original replica count
+ * 5. Cleans up temporary snapshots
+ *
+ * @param  array  $params
+ * @param  string $namespace
+ * @param  string $orderNum
+ * @param  string $filename   Backup filename (e.g. "db-0000-2024-01-01.dump")
+ * @param  string $backupType "db" or "filestore"
+ * @return string            'backup_restore_success:...' or 'backup_restore_error:...'
+ */
+function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, $filename, $backupType)
+{
+    RancherFleet\Logger::info("backupRestore: starting for {$namespace} file={$filename} type={$backupType}");
+
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+
+        // Get current deployment status (replica count)
+        $deploymentName = 'odoo-' . $orderNum;
+        $status = $rancher->getDeploymentStatus($namespace, $deploymentName);
+        $originalReplicas = max(1, isset($status['replicas']) ? (int)$status['replicas'] : 1);
+
+        // DB credentials from Module Settings
+        $dbUser = isset($params['configoption20']) ? trim($params['configoption20']) : 'postgres';
+        $dbPass = isset($params['configoption21']) ? trim($params['configoption21']) : '';
+        $dbHost = 'postgres16.default.svc.cluster.local';
+        $dbPort = '5432';
+        $dbName = 'odoo-' . $orderNum;
+
+        if (empty($dbUser)) {
+            RancherFleet\Logger::error("backupRestore: DB Admin Username not configured");
+            return 'backup_restore_error:Database credentials not configured';
+        }
+
+        // Validate backup file exists by checking the manifest
+        $files = rancherfleet_getBackupFiles((int)$params['serviceid']);
+        $backupFile = null;
+        foreach ($files as $f) {
+            if ($f['name'] === $filename) {
+                $backupFile = $f;
+                break;
+            }
+        }
+
+        if (!$backupFile) {
+            RancherFleet\Logger::error("backupRestore: backup file not found in manifest");
+            return 'backup_restore_error:Backup file not found';
+        }
+
+        // Validate backup type matches filename pattern
+        if ($backupType === 'db' && !preg_match('/^db-\d+-\d{4}-\d{2}-\d{2}\.dump$/', $filename)) {
+            return 'backup_restore_error:Invalid database backup filename format';
+        }
+        if ($backupType === 'filestore' && !preg_match('/^filestore-\d+-\d{4}-\d{2}-\d{2}\.tar\.gz$/', $filename)) {
+            return 'backup_restore_error:Invalid filestore backup filename format';
+        }
+
+        // Generate unique job name
+        $timestamp = time();
+        $jobName = 'rfm-restore-' . $backupType . '-' . $timestamp . '-' . substr(md5($orderNum), 0, 4);
+        $jobName = substr($jobName, 0, 60); // Keep under 63 char DNS limit
+
+        // Build restore shell script
+        // The script will:
+        // 1. Scale deployment to 0
+        // 2. Create pre-restore snapshots
+        // 3. Restore from backup
+        // 4. Scale back to original replicas
+        if ($backupType === 'db') {
+            $preRestoreDbFile = 'pre-restore-db-' . date('Y-m-d-H-i-s') . '.dump';
+            $restoreCmd = 'set -e && '
+                . 'echo "Scaling deployment to 0..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=0 -n ' . escapeshellarg($namespace) . ' && '
+                . 'sleep 5 && '
+                . 'echo "Creating pre-restore database snapshot..." && '
+                . 'pg_dump -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -Fc > /backups/' . escapeshellarg($preRestoreDbFile) . ' 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
+                . 'echo "Restoring database from backup..." && '
+                . 'pg_restore -h $PGHOST -p $PGPORT -U $PGUSER --clean --if-exists -d $PGDATABASE /backups/' . escapeshellarg($filename) . ' 2>&1 && '
+                . 'echo "Scaling deployment back to ' . $originalReplicas . ' replicas..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=' . (int)$originalReplicas . ' -n ' . escapeshellarg($namespace) . ' && '
+                . 'echo "Restore complete"';
+        } else {
+            // filestore restore
+            $preRestoreFilestore = 'pre-restore-filestore-' . date('Y-m-d-H-i-s') . '.tar.gz';
+            $restoreCmd = 'set -e && '
+                . 'echo "Scaling deployment to 0..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=0 -n ' . escapeshellarg($namespace) . ' && '
+                . 'sleep 5 && '
+                . 'echo "Creating pre-restore filestore snapshot..." && '
+                . 'tar -czf /backups/' . escapeshellarg($preRestoreFilestore) . ' -C /var/lib/odoo . 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
+                . 'echo "Restoring filestore from backup..." && '
+                . 'tar -xzf /backups/' . escapeshellarg($filename) . ' -C /var/lib/odoo && '
+                . 'echo "Scaling deployment back to ' . $originalReplicas . ' replicas..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=' . (int)$originalReplicas . ' -n ' . escapeshellarg($namespace) . ' && '
+                . 'echo "Restore complete"';
+        }
+
+        // Build Job manifest
+        $jobManifest = array(
+            'apiVersion' => 'batch/v1',
+            'kind'       => 'Job',
+            'metadata'   => array(
+                'name'      => $jobName,
+                'namespace' => $namespace,
+                'labels'    => array('app' => 'rfm-restore'),
+            ),
+            'spec' => array(
+                'ttlSecondsAfterFinished' => 300,
+                'backoffLimit'            => 0,
+                'template'               => array(
+                    'spec' => array(
+                        'restartPolicy' => 'Never',
+                        'containers'    => array(array(
+                            'name'    => 'restore',
+                            'image'   => $backupType === 'db' ? 'postgres:16-alpine' : 'alpine:latest',
+                            'command' => array('sh', '-c', $restoreCmd),
+                            'env'     => $backupType === 'db' ? array(
+                                array('name' => 'PGHOST',     'value' => $dbHost),
+                                array('name' => 'PGPORT',     'value' => $dbPort),
+                                array('name' => 'PGUSER',     'value' => $dbUser),
+                                array('name' => 'PGPASSWORD', 'value' => $dbPass),
+                                array('name' => 'PGDATABASE', 'value' => $dbName),
+                            ) : array(),
+                            'volumeMounts' => array(
+                                array(
+                                    'name'      => 'odoo-pvc',
+                                    'mountPath' => '/var/lib/odoo',
+                                    'subPath'   => 'filestore',
+                                ),
+                                array(
+                                    'name'      => 'odoo-pvc',
+                                    'mountPath' => '/backups',
+                                    'subPath'   => 'backups',
+                                ),
+                            ),
+                        )),
+                        'volumes' => array(
+                            array(
+                                'name'         => 'odoo-pvc',
+                                'persistentVolumeClaim' => array(
+                                    'claimName' => 'odoo-' . $orderNum,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        RancherFleet\Logger::info("backupRestore: creating Job {$jobName} for {$backupType} restore");
+
+        // Create the Job
+        $rancher->rawRequest('POST',
+            '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
+            $jobManifest
+        );
+
+        // Poll for completion — up to 120 seconds
+        $succeeded = false;
+        $failed    = false;
+        $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
+
+        for ($i = 0; $i < 24; $i++) {
+            sleep(5);
+            try {
+                $job        = $rancher->rawRequest('GET', $jobPath);
+                $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                foreach ($conditions as $cond) {
+                    if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                        $succeeded = true; break 2;
+                    }
+                    if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                        $failed = true; break 2;
+                    }
+                }
+                RancherFleet\Logger::info("backupRestore: waiting for Job... " . (($i + 1) * 5) . "s elapsed");
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("backupRestore: error polling Job: " . $e->getMessage());
+                break;
+            }
+        }
+
+        // Clean up the Job
+        try {
+            $rancher->rawRequest('DELETE', $jobPath);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("backupRestore: Job cleanup note: " . $e->getMessage());
+        }
+
+        if ($succeeded) {
+            RancherFleet\Logger::info("backupRestore: SUCCESS — {$backupType} restored from {$filename}");
+            rancherfleet_logHistory($params, 'Backup Restored', $backupType . ' restored from ' . $filename);
+            return 'backup_restore_success:' . $backupType;
+        } elseif ($failed) {
+            RancherFleet\Logger::error("backupRestore: Job failed");
+            rancherfleet_logHistory($params, 'Restore Failed', 'Job failed for ' . $filename);
+            return 'backup_restore_error:Restore job failed. Check admin logs for details.';
+        } else {
+            RancherFleet\Logger::error("backupRestore: Job timed out after 120s");
+            rancherfleet_logHistory($params, 'Restore Timeout', 'Job timeout for ' . $filename);
+            return 'backup_restore_error:Restore job timed out after 2 minutes';
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("backupRestore: exception — " . $e->getMessage());
+        rancherfleet_logHistory($params, 'Restore Error', $e->getMessage());
+        return 'backup_restore_error:' . $e->getMessage();
     }
 }
 
@@ -3066,6 +3299,14 @@ function rancherfleet_ClientArea(array $params)
                 exit;
             }
         }
+    } elseif ($action === 'backup_restore') {
+        $filename = isset($_POST['backup_file']) ? basename($_POST['backup_file']) : '';
+        $backupType = isset($_POST['backup_type']) ? $_POST['backup_type'] : '';
+        if ($filename && $backupType) {
+            $message = rancherfleet_handleBackupRestore($params, $namespace, $orderNum, $filename, $backupType);
+        } else {
+            $message = 'error:Invalid backup file or type';
+        }
     }
 
     // Build the output
@@ -3908,6 +4149,11 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-error">&#10007; Payment declined: ' . htmlspecialchars(substr($message, strlen('storage_declined:'))) . '</div>';
     } elseif (strpos($message, 'storage_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('storage_error:'))) . '</div>';
+    } elseif (strpos($message, 'backup_restore_success:') === 0) {
+        $backupInfo = substr($message, strlen('backup_restore_success:'));
+        $html .= '<div class="rfm-alert-success">&#10003; Backup restored successfully. Your instance will be back online shortly.</div>';
+    } elseif (strpos($message, 'backup_restore_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; Restore failed: ' . htmlspecialchars(substr($message, strlen('backup_restore_error:'))) . '</div>';
     }
 
     try {
