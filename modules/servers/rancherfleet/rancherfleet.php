@@ -1714,6 +1714,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Dry Run'                => 'DryRunProvision',
         'Clear Retry Queue'      => 'ClearRetryQueue',
         'Push Backup CronJob'    => 'PushBackupCronJob',
+        'Push Backup Sidecar'    => 'PushBackupSidecar',
         'Patch Template Updates' => 'PatchTemplateUpdates',
     );
 }
@@ -2372,6 +2373,205 @@ function rancherfleet_PushBackupCronJob(array $params)
         RancherFleet\Logger::error("PushBackupCronJob FAILED: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
+}
+
+/**
+ * Pushes the backup sidecar container into the Odoo Deployment.
+ * Replaces CronJob-based backups with a sidecar that runs dcron inline.
+ *
+ * Reads odoo.yml from the client branch, injects the backup sidecar container
+ * into the spec.template.spec.containers array, adds necessary volumes, and
+ * writes it back.
+ */
+function rancherfleet_PushBackupSidecar(array $params)
+{
+    try {
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        $clientBranch = $github->clientBranch($namespace);
+
+        // Read odoo.yml from the client branch
+        $odooYaml = $github->getClientFileContent($namespace, 'odoo.yml');
+        if (!$odooYaml) {
+            return "Error: odoo.yml not found on client branch '{$clientBranch}'.";
+        }
+
+        RancherFleet\Logger::info("PushBackupSidecar: read odoo.yml for {$namespace}");
+
+        // Inject the backup sidecar container and volumes
+        $updatedYaml = rancherfleet_injectBackupSidecar($odooYaml, $orderNum);
+
+        if ($updatedYaml === $odooYaml) {
+            return "No changes: backup sidecar already injected or injection failed.";
+        }
+
+        // Write back to the client branch
+        $github->writeFileToBranch('odoo.yml', $updatedYaml, $clientBranch,
+            "chore: inject backup sidecar container for {$namespace}");
+
+        // Create the DB admin Secret in the namespace (ensures rfm-db-admin and rfm-webhook Secrets exist)
+        rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+
+        rancherfleet_logHistory($params, 'Backup Sidecar Injected', $namespace);
+        RancherFleet\Logger::info("PushBackupSidecar: SUCCESS for {$namespace}");
+
+        return "Success: Backup sidecar injected into '{$clientBranch}' odoo.yml. DB admin Secret updated. Fleet will auto-sync within ~15s.";
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("PushBackupSidecar FAILED: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Injects the backup sidecar container and necessary volumes into odoo.yml YAML content.
+ *
+ * The sidecar:
+ * - Installs curl and dcron
+ * - Writes a backup script to /backup.sh
+ * - Schedules it to run at 3am UTC daily via crontab
+ * - Creates pre-compressed backups and rotates 3-day retention
+ * - POSTs manifest.json to the WHMCS webhook
+ *
+ * Volumes mounted:
+ * - odoo-data (PVC filestore + backups subPaths)
+ * - rfm-db-admin (Secret with DB credentials)
+ * - rfm-webhook-config (Secret with webhook URL/credentials)
+ *
+ * @param  string $yamlContent  Current odoo.yml YAML
+ * @param  string $orderNum     Order/client number for substitution
+ * @return string               Updated YAML content
+ */
+function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
+{
+    // Check if sidecar is already injected (look for "name: backup" container)
+    if (preg_match('/^\s+- name:\s+backup\s*$/m', $yamlContent)) {
+        RancherFleet\Logger::info("injectBackupSidecar: backup sidecar already present");
+        return $yamlContent;
+    }
+
+    // Backup sidecar container YAML
+    $sidecarContainer = '      - name: backup
+        image: postgres:16-alpine
+        command: [sh, -c]
+        args:
+          - |
+            apk add --no-cache curl dcron
+            cat > /backup.sh << \'SCRIPT\'
+            #!/bin/sh
+            set -e
+            DATE=$(date +%Y-%m-%d)
+            ORDER_NUM=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "' . $orderNum . '")
+            DB_NAME="odoo-${ORDER_NUM}"
+            BACKUP_DIR=/backups
+            mkdir -p "$BACKUP_DIR"
+            pg_dump -Fc -d "$DB_NAME" \
+              -h postgres16.default.svc.cluster.local \
+              -U $(cat /etc/rfm-db/username) \
+              -f "$BACKUP_DIR/db-${ORDER_NUM}-${DATE}.dump"
+            tar -czf "$BACKUP_DIR/filestore-${ORDER_NUM}-${DATE}.tar.gz" \
+              -C /var/lib/odoo . 2>/dev/null || true
+            find "$BACKUP_DIR" -maxdepth 1 \
+              \\( -name "db-${ORDER_NUM}-*.dump" \
+              -o -name "filestore-${ORDER_NUM}-*.tar.gz" \\) \
+              -mtime +3 -delete
+            MANIFEST="$BACKUP_DIR/manifest.json"
+            printf \'[\n\' > "$MANIFEST"
+            FIRST=1
+            for FILE in $(ls -t "$BACKUP_DIR"/db-${ORDER_NUM}-*.dump \
+              "$BACKUP_DIR"/filestore-${ORDER_NUM}-*.tar.gz 2>/dev/null); do
+              FNAME=$(basename "$FILE")
+              FSIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+              FMTIME=$(stat -c%Y "$FILE" 2>/dev/null || echo 0)
+              TYPE="db"
+              echo "$FNAME" | grep -q "^filestore-" && TYPE="filestore"
+              if [ "$FIRST" = "0" ]; then printf \',\n\' >> "$MANIFEST"; fi
+              printf \'  {"name":"%s","size":%s,"mtime":%s,"type":"%s"}\' \
+                "$FNAME" "$FSIZE" "$FMTIME" "$TYPE" >> "$MANIFEST"
+              FIRST=0
+            done
+            printf \']\n\' >> "$MANIFEST"
+            URL=$(cat /etc/rfm-webhook/url 2>/dev/null || echo "")
+            SECRET=$(cat /etc/rfm-webhook/secret 2>/dev/null || echo "")
+            SID=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "")
+            if [ -n "$URL" ] && [ -n "$SECRET" ] && [ -n "$SID" ]; then
+              PAYLOAD=$(printf \
+                \'{"service_id":%s,"order_num":"%s","secret":"%s","files":%s}\' \
+                "$SID" "$ORDER_NUM" "$SECRET" "$(cat $MANIFEST)")
+              curl -sf -X POST -H "Content-Type: application/json" \
+                -d "$PAYLOAD" "$URL" || true
+            fi
+            SCRIPT
+            chmod +x /backup.sh
+            echo "0 3 * * * /backup.sh >> /var/log/backup.log 2>&1" | crontab -
+            crond -f -l 2
+        env:
+          - name: PGPASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: rfm-db-admin-' . $orderNum . '
+                key: password
+        volumeMounts:
+          - name: odoo-data
+            mountPath: /var/lib/odoo
+            subPath: filestore
+          - name: odoo-data
+            mountPath: /backups
+            subPath: backups
+          - name: rfm-db-admin
+            mountPath: /etc/rfm-db
+            readOnly: true
+          - name: rfm-webhook-config
+            mountPath: /etc/rfm-webhook
+            readOnly: true';
+
+    // Find the containers section and add the sidecar
+    // Look for pattern: "      containers:" followed by "      - name: odoo"
+    // We'll inject the sidecar after the odoo container (after its volumeMounts)
+    $pattern = '/(\s+containers:\s*\n)(\s+- name: odoo\n.*?)(\n\s+volumes:)/s';
+
+    if (preg_match($pattern, $yamlContent, $matches)) {
+        // Insert the sidecar container before the volumes section
+        $yamlContent = preg_replace($pattern, '$1$2' . "\n" . $sidecarContainer . '\3', $yamlContent);
+    } else {
+        RancherFleet\Logger::warn("injectBackupSidecar: could not find containers section");
+        return $yamlContent;
+    }
+
+    // Add volumes: rfm-db-admin and rfm-webhook-config if not already present
+    $dbAdminVolume = '      - name: rfm-db-admin
+        secret:
+          secretName: rfm-db-admin-' . $orderNum;
+    $webhookVolume = '      - name: rfm-webhook-config
+        secret:
+          secretName: rfm-webhook-' . $orderNum;
+
+    // Check if volumes already exist
+    if (strpos($yamlContent, 'rfm-db-admin') === false) {
+        // Insert before the closing "volumes:" section (find last volume and add after it)
+        $yamlContent = preg_replace_callback(
+            '/(\s+volumes:.*?)(\n[a-zA-Z])/s',
+            function ($m) use ($dbAdminVolume, $webhookVolume) {
+                $volumesEnd = strrpos($m[1], '- name:');
+                if ($volumesEnd !== false) {
+                    $endOfLastVolume = strpos($m[1], "\n", $volumesEnd + 20);
+                    if ($endOfLastVolume !== false) {
+                        return substr($m[1], 0, $endOfLastVolume) . "\n" . $dbAdminVolume . "\n" . $webhookVolume . substr($m[1], $endOfLastVolume) . $m[2];
+                    }
+                }
+                return $m[0];
+            },
+            $yamlContent,
+            1
+        );
+    }
+
+    RancherFleet\Logger::info("injectBackupSidecar: successfully injected backup sidecar");
+    return $yamlContent;
 }
 
 // ---------------------------------------------------------------------------
