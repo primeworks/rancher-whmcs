@@ -249,8 +249,8 @@ class FleetHelper
 
     private function fleetRequest($method, $path, $body = array())
     {
-        // Fleet GitRepo CRD accessed via kubectl-proxy using the configured cluster ID.
-        // This uses the same auth path as namespace and deployment operations.
-        return $this->rancher->rawRequest($method, self::FLEET_API_PATH . $path, $body);
+        // Fleet GitRepo CRD lives on the local management cluster, not the downstream cluster.
+        // Use rancherRequest with full path including /k8s/clusters/local prefix.
+        return $this->rancher->rancherRequest($method, '/k8s/clusters/local' . self::FLEET_API_PATH . $path, $body);
     }
 }

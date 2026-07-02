@@ -49,9 +49,9 @@ class RancherClient
         $response = $this->request('GET', $url);
         $name     = isset($response['name']) ? $response['name'] : $this->clusterId;
 
-        // Check if Fleet CRDs exist on this cluster
+        // Check if Fleet CRDs exist on the local cluster
         try {
-            $fleetUrl    = $this->k8sUrl('/apis/fleet.cattle.io/v1alpha1');
+            $fleetUrl    = $this->baseUrl . '/k8s/clusters/local/apis/fleet.cattle.io/v1alpha1';
             $fleetResp   = $this->request('GET', $fleetUrl);
             $resources   = isset($fleetResp['resources']) ? $fleetResp['resources'] : array();
             $kinds = array();
