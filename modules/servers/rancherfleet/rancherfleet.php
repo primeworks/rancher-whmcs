@@ -2556,7 +2556,7 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
         volumeMounts:
           - name: odoo-data
             mountPath: /var/lib/odoo
-            subPath: filestore
+            subPath: odoo
           - name: odoo-data
             mountPath: /backups
             subPath: backups
@@ -2568,9 +2568,9 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
             readOnly: true';
 
     // Find the containers section and add the sidecar
-    // Look for pattern: "      containers:" followed by "      - name: odoo"
+    // Look for pattern: "      containers:" followed by "      - name: odoo-" (odoo-{orderNum})
     // We'll inject the sidecar after the odoo container (after its volumeMounts)
-    $pattern = '/(\s+containers:\s*\n)(\s+- name: odoo\n.*?)(\n\s+volumes:)/s';
+    $pattern = '/(\s+containers:\s*\n)(\s+- name: odoo-\S*\n.*?)(\n\s+volumes:)/s';
 
     if (preg_match($pattern, $yamlContent, $matches)) {
         // Insert the sidecar container before the volumes section
@@ -2581,7 +2581,7 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
         $yamlContent = $newContent;
         RancherFleet\Logger::info("injectBackupSidecar: sidecar container injected into containers section");
     } else {
-        throw new \Exception("Could not find 'containers:' section with 'odoo' container in odoo.yml. Pattern did not match.");
+        throw new \Exception("Could not find 'containers:' section with 'odoo-*' container in odoo.yml. Pattern did not match.");
     }
 
     // Add volumes: rfm-db-admin and rfm-webhook-config if not already present
