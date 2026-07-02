@@ -896,7 +896,7 @@ function rancherfleet_buildClients(array $params)
     // Fleet's GitRepo spec.targets[].clusterName matches against the Fleet
     // Cluster CRD's metadata.name — the cluster's DISPLAY NAME, not its
     // c-xxxxx ID. Resolve and cache it via the Rancher v3 API.
-    $targetClusterName = $rancher->getClusterName();
+    $targetClusterName = $rancher->testConnection();
 
     $github = new RancherFleet\GitHubClient(
         isset($cfg['github_pat'])         ? $cfg['github_pat']         : '',
@@ -1832,15 +1832,15 @@ function rancherfleet_RepairGitRepo(array $params)
         if ($oldFleetNs !== $correctFleetNs) {
             try {
                 // Fleet GitRepo CRDs live on the LOCAL (Fleet management) cluster,
-                // not the downstream cluster — use localClusterRequest().
-                $old = $rancher->localClusterRequest(
+                // not the downstream cluster — use rancherRequest with /k8s/clusters/local path.
+                $old = $rancher->rancherRequest(
                     'GET',
-                    RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
+                    '/k8s/clusters/local' . RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
                 );
                 if (!empty($old)) {
-                    $rancher->localClusterRequest(
+                    $rancher->rancherRequest(
                         'DELETE',
-                        RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
+                        '/k8s/clusters/local' . RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
                     );
                     $actions[] = "removed stale GitRepo from namespace '{$oldFleetNs}'";
                 }
@@ -1855,12 +1855,12 @@ function rancherfleet_RepairGitRepo(array $params)
         // the corrected repo URL, branch, paths, and clusterName.
         $existing = $fleet->getGitRepo($namespace);
         if (!empty($existing)) {
-            $fleet->updateGitRepoTarget($namespace, $repoPath);
-            $actions[] = "updated GitRepo in '{$correctFleetNs}'";
-        } else {
-            $fleet->createGitRepo($namespace, $repoPath);
-            $actions[] = "created GitRepo in '{$correctFleetNs}'";
+            $fleet->deleteGitRepo($namespace);
         }
+        $fleet->createGitRepo($namespace, $repoPath);
+        $actions[] = !empty($existing)
+            ? "updated GitRepo in '{$correctFleetNs}'"
+            : "created GitRepo in '{$correctFleetNs}'";
 
         $actions[] = "clusterName='" . $fleet->getTargetClusterName() . "'";
 

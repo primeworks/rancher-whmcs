@@ -51,6 +51,16 @@ class FleetHelper
         $this->gitBasicPassword = $gitBasicPassword;
     }
 
+    public function getFleetNamespace()
+    {
+        return $this->fleetNamespace;
+    }
+
+    public function getTargetClusterName()
+    {
+        return $this->clusterId;
+    }
+
     // -----------------------------------------------------------------------
     // Phase 4: GitRepo CRUD
     // -----------------------------------------------------------------------
