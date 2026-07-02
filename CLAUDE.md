@@ -11,6 +11,10 @@ Odoo instances deployed via Rancher Fleet GitOps on a Kubernetes cluster. It han
 - Storage metering and upgrades via Longhorn API
 - Daily backups to PVC with WHMCS webhook notification
 - Database termination via Kubernetes Jobs (not exec — see gotchas)
+- An admin-area AJAX endpoint (`includes/hooks/rancherfleet_migration.php`) for
+  migrating an Odoo deployment between namespaces — its actual exec/DB logic lives
+  in `modules/addons/rancherfleet_migration/`, an addon module **not included in
+  this repo**
 
 ## Repository structure
 
@@ -22,6 +26,7 @@ Odoo instances deployed via Rancher Fleet GitOps on a Kubernetes cluster. It han
 │           ├── rancherfleet.php    ← primary module file (provisioning + client area)
 │           ├── backup_webhook.php  ← receives CronJob completion POSTs from cluster
 │           ├── backup-cronjob.yaml ← Fleet template manifest (copied to odoo-0000 branch)
+│           ├── templates/clientarea.tpl
 │           └── lib/
 │               ├── RancherClient.php
 │               ├── GitHubClient.php
@@ -30,15 +35,23 @@ Odoo instances deployed via Rancher Fleet GitOps on a Kubernetes cluster. It han
 │               ├── RetryQueue.php
 │               ├── LonghornClient.php
 │               ├── StorageUpgradeStore.php
+│               ├── DomainOrderManager.php  ← stray unused duplicate, see module CLAUDE.md gotchas
 │               └── Domains/
 │                   ├── ResellersPanelClient.php
 │                   ├── CloudflareClient.php
-│                   ├── DomainOrderManager.php
+│                   ├── DomainOrderManager.php  ← the one actually loaded
 │                   ├── DomainRecordStore.php
-│                   └── DomainRetryStore.php
+│                   ├── DomainRetryStore.php
+│                   └── IngressHelper.php   ← Traefik IngressRoute for root-domain redirects
 └── includes/
     └── hooks/
-        └── rancherfleet.php        ← cron hook for domain retry queue
+        ├── rancherfleet.php            ← cron hook for the infrastructure provisioning
+        │                                  retry queue (RetryQueue), plus the Fleet status
+        │                                  webhook receiver. Does NOT process the domain
+        │                                  registration retry queue — see module CLAUDE.md.
+        └── rancherfleet_migration.php   ← AJAX dispatcher for a migration addon UI; requires
+                                             modules/addons/rancherfleet_migration/, which is
+                                             NOT part of this repo
 ```
 
 ## Deployment
@@ -60,8 +73,8 @@ read on each request.
 | Fleet template branch | odoo-0000 |
 | Client namespace pattern | whmcs-client-{orderNum} |
 | Ingress controller | Traefik (not nginx) |
-| Postgres | postgres16 StatefulSet in `default` namespace |
-| Postgres hostname (in-cluster) | postgres16.default.svc.cluster.local |
+| Postgres | `db16` (postgres16 StatefulSet in `default` namespace) is the default; configurable per-product via the "Database Server" Module Setting (`db{N}` identifier, e.g. `db19`) |
+| Postgres hostname (in-cluster) | `postgres{N}.default.svc.cluster.local`, N from "Database Server" above (defaults to `postgres16...`) |
 | Longhorn | Distributed block storage, API via Rancher proxy |
 | NFS | 162.35.166.55:/export/share1 (used by Longhorn) |
 | Domain registrar | ResellersPanel.com (api.duoservers.com) |
@@ -88,6 +101,12 @@ FROM tblproducts WHERE id = {product_id};
 The numbered slots do NOT reliably match definition order in `_ConfigOptions()` —
 they can drift after field additions, module resets, or switching the module dropdown
 to "None" and back. Never assume position from definition order alone.
+
+`_ConfigOptions()` currently defines 22 fields — only 2 of the 24 slots remain
+free. Several helper functions also still read the (customer-facing-only)
+`$params['configoptions']['Friendly Name']` array instead of `configoptionN`
+for Module Settings — see "configoption access pattern is inconsistent" in
+`modules/servers/rancherfleet/CLAUDE.md` before assuming a setting works.
 
 ## Related repositories
 
