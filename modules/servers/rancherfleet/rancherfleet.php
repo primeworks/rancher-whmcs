@@ -2585,28 +2585,49 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
     $yamlContent = $newContent;
     RancherFleet\Logger::info("injectBackupSidecar: sidecar container injected before restartPolicy");
 
-    // Step 4: Add volumes if not already present
-    if (strpos($yamlContent, 'rfm-db-admin') === false) {
-        $dbVolume = '      - name: rfm-db-admin
+    // Step 4: Add volumes ONLY within Deployment if not already present
+    // Look for Deployment's volumes: section specifically (after the Deployment kind: line)
+    // and insert before "      - name: config" which is always the first volume in the template
+    $dbVolume = '      - name: rfm-db-admin
         secret:
           secretName: rfm-db-admin-' . $orderNum;
-        $webhookVolume = '      - name: rfm-webhook-config
+    $webhookVolume = '      - name: rfm-webhook-config
         secret:
           secretName: rfm-webhook-' . $orderNum;
 
-        // Find volumes: section and add before "      - name: config"
-        $volumePattern = '/(volumes:\s*\n)(      - name: config)/';
-        $newContent = preg_replace($volumePattern, '${1}' . $dbVolume . "\n" . $webhookVolume . "\n" . '${2}', $yamlContent);
+    // Check if volumes already exist (look for them anywhere in Deployment)
+    $deploymentHasVolumes = preg_match('/kind:\s*Deployment.*?rfm-db-admin/is', $yamlContent);
+
+    if (!$deploymentHasVolumes) {
+        // Find Deployment block's volumes section and insert before "      - name: config"
+        // Pattern: start from "kind: Deployment", find "volumes:", then "- name: config"
+        $volumePattern = '/(kind:\s*Deployment.*?)(^\s{6}volumes:\s*\n)(^\s{6}- name: config)/ms';
+        $newContent = preg_replace(
+            $volumePattern,
+            '${1}${2}' . $dbVolume . "\n" . $webhookVolume . "\n" . '${3}',
+            $yamlContent
+        );
         if (!$newContent) {
-            throw new \Exception("Failed to add backup secret volumes");
+            throw new \Exception("Failed to inject backup secret volumes into Deployment volumes section");
         }
         $yamlContent = $newContent;
-        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes added");
+        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes injected into Deployment");
     } else {
-        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes already present");
+        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes already present in Deployment");
     }
 
-    RancherFleet\Logger::info("injectBackupSidecar: successfully injected backup sidecar and volumes");
+    // Step 5: Atomic validation — verify BOTH sidecar and volumes are now present
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+backup\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: backup sidecar container not found after injection");
+    }
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+rfm-db-admin\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: rfm-db-admin volume not found after injection");
+    }
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+rfm-webhook-config\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: rfm-webhook-config volume not found after injection");
+    }
+
+    RancherFleet\Logger::info("injectBackupSidecar: atomic validation passed - sidecar and volumes present");
     return $yamlContent;
 }
 
