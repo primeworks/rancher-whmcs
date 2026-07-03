@@ -545,6 +545,7 @@ function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $
         ),
     );
 
+    $secretsCreated = array();
     foreach ($secrets as $secretName => $data) {
         $secretBody = array(
             'apiVersion' => 'v1',
@@ -564,6 +565,7 @@ function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $
                     $secretBody
                 );
                 RancherFleet\Logger::info("createDbAdminSecret: created {$secretName} in {$namespace}");
+                $secretsCreated[$secretName] = true;
             } catch (RancherFleet\RancherApiException $e) {
                 if ($e->getHttpCode() === 409) {
                     $rancher->rawRequest('PATCH',
@@ -572,13 +574,23 @@ function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $
                         array('Content-Type: application/strategic-merge-patch+json')
                     );
                     RancherFleet\Logger::info("createDbAdminSecret: patched {$secretName}");
+                    $secretsCreated[$secretName] = true;
                 } else {
                     throw $e;
                 }
             }
         } catch (\Exception $e) {
             RancherFleet\Logger::error("createDbAdminSecret: FAILED {$secretName} in {$namespace}: " . $e->getMessage());
+            $secretsCreated[$secretName] = false;
         }
+    }
+
+    // Verify both required secrets were created
+    if (empty($secretsCreated['rfm-db-admin-' . $orderNum])) {
+        RancherFleet\Logger::error("createDbAdminSecret: rfm-db-admin-{$orderNum} not created in {$namespace}");
+    }
+    if (empty($secretsCreated['rfm-webhook-' . $orderNum])) {
+        RancherFleet\Logger::error("createDbAdminSecret: rfm-webhook-{$orderNum} not created in {$namespace}");
     }
 }
 
@@ -2487,6 +2499,17 @@ function rancherfleet_PushBackupSidecar(array $params)
  */
 function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
 {
+    // Step 0: Remove any existing NFS CronJob (old backup approach)
+    $cronJobName = 'odoo-' . $orderNum . '-backup';
+    $cronJobPattern = '/^---\n.*?kind:\s*CronJob\s*\n.*?name:\s*' . preg_quote($cronJobName, '/') . '\s*\n.*?(?=^---|$)/ms';
+    $yamlContent = preg_replace($cronJobPattern, '', $yamlContent);
+
+    // Clean up any double document separators left behind
+    $yamlContent = preg_replace('/\n---\n---/', "\n---", $yamlContent);
+    $yamlContent = preg_replace('/^---\n---/', "---", $yamlContent);
+
+    RancherFleet\Logger::info("injectBackupSidecar: removed old NFS CronJob '{$cronJobName}' if present");
+
     // Step 1: Find the Deployment resource
     if (!preg_match('/kind:\s*Deployment/i', $yamlContent, $m)) {
         throw new \Exception("No Deployment resource found in odoo.yml");
