@@ -573,8 +573,7 @@ function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $
                 if ($e->getHttpCode() === 409) {
                     $rancher->rawRequest('PATCH',
                         '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets/' . rawurlencode($secretName),
-                        array('data' => $data),
-                        array('Content-Type: application/strategic-merge-patch+json')
+                        array('data' => $data)
                     );
                     RancherFleet\Logger::info("createDbAdminSecret: patched {$secretName}");
                     $secretsCreated[$secretName] = true;
