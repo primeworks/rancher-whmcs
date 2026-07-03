@@ -529,8 +529,11 @@ function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $
         return;
     }
 
-    // Determine WHMCS base URL for the webhook
+    // Determine WHMCS base URL for the webhook (with fallback if empty)
     $whmcsUrl = function_exists('App') ? \App::getSystemUrl() : '';
+    if (empty($whmcsUrl)) {
+        $whmcsUrl = 'https://host.webdiscode.com';
+    }
     $webhookUrl = rtrim($whmcsUrl, '/') . '/modules/servers/rancherfleet/backup_webhook.php';
 
     $secrets = array(
@@ -1728,6 +1731,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Clear Retry Queue'      => 'ClearRetryQueue',
         'Push Backup CronJob'    => 'PushBackupCronJob',
         'Push Backup Sidecar'    => 'PushBackupSidecar',
+        'Refresh Webhook Secret' => 'RefreshWebhookSecret',
         'Patch Template Updates' => 'PatchTemplateUpdates',
     );
 }
@@ -2739,6 +2743,29 @@ function rancherfleet_preserveVersionMarkers($content, array $markers)
     }
 
     return $content;
+}
+
+/**
+ * Refreshes the webhook Secret (rfm-webhook-{orderNum}) for an existing
+ * instance. Allows admins to fix an instance that has an incorrect webhook
+ * URL or credentials without needing kubectl access.
+ */
+function rancherfleet_RefreshWebhookSecret(array $params)
+{
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+
+        rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+
+        RancherFleet\Logger::info("RefreshWebhookSecret: SUCCESS - recreated Secrets for {$namespace}");
+        return 'Success: rfm-db-admin and rfm-webhook Secrets have been recreated with current values.';
+    } catch (Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("RefreshWebhookSecret FAILED:\n" . $detail);
+        return 'Error: ' . $e->getMessage();
+    }
 }
 
 function rancherfleet_PatchTemplateUpdates(array $params)
