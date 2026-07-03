@@ -1055,18 +1055,12 @@ function rancherfleet_CreateAccount(array $params)
         'gitrepo_created'   => false,
     );
 
-    // Phase 1: Connection test and template validation
+    // Phase 1: Connection test
     try {
-        list($rancher, $github) = rancherfleet_buildClients($params);
+        list($rancher) = rancherfleet_buildClients($params);
         RancherFleet\Logger::info("CreateAccount: rancherfleet_buildClients() completed");
         $rancher->testConnection();
         RancherFleet\Logger::info("CreateAccount: testConnection() completed");
-        RancherFleet\Logger::info("CreateAccount: validateTemplate() starting");
-        $validationErrors = $github->validateTemplate();
-        if (!empty($validationErrors)) {
-            return 'Error (Phase 1 - Template Validation): ' . implode('; ', $validationErrors);
-        }
-        RancherFleet\Logger::info("CreateAccount: validateTemplate() completed");
     } catch (Exception $e) {
         RancherFleet\RetryQueue::enqueue($serviceId, 'TestConnection', $namespace, $e->getMessage());
         return 'Error (Phase 1 - Connection): ' . $e->getMessage();
