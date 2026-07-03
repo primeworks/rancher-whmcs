@@ -538,49 +538,22 @@ function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $
 
     $secrets = array(
         'rfm-db-admin-' . $orderNum => array(
-            'username' => base64_encode($dbUser),
-            'password' => base64_encode($dbPass),
+            'username' => $dbUser,
+            'password' => $dbPass,
         ),
         'rfm-webhook-' . $orderNum => array(
-            'url'        => base64_encode($webhookUrl),
-            'secret'     => base64_encode($authSecret),
-            'service_id' => base64_encode((string)$serviceId),
+            'url'        => $webhookUrl,
+            'secret'     => $authSecret,
+            'service_id' => (string)$serviceId,
         ),
     );
 
     $secretsCreated = array();
     foreach ($secrets as $secretName => $data) {
-        $secretBody = array(
-            'apiVersion' => 'v1',
-            'kind'       => 'Secret',
-            'metadata'   => array(
-                'name'      => $secretName,
-                'namespace' => $namespace,
-            ),
-            'type' => 'Opaque',
-            'data' => $data,
-        );
-
         try {
-            try {
-                $rancher->rawRequest('POST',
-                    '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets',
-                    $secretBody
-                );
-                RancherFleet\Logger::info("createDbAdminSecret: created {$secretName} in {$namespace}");
-                $secretsCreated[$secretName] = true;
-            } catch (RancherFleet\RancherApiException $e) {
-                if ($e->getHttpCode() === 409) {
-                    $rancher->rawRequest('PATCH',
-                        '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets/' . rawurlencode($secretName),
-                        array('data' => $data)
-                    );
-                    RancherFleet\Logger::info("createDbAdminSecret: patched {$secretName}");
-                    $secretsCreated[$secretName] = true;
-                } else {
-                    throw $e;
-                }
-            }
+            $rancher->applySecret($namespace, $secretName, $data);
+            RancherFleet\Logger::info("createDbAdminSecret: applied {$secretName} in {$namespace}");
+            $secretsCreated[$secretName] = true;
         } catch (\Exception $e) {
             RancherFleet\Logger::error("createDbAdminSecret: FAILED {$secretName} in {$namespace}: " . $e->getMessage());
             $secretsCreated[$secretName] = false;
