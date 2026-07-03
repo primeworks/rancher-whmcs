@@ -924,6 +924,7 @@ class RancherClient
         curl_setopt($ch, CURLOPT_URL,            $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT,        $this->timeout);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST,  strtoupper($method));
         curl_setopt($ch, CURLOPT_HTTPHEADER,     $headers);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);

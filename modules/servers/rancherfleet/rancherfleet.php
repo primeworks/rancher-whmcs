@@ -1024,6 +1024,8 @@ function rancherfleet_exceptionDetail($e)
 
 function rancherfleet_CreateAccount(array $params)
 {
+    RancherFleet\Logger::info("CreateAccount: starting");
+
     // If automatic provisioning is disabled, skip all phases.
     if (!rancherfleet_isAutomatic($params)) {
         RancherFleet\Logger::info("CreateAccount: automatic provisioning disabled, skipping.");
@@ -1056,7 +1058,9 @@ function rancherfleet_CreateAccount(array $params)
     // Phase 1: Connection test
     try {
         list($rancher) = rancherfleet_buildClients($params);
+        RancherFleet\Logger::info("CreateAccount: rancherfleet_buildClients() completed");
         $rancher->testConnection();
+        RancherFleet\Logger::info("CreateAccount: testConnection() completed");
     } catch (Exception $e) {
         RancherFleet\RetryQueue::enqueue($serviceId, 'TestConnection', $namespace, $e->getMessage());
         return 'Error (Phase 1 - Connection): ' . $e->getMessage();
@@ -1075,16 +1079,19 @@ function rancherfleet_CreateAccount(array $params)
 
         $rancher->createNamespace($namespace);
         $completed['namespace_created'] = true;
+        RancherFleet\Logger::info("CreateAccount: createNamespace() completed for {$namespace}");
 
         // Phase C: Create client ServiceAccount for kubeconfig
         $rancher->createClientServiceAccount($namespace);
-        RancherFleet\Logger::info("CreateAccount: service account created for {$namespace}");
+        RancherFleet\Logger::info("CreateAccount: createClientServiceAccount() completed for {$namespace}");
 
         // Phase C: Inject secrets from product custom fields
         rancherfleet_doInjectSecrets($params, $namespace);
+        RancherFleet\Logger::info("CreateAccount: doInjectSecrets() completed for {$namespace}");
 
         // Phase C: Create DB admin Secret for backup CronJob
         rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+        RancherFleet\Logger::info("CreateAccount: createDbAdminSecret() completed for {$namespace}");
 
     } catch (Exception $e) {
         rancherfleet_doRollback($params, $completed);
