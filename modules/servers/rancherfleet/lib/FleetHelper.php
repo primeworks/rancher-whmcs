@@ -67,9 +67,10 @@ class FleetHelper
 
     /**
      * Creates a Fleet GitRepo for a client namespace.
+     * Files are expected at the branch root (no subfolder).
      *
      * @param string $namespace  Target namespace (whmcs-client-{id})
-     * @param string $repoPath   Path in repo (clients/whmcs-client-{id})
+     * @param string $repoPath   (Deprecated, no longer used — files are at branch root)
      */
     public function createGitRepo($namespace, $repoPath)
     {
@@ -79,7 +80,6 @@ class FleetHelper
         $spec = array(
             'repo'            => $repoUrl,
             'branch'          => $namespace,
-            'paths'           => array($repoPath),
             'pollingInterval' => '15s',
             'targets'         => array(
                 array(
