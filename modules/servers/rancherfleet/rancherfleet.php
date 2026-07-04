@@ -4303,12 +4303,10 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
     }
 
     try {
-        list($github) = rancherfleet_buildClients($params);
+        list($rancher, $github, $fleet) = rancherfleet_buildClients($params);
 
         // Read odoo.yml from client branch
-        $branchName = $namespace;
-        $filename = 'odoo.yml';
-        $manifestContent = $github->getFileContents($branchName, $filename);
+        $manifestContent = $github->getClientFileContent($namespace, 'odoo.yml');
         if (!$manifestContent) {
             return 'custom_url_error:Could not read manifest file. Please contact support.';
         }
@@ -4321,9 +4319,9 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
 
         // Write updated manifest back
         $github->writeFileToBranch(
-            $branchName,
-            $filename,
+            'odoo.yml',
             $updated,
+            $namespace,
             'Connect custom subdomain: ' . $subdomain
         );
 
