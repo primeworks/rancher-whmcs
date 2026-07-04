@@ -2440,7 +2440,7 @@ function rancherfleet_PushBackupSidecar(array $params)
             rancherfleet_logHistory($params, 'Backup Sidecar Injected', $namespace);
         } catch (\Exception $historyEx) {
             // History logging is non-critical; log but don't fail
-            RancherFleet\Logger::warn("PushBackupSidecar: failed to log history: " . $historyEx->getMessage());
+            RancherFleet\Logger::info("PushBackupSidecar: failed to log history: " . $historyEx->getMessage());
         }
 
         RancherFleet\Logger::info("PushBackupSidecar: SUCCESS for {$namespace}");
@@ -2756,7 +2756,7 @@ function rancherfleet_RemoveCustomUrl(array $params)
             ->value('value');
 
         if (!$customUrl) {
-            RancherFleet\Logger::warn("RemoveCustomUrl: no custom URL found for service {$serviceId}");
+            RancherFleet\Logger::info("RemoveCustomUrl: no custom URL found for service {$serviceId}");
             return 'Error: No custom URL found for this service';
         }
 
@@ -4483,10 +4483,10 @@ function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
             $replacement = "$1\n        - " . $subdomain;
             $ingress = preg_replace($tlsPattern, $replacement, $ingress, 1);
         } else {
-            RancherFleet\Logger::warn("addSubdomainToIngress: TLS hosts pattern did NOT match (pattern: " . $tlsPattern . ")");
+            RancherFleet\Logger::info("addSubdomainToIngress: TLS hosts pattern did NOT match (pattern: " . $tlsPattern . ")");
         }
     } else {
-        RancherFleet\Logger::warn("addSubdomainToIngress: 'spec:' not found in Ingress resource");
+        RancherFleet\Logger::info("addSubdomainToIngress: 'spec:' not found in Ingress resource");
     }
 
     // Add subdomain to spec.rules array
@@ -4499,7 +4499,7 @@ function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
         $newRule = "\n  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
         $ingress = str_replace($matches[0], $matches[0] . $newRule, $ingress);
     } else {
-        RancherFleet\Logger::warn("addSubdomainToIngress: rules pattern did NOT match");
+        RancherFleet\Logger::info("addSubdomainToIngress: rules pattern did NOT match");
     }
 
     // Reconstruct the full document
@@ -4549,7 +4549,7 @@ function rancherfleet_removeSubdomainFromIngress($yamlContent, $subdomain, $orde
         RancherFleet\Logger::info("removeSubdomainFromIngress: TLS hosts entry found, removing");
         $ingress = preg_replace($tlsLinePattern, '', $ingress, 1);
     } else {
-        RancherFleet\Logger::warn("removeSubdomainFromIngress: TLS hosts entry for {$subdomain} not found");
+        RancherFleet\Logger::info("removeSubdomainFromIngress: TLS hosts entry for {$subdomain} not found");
     }
 
     // Remove the entire rules entry for this subdomain
@@ -4559,7 +4559,7 @@ function rancherfleet_removeSubdomainFromIngress($yamlContent, $subdomain, $orde
         RancherFleet\Logger::info("removeSubdomainFromIngress: rules entry found, removing");
         $ingress = preg_replace($rulesPattern, '', $ingress, 1);
     } else {
-        RancherFleet\Logger::warn("removeSubdomainFromIngress: rules entry for {$subdomain} not found");
+        RancherFleet\Logger::info("removeSubdomainFromIngress: rules entry for {$subdomain} not found");
     }
 
     // Reconstruct the full document
