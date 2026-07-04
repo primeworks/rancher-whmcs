@@ -3587,6 +3587,8 @@ function rancherfleet_ClientArea(array $params)
         } else {
             $message = 'error:Invalid backup file or type';
         }
+    } elseif ($action === 'custom_url_connect') {
+        $message = rancherfleet_handleCustomUrlConnect($params, $namespace, $orderNum);
     }
 
     // Build the output
@@ -3844,6 +3846,7 @@ function rancherfleet_domainPanelHtml(array $params, $namespace, $orderNum)
 {
     $html = '<div class="rfm-ca-card">';
     $html .= '<h4>Domain Name</h4>';
+    $html .= rancherfleet_creditBalanceHtml($params);
 
     // See buildDomainClients() comment re: confirmed numbered positions
     // for product 126 (re-confirmed 2026-06-16 after a module-dropdown
@@ -4011,6 +4014,32 @@ function rancherfleet_domainPurchaseModal($sld, $tld, $serviceUrl)
     return $html;
 }
 
+
+/**
+ * Renders the client's WHMCS credit balance as a small styled badge.
+ * Reads from tblclients.credit.
+ *
+ * @param  array $params
+ * @return string  HTML badge
+ */
+function rancherfleet_creditBalanceHtml(array $params)
+{
+    $clientId = (int)$params['userid'];
+    try {
+        $client = \WHMCS\Database\Capsule::table('tblclients')
+            ->where('id', $clientId)
+            ->first(['credit']);
+        if (!$client) {
+            return '';
+        }
+        $creditBalance = (float)$client->credit;
+        $currency = isset($params['clientsdetails']['currency_code'])
+                  ? $params['clientsdetails']['currency_code'] : 'USD';
+        return '<div style="display:inline-block;background:#e8f4f8;border:1px solid #a8d5dd;color:#0c5460;padding:6px 12px;border-radius:12px;font-size:11px;font-weight:bold;margin-bottom:12px;">&#127874; Credit Balance: <strong>' . $currency . ' ' . number_format($creditBalance, 2) . '</strong></div>';
+    } catch (\Exception $e) {
+        return '';
+    }
+}
 
 /**
  * Reads storage upgrade configuration from params.
@@ -4217,6 +4246,139 @@ function rancherfleet_handleStorageUpgrade(array $params, $namespace, $orderNum)
 }
 
 /**
+ * Handles a custom URL domain connection POST from the client area.
+ * Validates domain format, updates odoo.yml Ingress, and stores the domain.
+ *
+ * @return string  'custom_url_success:{domain}' | 'custom_url_error:{message}'
+ */
+function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNum)
+{
+    $domain = isset($_POST['custom_url_domain']) ? trim($_POST['custom_url_domain']) : '';
+    $serviceId = (int)$params['serviceid'];
+
+    if (!$domain) {
+        return 'custom_url_error:Domain name is required.';
+    }
+
+    // Validate domain format: allow letters, numbers, hyphens, dots
+    if (!preg_match('/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i', $domain)) {
+        return 'custom_url_error:Invalid domain format. Use letters, numbers, and hyphens only (e.g. example.com).';
+    }
+
+    try {
+        list($github) = rancherfleet_buildClients($params);
+
+        // Read odoo.yml from client branch
+        $branchName = $namespace;
+        $filename = 'odoo.yml';
+        $manifestContent = $github->getFileContents($branchName, $filename);
+        if (!$manifestContent) {
+            return 'custom_url_error:Could not read manifest file. Please contact support.';
+        }
+
+        // Find and update the Ingress resource
+        $updated = rancherfleet_addDomainToIngress($manifestContent, $domain, $orderNum);
+        if ($updated === false) {
+            return 'custom_url_error:Could not update Ingress configuration. Please contact support.';
+        }
+
+        // Write updated manifest back
+        $github->writeFileToBranch(
+            $branchName,
+            $filename,
+            $updated,
+            'Connect custom domain: ' . $domain
+        );
+
+        // Store the custom URL in tbladdonmodules
+        $table = \WHMCS\Database\Capsule::table('tbladdonmodules');
+        $setting = 'url_' . $serviceId;
+        $existing = $table->where('module', 'rancherfleet_custom_url')
+            ->where('setting', $setting)
+            ->first();
+
+        if ($existing) {
+            $table->where('module', 'rancherfleet_custom_url')
+                ->where('setting', $setting)
+                ->update(['value' => $domain]);
+        } else {
+            $table->insert([
+                'module'  => 'rancherfleet_custom_url',
+                'setting' => $setting,
+                'value'   => $domain,
+            ]);
+        }
+
+        rancherfleet_logHistory($params, 'Custom Domain Connected', $domain);
+        RancherFleet\Logger::info("handleCustomUrlConnect: SUCCESS {$namespace} -> {$domain}");
+
+        return 'custom_url_success:' . $domain;
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("handleCustomUrlConnect: " . $e->getMessage());
+        return 'custom_url_error:' . $e->getMessage();
+    }
+}
+
+/**
+ * Adds a custom domain to the Ingress resource in odoo.yml.
+ * Updates both spec.tls[0].hosts and spec.rules to include the new domain.
+ *
+ * @param  string $yamlContent  The odoo.yml file content
+ * @param  string $customDomain The domain to add (e.g. example.com)
+ * @param  int    $orderNum     The order number for service name
+ * @return string|false  Updated YAML content, or false on failure
+ */
+function rancherfleet_addDomainToIngress($yamlContent, $customDomain, $orderNum)
+{
+    // Find the Ingress block by looking for "kind: Ingress"
+    if (strpos($yamlContent, 'kind: Ingress') === false) {
+        return false;
+    }
+
+    // Split by resource boundaries (---) to handle multi-resource documents
+    $resources = explode("\n---\n", $yamlContent);
+    $ingressIdx = -1;
+
+    for ($i = 0; $i < count($resources); $i++) {
+        if (strpos($resources[$i], 'kind: Ingress') !== false) {
+            $ingressIdx = $i;
+            break;
+        }
+    }
+
+    if ($ingressIdx === -1) {
+        return false;
+    }
+
+    $ingress = $resources[$ingressIdx];
+
+    // Add domain to spec.tls[0].hosts array
+    if (strpos($ingress, 'spec:') !== false) {
+        $tlsPattern = '/(\s+hosts:\s*\n\s+-\s+' . preg_quote($orderNum, '/') . '\.webdiscode\.com)/';
+        if (preg_match($tlsPattern, $ingress)) {
+            // Add custom domain after the default host
+            $replacement = "$1\n        - " . $customDomain;
+            $ingress = preg_replace($tlsPattern, $replacement, $ingress, 1);
+        }
+    }
+
+    // Add custom domain to spec.rules array
+    // Look for an existing rule block and duplicate it with the custom domain
+    $rulesPattern = '/(\s+- host: ' . preg_quote($orderNum, '/') . '\.webdiscode\.com\n\s+http:\n\s+paths:\n\s+-\s+path:\s+\/\n\s+pathType:\s+Prefix\n\s+backend:\n\s+service:\n\s+name:\s+odoo-\d+\n\s+port:\n\s+number:\s+8069)/';
+
+    if (preg_match($rulesPattern, $ingress, $matches)) {
+        // Create a new rule block for the custom domain
+        $newRule = "\n  - host: " . $customDomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
+        $ingress = str_replace($matches[0], $matches[0] . $newRule, $ingress);
+    }
+
+    // Reconstruct the full document
+    $resources[$ingressIdx] = $ingress;
+    return implode("\n---\n", $resources);
+}
+
+/**
  * Renders the storage usage card and upgrade panel for the client area.
  *
  * @param  array  $params
@@ -4238,6 +4400,7 @@ function rancherfleet_storagePanelHtml(array $params, $namespace, $serviceUrl, $
 
     $html  = '<div class="rfm-ca-card">';
     $html .= '<h4>Storage</h4>';
+    $html .= rancherfleet_creditBalanceHtml($params);
 
     // Try to get live usage
     $usage = rancherfleet_getStorageUsage($params, $namespace, $pvcName);
@@ -4434,6 +4597,11 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-success">&#10003; Backup restored successfully. Your instance will be back online shortly.</div>';
     } elseif (strpos($message, 'backup_restore_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; Restore failed: ' . htmlspecialchars(substr($message, strlen('backup_restore_error:'))) . '</div>';
+    } elseif (strpos($message, 'custom_url_success:') === 0) {
+        $domain = substr($message, strlen('custom_url_success:'));
+        $html .= '<div class="rfm-alert-success">&#10003; Your domain ' . htmlspecialchars($domain) . ' has been connected. DNS propagation may take up to 24 hours.</div>';
+    } elseif (strpos($message, 'custom_url_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('custom_url_error:'))) . '</div>';
     }
 
     try {
@@ -4504,6 +4672,74 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '</div>';
         $html .= '</div>';
         $html .= '</div>'; // instance link card
+
+        // -----------------------------------------------------------------------
+        // Custom URL Ingress Card
+        // -----------------------------------------------------------------------
+        $customUrl = null;
+        try {
+            $customUrlData = \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_custom_url')
+                ->where('setting', 'url_' . $serviceId)
+                ->value('value');
+            if ($customUrlData) {
+                $customUrl = $customUrlData;
+            }
+        } catch (\Exception $e) {
+            // Continue without custom URL
+        }
+
+        $html .= '<div class="rfm-ca-card">';
+        $html .= '<h4>Custom Domain URL</h4>';
+
+        if ($customUrl) {
+            $html .= '<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px;">';
+            $html .= '<p style="font-size:12px;color:#666;margin:0 0 8px;">Connected domain:</p>';
+            $html .= '<div style="display:flex;align-items:center;gap:10px;">';
+            $html .= '<span style="font-size:13px;font-weight:bold;color:#2980b9;font-family:monospace;">' . htmlspecialchars($customUrl) . '</span>';
+            $html .= '<a href="https://' . htmlspecialchars($customUrl) . '" target="_blank" style="color:#2980b9;text-decoration:none;font-size:13px;">&#8599;</a>';
+            $html .= '</div>';
+            $html .= '<p style="font-size:11px;color:#888;margin:8px 0 0;">To change or remove this domain, contact support.</p>';
+            $html .= '</div>';
+        } else {
+            $html .= '<p style="font-size:12px;color:#666;margin-bottom:10px;">Connect a custom domain you own to this instance. Your domain must point to <code>cowboy.webdiscode.com</code> via CNAME record.</p>';
+            $html .= '<form method="post" action="' . $serviceUrl . '">';
+            $html .= '<div style="margin-bottom:12px;">';
+            $html .= '<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;cursor:pointer;">';
+            $html .= '<input type="checkbox" name="custom_url_enable" id="custom_url_enable" onchange="document.getElementById(\'custom_url_form\').style.display=this.checked?\'block\':\'none\'" style="cursor:pointer;">';
+            $html .= '<span>I have a custom domain pointing to cowboy.webdiscode.com</span>';
+            $html .= '</label>';
+            $html .= '</div>';
+            $html .= '<div id="custom_url_form" style="display:none;background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<label style="display:block;font-size:12px;font-weight:bold;margin:0 0 6px;color:#333;">Domain name</label>';
+            $html .= '<input type="text" name="custom_url_domain" placeholder="example.com" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;box-sizing:border-box;margin-bottom:10px;">';
+            $html .= '<p style="font-size:11px;color:#888;margin:0;">Enter only the domain name (e.g. <code>example.com</code>, not <code>www.example.com</code> or <code>https://example.com</code>).</p>';
+            $html .= '</div>';
+            $html .= '<input type="hidden" name="clientaction" value="custom_url_connect">';
+            $html .= '<button type="submit" id="custom_url_btn" disabled style="background:#2980b9;color:#fff;border:none;border-radius:4px;padding:8px 18px;font-size:13px;font-weight:bold;cursor:not-allowed;opacity:0.5;">Connect Domain</button>';
+            $html .= '<script>
+                document.getElementById("custom_url_enable").addEventListener("change", function() {
+                    const btn = document.getElementById("custom_url_btn");
+                    const input = document.querySelector("input[name=custom_url_domain]");
+                    if (this.checked) {
+                        btn.disabled = false;
+                        btn.style.opacity = "1";
+                        btn.style.cursor = "pointer";
+                        input.addEventListener("input", function() {
+                            btn.disabled = !this.value.trim();
+                            btn.style.opacity = this.value.trim() ? "1" : "0.5";
+                            btn.style.cursor = this.value.trim() ? "pointer" : "not-allowed";
+                        });
+                    } else {
+                        btn.disabled = true;
+                        btn.style.opacity = "0.5";
+                        btn.style.cursor = "not-allowed";
+                    }
+                });
+            </script>';
+            $html .= '</form>';
+        }
+        $html .= '</div>';
 
         // -----------------------------------------------------------------------
         // Status Card
