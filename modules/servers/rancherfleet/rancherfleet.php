@@ -4306,24 +4306,32 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
         list($rancher, $github, $fleet) = rancherfleet_buildClients($params);
 
         // Read odoo.yml from client branch
+        RancherFleet\Logger::info("handleCustomUrlConnect: reading odoo.yml from {$namespace}");
         $manifestContent = $github->getClientFileContent($namespace, 'odoo.yml');
         if (!$manifestContent) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: failed to read odoo.yml from {$namespace}");
             return 'custom_url_error:Could not read manifest file. Please contact support.';
         }
+        RancherFleet\Logger::info("handleCustomUrlConnect: odoo.yml read successfully, size=" . strlen($manifestContent) . " bytes");
 
         // Find and update the Ingress resource
+        RancherFleet\Logger::info("handleCustomUrlConnect: adding subdomain {$subdomain} to Ingress");
         $updated = rancherfleet_addSubdomainToIngress($manifestContent, $subdomain, $orderNum);
         if ($updated === false) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: addSubdomainToIngress returned false for {$subdomain}");
             return 'custom_url_error:Could not update Ingress configuration. Please contact support.';
         }
+        RancherFleet\Logger::info("handleCustomUrlConnect: Ingress updated successfully");
 
         // Write updated manifest back
+        RancherFleet\Logger::info("handleCustomUrlConnect: writing updated odoo.yml to {$namespace}");
         $github->writeFileToBranch(
             'odoo.yml',
             $updated,
             $namespace,
             'Connect custom subdomain: ' . $subdomain
         );
+        RancherFleet\Logger::info("handleCustomUrlConnect: odoo.yml written successfully");
 
         // Store the custom subdomain in tbladdonmodules
         $table = \WHMCS\Database\Capsule::table('tbladdonmodules');
@@ -4336,12 +4344,14 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
             $table->where('module', 'rancherfleet_custom_url')
                 ->where('setting', $setting)
                 ->update(['value' => $subdomain]);
+            RancherFleet\Logger::info("handleCustomUrlConnect: updated tbladdonmodules");
         } else {
             $table->insert([
                 'module'  => 'rancherfleet_custom_url',
                 'setting' => $setting,
                 'value'   => $subdomain,
             ]);
+            RancherFleet\Logger::info("handleCustomUrlConnect: inserted into tbladdonmodules");
         }
 
         rancherfleet_logHistory($params, 'Custom Subdomain Connected', $subdomain);
@@ -4350,7 +4360,7 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
         return 'custom_url_success:' . $subdomain;
 
     } catch (\Exception $e) {
-        RancherFleet\Logger::error("handleCustomUrlConnect: " . $e->getMessage());
+        RancherFleet\Logger::error("handleCustomUrlConnect: EXCEPTION " . $e->getMessage() . "\n" . $e->getTraceAsString());
         return 'custom_url_error:' . $e->getMessage();
     }
 }
@@ -4368,6 +4378,7 @@ function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
 {
     // Find the Ingress block by looking for "kind: Ingress"
     if (strpos($yamlContent, 'kind: Ingress') === false) {
+        RancherFleet\Logger::error("addSubdomainToIngress: 'kind: Ingress' not found in manifest");
         return false;
     }
 
@@ -4383,9 +4394,11 @@ function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
     }
 
     if ($ingressIdx === -1) {
+        RancherFleet\Logger::error("addSubdomainToIngress: failed to find Ingress resource index");
         return false;
     }
 
+    RancherFleet\Logger::info("addSubdomainToIngress: found Ingress at resource index {$ingressIdx}");
     $ingress = $resources[$ingressIdx];
 
     // Add subdomain to spec.tls[0].hosts array
@@ -4393,9 +4406,14 @@ function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
         $tlsPattern = '/(\s+hosts:\s*\n\s+-\s+' . preg_quote($orderNum, '/') . '\.webdiscode\.com)/';
         if (preg_match($tlsPattern, $ingress)) {
             // Add custom subdomain after the default host
+            RancherFleet\Logger::info("addSubdomainToIngress: TLS hosts pattern matched, adding subdomain");
             $replacement = "$1\n        - " . $subdomain;
             $ingress = preg_replace($tlsPattern, $replacement, $ingress, 1);
+        } else {
+            RancherFleet\Logger::warn("addSubdomainToIngress: TLS hosts pattern did NOT match (pattern: " . $tlsPattern . ")");
         }
+    } else {
+        RancherFleet\Logger::warn("addSubdomainToIngress: 'spec:' not found in Ingress resource");
     }
 
     // Add subdomain to spec.rules array
@@ -4404,8 +4422,11 @@ function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
 
     if (preg_match($rulesPattern, $ingress, $matches)) {
         // Create a new rule block for the custom subdomain
+        RancherFleet\Logger::info("addSubdomainToIngress: rules pattern matched, adding rule for subdomain");
         $newRule = "\n  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
         $ingress = str_replace($matches[0], $matches[0] . $newRule, $ingress);
+    } else {
+        RancherFleet\Logger::warn("addSubdomainToIngress: rules pattern did NOT match");
     }
 
     // Reconstruct the full document
