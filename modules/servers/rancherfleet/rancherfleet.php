@@ -1704,6 +1704,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Push Backup CronJob'    => 'PushBackupCronJob',
         'Push Backup Sidecar'    => 'PushBackupSidecar',
         'Refresh Webhook Secret' => 'RefreshWebhookSecret',
+        'Remove Custom URL'      => 'RemoveCustomUrl',
         'Patch Template Updates' => 'PatchTemplateUpdates',
     );
 }
@@ -2736,6 +2737,78 @@ function rancherfleet_RefreshWebhookSecret(array $params)
     } catch (Exception $e) {
         $detail = rancherfleet_exceptionDetail($e);
         RancherFleet\Logger::error("RefreshWebhookSecret FAILED:\n" . $detail);
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+function rancherfleet_RemoveCustomUrl(array $params)
+{
+    try {
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        // Read stored custom URL from tbladdonmodules
+        RancherFleet\Logger::info("RemoveCustomUrl: reading stored URL for service {$serviceId}");
+        $customUrl = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_custom_url')
+            ->where('setting', 'url_' . $serviceId)
+            ->value('value');
+
+        if (!$customUrl) {
+            RancherFleet\Logger::warn("RemoveCustomUrl: no custom URL found for service {$serviceId}");
+            return 'Error: No custom URL found for this service';
+        }
+
+        RancherFleet\Logger::info("RemoveCustomUrl: found custom URL {$customUrl}");
+
+        // Build clients
+        list($rancher, $github, $fleet) = rancherfleet_buildClients($params);
+
+        // Read odoo.yml from client branch
+        RancherFleet\Logger::info("RemoveCustomUrl: reading odoo.yml from {$namespace}");
+        $manifestContent = $github->getClientFileContent($namespace, 'odoo.yml');
+        if (!$manifestContent) {
+            RancherFleet\Logger::error("RemoveCustomUrl: failed to read odoo.yml from {$namespace}");
+            return 'Error: Could not read manifest file. Please contact support.';
+        }
+        RancherFleet\Logger::info("RemoveCustomUrl: odoo.yml read successfully");
+
+        // Remove the custom URL from Ingress
+        RancherFleet\Logger::info("RemoveCustomUrl: removing {$customUrl} from Ingress");
+        $updated = rancherfleet_removeSubdomainFromIngress($manifestContent, $customUrl, $orderNum);
+        if ($updated === false) {
+            RancherFleet\Logger::error("RemoveCustomUrl: removeSubdomainFromIngress failed");
+            return 'Error: Could not update Ingress configuration. Please contact support.';
+        }
+        RancherFleet\Logger::info("RemoveCustomUrl: Ingress updated successfully");
+
+        // Write updated manifest back
+        RancherFleet\Logger::info("RemoveCustomUrl: writing updated odoo.yml to {$namespace}");
+        $github->writeFileToBranch(
+            'odoo.yml',
+            $updated,
+            $namespace,
+            'Remove custom subdomain: ' . $customUrl
+        );
+        RancherFleet\Logger::info("RemoveCustomUrl: odoo.yml written successfully");
+
+        // Delete tbladdonmodules record so client area resets to form
+        RancherFleet\Logger::info("RemoveCustomUrl: deleting tbladdonmodules record");
+        \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_custom_url')
+            ->where('setting', 'url_' . $serviceId)
+            ->delete();
+        RancherFleet\Logger::info("RemoveCustomUrl: tbladdonmodules record deleted");
+
+        rancherfleet_logHistory($params, 'Custom Subdomain Removed', $customUrl);
+        RancherFleet\Logger::info("RemoveCustomUrl: SUCCESS - removed {$customUrl} from {$namespace}");
+
+        return "Success: Custom subdomain {$customUrl} has been removed. The Ingress has been updated and will sync shortly.";
+
+    } catch (Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("RemoveCustomUrl FAILED:\n" . $detail);
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -4427,6 +4500,66 @@ function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
         $ingress = str_replace($matches[0], $matches[0] . $newRule, $ingress);
     } else {
         RancherFleet\Logger::warn("addSubdomainToIngress: rules pattern did NOT match");
+    }
+
+    // Reconstruct the full document
+    $resources[$ingressIdx] = $ingress;
+    return implode("\n---\n", $resources);
+}
+
+/**
+ * Removes a custom subdomain from the Ingress resource in odoo.yml.
+ * Removes from both spec.tls[0].hosts and matching rules entry.
+ *
+ * @param  string $yamlContent  The odoo.yml file content
+ * @param  string $subdomain    The subdomain to remove (e.g. www.yourdomain.com)
+ * @param  int    $orderNum     The order number for service name
+ * @return string|false  Updated YAML content, or false on failure
+ */
+function rancherfleet_removeSubdomainFromIngress($yamlContent, $subdomain, $orderNum)
+{
+    // Find the Ingress block by looking for "kind: Ingress"
+    if (strpos($yamlContent, 'kind: Ingress') === false) {
+        RancherFleet\Logger::error("removeSubdomainFromIngress: 'kind: Ingress' not found in manifest");
+        return false;
+    }
+
+    // Split by resource boundaries (---) to handle multi-resource documents
+    $resources = explode("\n---\n", $yamlContent);
+    $ingressIdx = -1;
+
+    for ($i = 0; $i < count($resources); $i++) {
+        if (strpos($resources[$i], 'kind: Ingress') !== false) {
+            $ingressIdx = $i;
+            break;
+        }
+    }
+
+    if ($ingressIdx === -1) {
+        RancherFleet\Logger::error("removeSubdomainFromIngress: failed to find Ingress resource index");
+        return false;
+    }
+
+    RancherFleet\Logger::info("removeSubdomainFromIngress: found Ingress at resource index {$ingressIdx}");
+    $ingress = $resources[$ingressIdx];
+
+    // Remove subdomain from spec.tls[0].hosts array
+    $tlsLinePattern = '/\s*-\s+' . preg_quote($subdomain, '/') . '\s*\n/';
+    if (preg_match($tlsLinePattern, $ingress)) {
+        RancherFleet\Logger::info("removeSubdomainFromIngress: TLS hosts entry found, removing");
+        $ingress = preg_replace($tlsLinePattern, '', $ingress, 1);
+    } else {
+        RancherFleet\Logger::warn("removeSubdomainFromIngress: TLS hosts entry for {$subdomain} not found");
+    }
+
+    // Remove the entire rules entry for this subdomain
+    $rulesPattern = '/\n\s+-\s+host:\s+' . preg_quote($subdomain, '/') . '\n\s+http:\n\s+paths:\n\s+-\s+path:\s+\/\n\s+pathType:\s+Prefix\n\s+backend:\n\s+service:\n\s+name:\s+odoo-' . preg_quote($orderNum, '/') . '\n\s+port:\n\s+number:\s+8069/';
+
+    if (preg_match($rulesPattern, $ingress)) {
+        RancherFleet\Logger::info("removeSubdomainFromIngress: rules entry found, removing");
+        $ingress = preg_replace($rulesPattern, '', $ingress, 1);
+    } else {
+        RancherFleet\Logger::warn("removeSubdomainFromIngress: rules entry for {$subdomain} not found");
     }
 
     // Reconstruct the full document
