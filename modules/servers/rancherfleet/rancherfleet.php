@@ -4246,23 +4246,60 @@ function rancherfleet_handleStorageUpgrade(array $params, $namespace, $orderNum)
 }
 
 /**
- * Handles a custom URL domain connection POST from the client area.
- * Validates domain format, updates odoo.yml Ingress, and stores the domain.
+ * Handles a custom subdomain connection POST from the client area.
+ * Validates subdomain format, verifies CNAME DNS record, updates odoo.yml Ingress.
  *
- * @return string  'custom_url_success:{domain}' | 'custom_url_error:{message}'
+ * @return string  'custom_url_success:{subdomain}' | 'custom_url_error:{message}'
  */
 function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNum)
 {
-    $domain = isset($_POST['custom_url_domain']) ? trim($_POST['custom_url_domain']) : '';
+    $subdomain = isset($_POST['custom_url_subdomain']) ? trim($_POST['custom_url_subdomain']) : '';
     $serviceId = (int)$params['serviceid'];
 
-    if (!$domain) {
-        return 'custom_url_error:Domain name is required.';
+    if (!$subdomain) {
+        return 'custom_url_error:Subdomain is required.';
     }
 
-    // Validate domain format: allow letters, numbers, hyphens, dots
-    if (!preg_match('/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i', $domain)) {
-        return 'custom_url_error:Invalid domain format. Use letters, numbers, and hyphens only (e.g. example.com).';
+    // Validate subdomain format: must be subdomain.domain.tld (at least one dot + prefix)
+    // Reject bare domains without subdomain prefix
+    $parts = explode('.', $subdomain);
+    if (count($parts) < 3) {
+        return 'custom_url_error:Enter a subdomain (e.g. www.yourdomain.com), not a bare domain (yourdomain.com).';
+    }
+
+    // Validate each label: letters, numbers, hyphens only
+    foreach ($parts as $label) {
+        if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i', $label)) {
+            return 'custom_url_error:Invalid subdomain format. Use letters, numbers, and hyphens only.';
+        }
+    }
+
+    // Reject webdiscode.com subdomains
+    $rootDomain = implode('.', array_slice($parts, -2));
+    if (strtolower($rootDomain) === 'webdiscode.com') {
+        return 'custom_url_error:Cannot use a webdiscode.com subdomain. Enter your own custom domain.';
+    }
+
+    // Verify CNAME record points to cowboy.webdiscode.com
+    $cnameTarget = 'cowboy.webdiscode.com';
+    $dnsRecords = @dns_get_record($subdomain, DNS_CNAME);
+    $cnameFound = false;
+
+    if ($dnsRecords && is_array($dnsRecords)) {
+        foreach ($dnsRecords as $record) {
+            if (isset($record['target'])) {
+                $target = rtrim($record['target'], '.');
+                if (strtolower($target) === strtolower($cnameTarget)) {
+                    $cnameFound = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!$cnameFound) {
+        return 'custom_url_error:Could not verify CNAME record. Please ensure ' . htmlspecialchars($subdomain)
+            . ' points to ' . $cnameTarget . ' and try again. DNS changes can take up to 24 hours to propagate.';
     }
 
     try {
@@ -4277,7 +4314,7 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
         }
 
         // Find and update the Ingress resource
-        $updated = rancherfleet_addDomainToIngress($manifestContent, $domain, $orderNum);
+        $updated = rancherfleet_addSubdomainToIngress($manifestContent, $subdomain, $orderNum);
         if ($updated === false) {
             return 'custom_url_error:Could not update Ingress configuration. Please contact support.';
         }
@@ -4287,10 +4324,10 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
             $branchName,
             $filename,
             $updated,
-            'Connect custom domain: ' . $domain
+            'Connect custom subdomain: ' . $subdomain
         );
 
-        // Store the custom URL in tbladdonmodules
+        // Store the custom subdomain in tbladdonmodules
         $table = \WHMCS\Database\Capsule::table('tbladdonmodules');
         $setting = 'url_' . $serviceId;
         $existing = $table->where('module', 'rancherfleet_custom_url')
@@ -4300,19 +4337,19 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
         if ($existing) {
             $table->where('module', 'rancherfleet_custom_url')
                 ->where('setting', $setting)
-                ->update(['value' => $domain]);
+                ->update(['value' => $subdomain]);
         } else {
             $table->insert([
                 'module'  => 'rancherfleet_custom_url',
                 'setting' => $setting,
-                'value'   => $domain,
+                'value'   => $subdomain,
             ]);
         }
 
-        rancherfleet_logHistory($params, 'Custom Domain Connected', $domain);
-        RancherFleet\Logger::info("handleCustomUrlConnect: SUCCESS {$namespace} -> {$domain}");
+        rancherfleet_logHistory($params, 'Custom Subdomain Connected', $subdomain);
+        RancherFleet\Logger::info("handleCustomUrlConnect: SUCCESS {$namespace} -> {$subdomain}");
 
-        return 'custom_url_success:' . $domain;
+        return 'custom_url_success:' . $subdomain;
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("handleCustomUrlConnect: " . $e->getMessage());
@@ -4321,15 +4358,15 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
 }
 
 /**
- * Adds a custom domain to the Ingress resource in odoo.yml.
- * Updates both spec.tls[0].hosts and spec.rules to include the new domain.
+ * Adds a custom subdomain to the Ingress resource in odoo.yml.
+ * Updates both spec.tls[0].hosts and spec.rules to include the new subdomain.
  *
  * @param  string $yamlContent  The odoo.yml file content
- * @param  string $customDomain The domain to add (e.g. example.com)
+ * @param  string $subdomain    The subdomain to add (e.g. www.yourdomain.com)
  * @param  int    $orderNum     The order number for service name
  * @return string|false  Updated YAML content, or false on failure
  */
-function rancherfleet_addDomainToIngress($yamlContent, $customDomain, $orderNum)
+function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
 {
     // Find the Ingress block by looking for "kind: Ingress"
     if (strpos($yamlContent, 'kind: Ingress') === false) {
@@ -4353,23 +4390,23 @@ function rancherfleet_addDomainToIngress($yamlContent, $customDomain, $orderNum)
 
     $ingress = $resources[$ingressIdx];
 
-    // Add domain to spec.tls[0].hosts array
+    // Add subdomain to spec.tls[0].hosts array
     if (strpos($ingress, 'spec:') !== false) {
         $tlsPattern = '/(\s+hosts:\s*\n\s+-\s+' . preg_quote($orderNum, '/') . '\.webdiscode\.com)/';
         if (preg_match($tlsPattern, $ingress)) {
-            // Add custom domain after the default host
-            $replacement = "$1\n        - " . $customDomain;
+            // Add custom subdomain after the default host
+            $replacement = "$1\n        - " . $subdomain;
             $ingress = preg_replace($tlsPattern, $replacement, $ingress, 1);
         }
     }
 
-    // Add custom domain to spec.rules array
-    // Look for an existing rule block and duplicate it with the custom domain
+    // Add subdomain to spec.rules array
+    // Look for an existing rule block and duplicate it with the custom subdomain
     $rulesPattern = '/(\s+- host: ' . preg_quote($orderNum, '/') . '\.webdiscode\.com\n\s+http:\n\s+paths:\n\s+-\s+path:\s+\/\n\s+pathType:\s+Prefix\n\s+backend:\n\s+service:\n\s+name:\s+odoo-\d+\n\s+port:\n\s+number:\s+8069)/';
 
     if (preg_match($rulesPattern, $ingress, $matches)) {
-        // Create a new rule block for the custom domain
-        $newRule = "\n  - host: " . $customDomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
+        // Create a new rule block for the custom subdomain
+        $newRule = "\n  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
         $ingress = str_replace($matches[0], $matches[0] . $newRule, $ingress);
     }
 
@@ -4598,8 +4635,8 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
     } elseif (strpos($message, 'backup_restore_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; Restore failed: ' . htmlspecialchars(substr($message, strlen('backup_restore_error:'))) . '</div>';
     } elseif (strpos($message, 'custom_url_success:') === 0) {
-        $domain = substr($message, strlen('custom_url_success:'));
-        $html .= '<div class="rfm-alert-success">&#10003; Your domain ' . htmlspecialchars($domain) . ' has been connected. DNS propagation may take up to 24 hours.</div>';
+        $subdomain = substr($message, strlen('custom_url_success:'));
+        $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars($subdomain) . ' has been connected. Your SSL certificate will be issued automatically within a few minutes.</div>';
     } elseif (strpos($message, 'custom_url_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('custom_url_error:'))) . '</div>';
     }
@@ -4674,57 +4711,56 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '</div>'; // instance link card
 
         // -----------------------------------------------------------------------
-        // Custom URL Ingress Card
+        // Custom Subdomain Ingress Card
         // -----------------------------------------------------------------------
-        $customUrl = null;
+        $customSubdomain = null;
         try {
             $customUrlData = \WHMCS\Database\Capsule::table('tbladdonmodules')
                 ->where('module', 'rancherfleet_custom_url')
                 ->where('setting', 'url_' . $serviceId)
                 ->value('value');
             if ($customUrlData) {
-                $customUrl = $customUrlData;
+                $customSubdomain = $customUrlData;
             }
         } catch (\Exception $e) {
-            // Continue without custom URL
+            // Continue without custom subdomain
         }
 
         $html .= '<div class="rfm-ca-card">';
-        $html .= '<h4>Custom Domain URL</h4>';
+        $html .= '<h4>Connect a Custom Domain</h4>';
 
-        if ($customUrl) {
+        if ($customSubdomain) {
             $html .= '<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px;">';
-            $html .= '<p style="font-size:12px;color:#666;margin:0 0 8px;">Connected domain:</p>';
+            $html .= '<p style="font-size:12px;color:#666;margin:0 0 8px;">Connected subdomain:</p>';
             $html .= '<div style="display:flex;align-items:center;gap:10px;">';
-            $html .= '<span style="font-size:13px;font-weight:bold;color:#2980b9;font-family:monospace;">' . htmlspecialchars($customUrl) . '</span>';
-            $html .= '<a href="https://' . htmlspecialchars($customUrl) . '" target="_blank" style="color:#2980b9;text-decoration:none;font-size:13px;">&#8599;</a>';
+            $html .= '<span style="font-size:13px;font-weight:bold;color:#2980b9;font-family:monospace;">' . htmlspecialchars($customSubdomain) . '</span>';
+            $html .= '<a href="https://' . htmlspecialchars($customSubdomain) . '" target="_blank" style="color:#2980b9;text-decoration:none;font-size:13px;">&#8599;</a>';
             $html .= '</div>';
-            $html .= '<p style="font-size:11px;color:#888;margin:8px 0 0;">To change or remove this domain, contact support.</p>';
+            $html .= '<p style="font-size:11px;color:#888;margin:8px 0 0;">To change or remove this subdomain, contact support.</p>';
             $html .= '</div>';
         } else {
-            $html .= '<p style="font-size:12px;color:#666;margin-bottom:10px;">Connect a custom domain you own to this instance. Your domain must point to <code>cowboy.webdiscode.com</code> via CNAME record.</p>';
+            $html .= '<div style="background:#e3f2fd;border:1px solid #90caf9;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="font-size:12px;color:#1565c0;margin:0 0 8px;line-height:1.4;"><strong>Instructions:</strong> Enter a subdomain you have pointed to cowboy.webdiscode.com via a CNAME record. Use a subdomain only (e.g. www.yourdomain.com, app.yourdomain.com) — do not enter a root domain (yourdomain.com) as this can break email and other services on your domain. Your registrar\'s DNS settings should have:</p>';
+            $html .= '<div style="font-family:monospace;font-size:11px;background:#fff;border:1px solid #90caf9;border-radius:4px;padding:8px;margin:0;color:#1565c0;"><strong>Type:</strong> CNAME  |  <strong>Host:</strong> www  |  <strong>Value:</strong> cowboy.webdiscode.com</div>';
+            $html .= '</div>';
             $html .= '<form method="post" action="' . $serviceUrl . '">';
             $html .= '<div style="margin-bottom:12px;">';
-            $html .= '<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;cursor:pointer;">';
+            $html .= '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">';
             $html .= '<input type="checkbox" name="custom_url_enable" id="custom_url_enable" onchange="document.getElementById(\'custom_url_form\').style.display=this.checked?\'block\':\'none\'" style="cursor:pointer;">';
-            $html .= '<span>I have a custom domain pointing to cowboy.webdiscode.com</span>';
+            $html .= '<span>I have set up the CNAME record for my subdomain</span>';
             $html .= '</label>';
             $html .= '</div>';
-            $html .= '<div id="custom_url_form" style="display:none;background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px;margin-bottom:12px;">';
-            $html .= '<label style="display:block;font-size:12px;font-weight:bold;margin:0 0 6px;color:#333;">Domain name</label>';
-            $html .= '<input type="text" name="custom_url_domain" placeholder="example.com" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;box-sizing:border-box;margin-bottom:10px;">';
-            $html .= '<p style="font-size:11px;color:#888;margin:0;">Enter only the domain name (e.g. <code>example.com</code>, not <code>www.example.com</code> or <code>https://example.com</code>).</p>';
+            $html .= '<div id="custom_url_form" style="display:none;margin-bottom:12px;">';
+            $html .= '<label style="display:block;font-size:12px;font-weight:bold;margin:0 0 6px;color:#333;">Subdomain</label>';
+            $html .= '<input type="text" name="custom_url_subdomain" placeholder="www.yourdomain.com" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;box-sizing:border-box;margin-bottom:10px;">';
             $html .= '</div>';
             $html .= '<input type="hidden" name="clientaction" value="custom_url_connect">';
-            $html .= '<button type="submit" id="custom_url_btn" disabled style="background:#2980b9;color:#fff;border:none;border-radius:4px;padding:8px 18px;font-size:13px;font-weight:bold;cursor:not-allowed;opacity:0.5;">Connect Domain</button>';
+            $html .= '<button type="submit" id="custom_url_btn" disabled style="background:#2980b9;color:#fff;border:none;border-radius:4px;padding:8px 18px;font-size:13px;font-weight:bold;cursor:not-allowed;opacity:0.5;">Verify & Connect</button>';
             $html .= '<script>
                 document.getElementById("custom_url_enable").addEventListener("change", function() {
                     const btn = document.getElementById("custom_url_btn");
-                    const input = document.querySelector("input[name=custom_url_domain]");
+                    const input = document.querySelector("input[name=custom_url_subdomain]");
                     if (this.checked) {
-                        btn.disabled = false;
-                        btn.style.opacity = "1";
-                        btn.style.cursor = "pointer";
                         input.addEventListener("input", function() {
                             btn.disabled = !this.value.trim();
                             btn.style.opacity = this.value.trim() ? "1" : "0.5";
