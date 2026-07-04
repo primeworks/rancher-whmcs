@@ -4441,70 +4441,73 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
 /**
  * Adds a custom subdomain to the Ingress resource in odoo.yml.
  * Updates both spec.tls[0].hosts and spec.rules to include the new subdomain.
+ * Uses reliable markers (secretName anchor for TLS, comment markers for rules).
  *
  * @param  string $yamlContent  The odoo.yml file content
  * @param  string $subdomain    The subdomain to add (e.g. www.yourdomain.com)
  * @param  int    $orderNum     The order number for service name
- * @return string|false  Updated YAML content, or false on failure
+ * @return string  Updated YAML content
+ * @throws Exception if injection patterns fail to match
  */
 function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
 {
-    // Find the Ingress block by looking for "kind: Ingress"
-    if (strpos($yamlContent, 'kind: Ingress') === false) {
-        RancherFleet\Logger::error("addSubdomainToIngress: 'kind: Ingress' not found in manifest");
-        return false;
-    }
+    $originalContent = $yamlContent;
+    $tlsInjected = false;
+    $rulesInjected = false;
 
-    // Split by resource boundaries (---) to handle multi-resource documents
-    $resources = explode("\n---\n", $yamlContent);
-    $ingressIdx = -1;
-
-    for ($i = 0; $i < count($resources); $i++) {
-        if (strpos($resources[$i], 'kind: Ingress') !== false) {
-            $ingressIdx = $i;
-            break;
-        }
-    }
-
-    if ($ingressIdx === -1) {
-        RancherFleet\Logger::error("addSubdomainToIngress: failed to find Ingress resource index");
-        return false;
-    }
-
-    RancherFleet\Logger::info("addSubdomainToIngress: found Ingress at resource index {$ingressIdx}");
-    $ingress = $resources[$ingressIdx];
-
-    // Add subdomain to spec.tls[0].hosts array
-    if (strpos($ingress, 'spec:') !== false) {
-        $tlsPattern = '/(\s+hosts:\s*\n\s+-\s+' . preg_quote($orderNum, '/') . '\.webdiscode\.com)/';
-        if (preg_match($tlsPattern, $ingress)) {
-            // Add custom subdomain after the default host
-            RancherFleet\Logger::info("addSubdomainToIngress: TLS hosts pattern matched, adding subdomain");
-            $replacement = "$1\n        - " . $subdomain;
-            $ingress = preg_replace($tlsPattern, $replacement, $ingress, 1);
-        } else {
-            RancherFleet\Logger::info("addSubdomainToIngress: TLS hosts pattern did NOT match (pattern: " . $tlsPattern . ")");
-        }
+    // Step 1: Find and inject into TLS hosts array
+    // Use "    secretName: odoo-{orderNum}-tls" as the anchor (reliable marker)
+    $secretNameMarker = "    secretName: odoo-" . $orderNum . "-tls";
+    if (strpos($yamlContent, $secretNameMarker) !== false) {
+        RancherFleet\Logger::info("addSubdomainToIngress: found secretName marker, injecting TLS host");
+        $newHostLine = "    - " . $subdomain . "\n";
+        $yamlContent = str_replace($secretNameMarker, $newHostLine . $secretNameMarker, $yamlContent);
+        $tlsInjected = true;
+        RancherFleet\Logger::info("addSubdomainToIngress: TLS host injected successfully");
     } else {
-        RancherFleet\Logger::info("addSubdomainToIngress: 'spec:' not found in Ingress resource");
+        RancherFleet\Logger::error("addSubdomainToIngress: secretName marker not found");
     }
 
-    // Add subdomain to spec.rules array
-    // Look for an existing rule block and duplicate it with the custom subdomain
-    $rulesPattern = '/(\s+- host: ' . preg_quote($orderNum, '/') . '\.webdiscode\.com\n\s+http:\n\s+paths:\n\s+-\s+path:\s+\/\n\s+pathType:\s+Prefix\n\s+backend:\n\s+service:\n\s+name:\s+odoo-\d+\n\s+port:\n\s+number:\s+8069)/';
+    // Step 2: Find and inject into rules array
+    // Look for reliable markers that indicate the end of HTTPS Ingress rules:
+    // either "# --- HTTP Redirect Ingress ---" or the http-redirect Ingress marker
+    $httpRedirectMarker = "# --- HTTP Redirect Ingress ---";
+    $httpRedirectIngressMarker = "name: odoo-" . $orderNum . "-http-redirect";
 
-    if (preg_match($rulesPattern, $ingress, $matches)) {
-        // Create a new rule block for the custom subdomain
-        RancherFleet\Logger::info("addSubdomainToIngress: rules pattern matched, adding rule for subdomain");
-        $newRule = "\n  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
-        $ingress = str_replace($matches[0], $matches[0] . $newRule, $ingress);
+    if (strpos($yamlContent, $httpRedirectMarker) !== false) {
+        RancherFleet\Logger::info("addSubdomainToIngress: found HTTP redirect comment marker, injecting rules");
+        $newRulesEntry = "\n  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
+        $yamlContent = str_replace($httpRedirectMarker, $newRulesEntry . "\n" . $httpRedirectMarker, $yamlContent);
+        $rulesInjected = true;
+        RancherFleet\Logger::info("addSubdomainToIngress: rules entry injected successfully");
+    } elseif (strpos($yamlContent, $httpRedirectIngressMarker) !== false) {
+        RancherFleet\Logger::info("addSubdomainToIngress: found http-redirect Ingress marker, injecting rules before it");
+        $newRulesEntry = "  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069\n\n";
+        $yamlContent = str_replace($httpRedirectIngressMarker, $newRulesEntry . $httpRedirectIngressMarker, $yamlContent);
+        $rulesInjected = true;
+        RancherFleet\Logger::info("addSubdomainToIngress: rules entry injected successfully");
     } else {
-        RancherFleet\Logger::info("addSubdomainToIngress: rules pattern did NOT match");
+        RancherFleet\Logger::error("addSubdomainToIngress: HTTP redirect marker not found");
     }
 
-    // Reconstruct the full document
-    $resources[$ingressIdx] = $ingress;
-    return implode("\n---\n", $resources);
+    // Verify that injection actually worked
+    if (!$tlsInjected) {
+        RancherFleet\Logger::error("addSubdomainToIngress: TLS injection failed - subdomain " . $subdomain . " was not added to tls.hosts");
+        throw new Exception("Failed to inject subdomain into TLS hosts array");
+    }
+
+    if (!$rulesInjected) {
+        RancherFleet\Logger::error("addSubdomainToIngress: rules injection failed - subdomain " . $subdomain . " was not added to rules");
+        throw new Exception("Failed to inject subdomain into rules array");
+    }
+
+    // Verify the subdomain actually appears in the modified content
+    if (strpos($yamlContent, $subdomain) === false) {
+        RancherFleet\Logger::error("addSubdomainToIngress: subdomain " . $subdomain . " not found in modified content");
+        throw new Exception("Subdomain injection failed - verification check failed");
+    }
+
+    return $yamlContent;
 }
 
 /**
