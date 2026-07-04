@@ -2774,14 +2774,30 @@ function rancherfleet_RemoveCustomUrl(array $params)
         }
         RancherFleet\Logger::info("RemoveCustomUrl: odoo.yml read successfully");
 
-        // Remove the custom URL from Ingress
-        RancherFleet\Logger::info("RemoveCustomUrl: removing {$customUrl} from Ingress");
-        $updated = rancherfleet_removeSubdomainFromIngress($manifestContent, $customUrl, $orderNum);
-        if ($updated === false) {
-            RancherFleet\Logger::error("RemoveCustomUrl: removeSubdomainFromIngress failed");
-            return 'Error: Could not update Ingress configuration. Please contact support.';
+        // Search for the custom subdomain in the manifest
+        if (strpos($manifestContent, $customUrl) === false) {
+            RancherFleet\Logger::error("RemoveCustomUrl: custom subdomain '{$customUrl}' not found in odoo.yml");
+            return 'Error: Custom subdomain not found in manifest. Please contact support.';
         }
-        RancherFleet\Logger::info("RemoveCustomUrl: Ingress updated successfully");
+        RancherFleet\Logger::info("RemoveCustomUrl: found custom subdomain '{$customUrl}' in manifest");
+
+        // Replace all occurrences of custom subdomain with www.{orderNum}.com
+        $restoreString = 'www.' . $orderNum . '.com';
+        RancherFleet\Logger::info("RemoveCustomUrl: replacing '{$customUrl}' with '{$restoreString}'");
+        $updated = str_replace($customUrl, $restoreString, $manifestContent);
+
+        // Verify the replacement actually worked
+        if ($updated === $manifestContent) {
+            RancherFleet\Logger::error("RemoveCustomUrl: str_replace failed - content unchanged");
+            return 'Error: Could not update manifest. Please contact support.';
+        }
+
+        // Verify restore string now appears in the updated content
+        if (strpos($updated, $restoreString) === false) {
+            RancherFleet\Logger::error("RemoveCustomUrl: restore string '{$restoreString}' not found in updated manifest");
+            return 'Error: Manifest restoration verification failed. Please contact support.';
+        }
+        RancherFleet\Logger::info("RemoveCustomUrl: manifest updated successfully");
 
         // Write updated manifest back
         RancherFleet\Logger::info("RemoveCustomUrl: writing updated odoo.yml to {$namespace}");
@@ -4387,14 +4403,30 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
         }
         RancherFleet\Logger::info("handleCustomUrlConnect: odoo.yml read successfully, size=" . strlen($manifestContent) . " bytes");
 
-        // Find and update the Ingress resource
-        RancherFleet\Logger::info("handleCustomUrlConnect: adding subdomain {$subdomain} to Ingress");
-        $updated = rancherfleet_addSubdomainToIngress($manifestContent, $subdomain, $orderNum);
-        if ($updated === false) {
-            RancherFleet\Logger::error("handleCustomUrlConnect: addSubdomainToIngress returned false for {$subdomain}");
-            return 'custom_url_error:Could not update Ingress configuration. Please contact support.';
+        // Search for the default www.{orderNum}.com host in the manifest
+        $searchString = 'www.' . $orderNum . '.com';
+        if (strpos($manifestContent, $searchString) === false) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: search string '{$searchString}' not found in odoo.yml");
+            return 'custom_url_error:Could not find default domain in manifest. Please contact support.';
         }
-        RancherFleet\Logger::info("handleCustomUrlConnect: Ingress updated successfully");
+        RancherFleet\Logger::info("handleCustomUrlConnect: found '{$searchString}' in manifest");
+
+        // Replace all occurrences of www.{orderNum}.com with the custom subdomain
+        RancherFleet\Logger::info("handleCustomUrlConnect: replacing '{$searchString}' with '{$subdomain}'");
+        $updated = str_replace($searchString, $subdomain, $manifestContent);
+
+        // Verify the replacement actually worked
+        if ($updated === $manifestContent) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: str_replace failed - content unchanged");
+            return 'custom_url_error:Could not update manifest. Please contact support.';
+        }
+
+        // Verify subdomain now appears in the updated content
+        if (strpos($updated, $subdomain) === false) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: subdomain '{$subdomain}' not found in updated manifest");
+            return 'custom_url_error:Manifest update verification failed. Please contact support.';
+        }
+        RancherFleet\Logger::info("handleCustomUrlConnect: manifest updated successfully");
 
         // Write updated manifest back
         RancherFleet\Logger::info("handleCustomUrlConnect: writing updated odoo.yml to {$namespace}");
@@ -4449,127 +4481,6 @@ function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNu
  * @return string  Updated YAML content
  * @throws Exception if injection patterns fail to match
  */
-function rancherfleet_addSubdomainToIngress($yamlContent, $subdomain, $orderNum)
-{
-    $originalContent = $yamlContent;
-    $tlsInjected = false;
-    $rulesInjected = false;
-
-    // Step 1: Find and inject into TLS hosts array
-    // Use "    secretName: odoo-{orderNum}-tls" as the anchor (reliable marker)
-    $secretNameMarker = "    secretName: odoo-" . $orderNum . "-tls";
-    if (strpos($yamlContent, $secretNameMarker) !== false) {
-        RancherFleet\Logger::info("addSubdomainToIngress: found secretName marker, injecting TLS host");
-        $newHostLine = "    - " . $subdomain . "\n";
-        $yamlContent = str_replace($secretNameMarker, $newHostLine . $secretNameMarker, $yamlContent);
-        $tlsInjected = true;
-        RancherFleet\Logger::info("addSubdomainToIngress: TLS host injected successfully");
-    } else {
-        RancherFleet\Logger::error("addSubdomainToIngress: secretName marker not found");
-    }
-
-    // Step 2: Find and inject into rules array
-    // Look for reliable markers that indicate the end of HTTPS Ingress rules:
-    // either "# --- HTTP Redirect Ingress ---" or the http-redirect Ingress marker
-    $httpRedirectMarker = "# --- HTTP Redirect Ingress ---";
-    $httpRedirectIngressMarker = "name: odoo-" . $orderNum . "-http-redirect";
-
-    if (strpos($yamlContent, $httpRedirectMarker) !== false) {
-        RancherFleet\Logger::info("addSubdomainToIngress: found HTTP redirect comment marker, injecting rules");
-        $newRulesEntry = "\n  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069";
-        $yamlContent = str_replace($httpRedirectMarker, $newRulesEntry . "\n" . $httpRedirectMarker, $yamlContent);
-        $rulesInjected = true;
-        RancherFleet\Logger::info("addSubdomainToIngress: rules entry injected successfully");
-    } elseif (strpos($yamlContent, $httpRedirectIngressMarker) !== false) {
-        RancherFleet\Logger::info("addSubdomainToIngress: found http-redirect Ingress marker, injecting rules before it");
-        $newRulesEntry = "  - host: " . $subdomain . "\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: odoo-" . $orderNum . "\n            port:\n              number: 8069\n\n";
-        $yamlContent = str_replace($httpRedirectIngressMarker, $newRulesEntry . $httpRedirectIngressMarker, $yamlContent);
-        $rulesInjected = true;
-        RancherFleet\Logger::info("addSubdomainToIngress: rules entry injected successfully");
-    } else {
-        RancherFleet\Logger::error("addSubdomainToIngress: HTTP redirect marker not found");
-    }
-
-    // Verify that injection actually worked
-    if (!$tlsInjected) {
-        RancherFleet\Logger::error("addSubdomainToIngress: TLS injection failed - subdomain " . $subdomain . " was not added to tls.hosts");
-        throw new Exception("Failed to inject subdomain into TLS hosts array");
-    }
-
-    if (!$rulesInjected) {
-        RancherFleet\Logger::error("addSubdomainToIngress: rules injection failed - subdomain " . $subdomain . " was not added to rules");
-        throw new Exception("Failed to inject subdomain into rules array");
-    }
-
-    // Verify the subdomain actually appears in the modified content
-    if (strpos($yamlContent, $subdomain) === false) {
-        RancherFleet\Logger::error("addSubdomainToIngress: subdomain " . $subdomain . " not found in modified content");
-        throw new Exception("Subdomain injection failed - verification check failed");
-    }
-
-    return $yamlContent;
-}
-
-/**
- * Removes a custom subdomain from the Ingress resource in odoo.yml.
- * Removes from both spec.tls[0].hosts and matching rules entry.
- *
- * @param  string $yamlContent  The odoo.yml file content
- * @param  string $subdomain    The subdomain to remove (e.g. www.yourdomain.com)
- * @param  int    $orderNum     The order number for service name
- * @return string|false  Updated YAML content, or false on failure
- */
-function rancherfleet_removeSubdomainFromIngress($yamlContent, $subdomain, $orderNum)
-{
-    // Find the Ingress block by looking for "kind: Ingress"
-    if (strpos($yamlContent, 'kind: Ingress') === false) {
-        RancherFleet\Logger::error("removeSubdomainFromIngress: 'kind: Ingress' not found in manifest");
-        return false;
-    }
-
-    // Split by resource boundaries (---) to handle multi-resource documents
-    $resources = explode("\n---\n", $yamlContent);
-    $ingressIdx = -1;
-
-    for ($i = 0; $i < count($resources); $i++) {
-        if (strpos($resources[$i], 'kind: Ingress') !== false) {
-            $ingressIdx = $i;
-            break;
-        }
-    }
-
-    if ($ingressIdx === -1) {
-        RancherFleet\Logger::error("removeSubdomainFromIngress: failed to find Ingress resource index");
-        return false;
-    }
-
-    RancherFleet\Logger::info("removeSubdomainFromIngress: found Ingress at resource index {$ingressIdx}");
-    $ingress = $resources[$ingressIdx];
-
-    // Remove subdomain from spec.tls[0].hosts array
-    $tlsLinePattern = '/\s*-\s+' . preg_quote($subdomain, '/') . '\s*\n/';
-    if (preg_match($tlsLinePattern, $ingress)) {
-        RancherFleet\Logger::info("removeSubdomainFromIngress: TLS hosts entry found, removing");
-        $ingress = preg_replace($tlsLinePattern, '', $ingress, 1);
-    } else {
-        RancherFleet\Logger::info("removeSubdomainFromIngress: TLS hosts entry for {$subdomain} not found");
-    }
-
-    // Remove the entire rules entry for this subdomain
-    $rulesPattern = '/\n\s+-\s+host:\s+' . preg_quote($subdomain, '/') . '\n\s+http:\n\s+paths:\n\s+-\s+path:\s+\/\n\s+pathType:\s+Prefix\n\s+backend:\n\s+service:\n\s+name:\s+odoo-' . preg_quote($orderNum, '/') . '\n\s+port:\n\s+number:\s+8069/';
-
-    if (preg_match($rulesPattern, $ingress)) {
-        RancherFleet\Logger::info("removeSubdomainFromIngress: rules entry found, removing");
-        $ingress = preg_replace($rulesPattern, '', $ingress, 1);
-    } else {
-        RancherFleet\Logger::info("removeSubdomainFromIngress: rules entry for {$subdomain} not found");
-    }
-
-    // Reconstruct the full document
-    $resources[$ingressIdx] = $ingress;
-    return implode("\n---\n", $resources);
-}
-
 /**
  * Renders the storage usage card and upgrade panel for the client area.
  *
