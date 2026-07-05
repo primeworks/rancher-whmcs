@@ -366,6 +366,41 @@ class GitHubClient
     }
 
     /**
+     * Lists all branches in the repository that match a pattern.
+     * Returns array of branch names (e.g., ['whmcs-client-123', 'whmcs-client-456', ...])
+     *
+     * @param  string $pattern  Optional glob pattern to filter branches (default: all)
+     * @return array            Array of matching branch names
+     */
+    public function listBranches($pattern = null)
+    {
+        $url = self::API_BASE . '/repos/' . $this->owner . '/' . $this->repo . '/branches?per_page=100';
+        $branches = array();
+        $page = 1;
+
+        while (true) {
+            $response = $this->request('GET', $url . '&page=' . $page);
+            if (empty($response)) {
+                break;
+            }
+
+            foreach ($response as $branch) {
+                $branchName = $branch['name'];
+                if ($pattern === null || strpos($branchName, $pattern) === 0) {
+                    $branches[] = $branchName;
+                }
+            }
+
+            if (count($response) < 100) {
+                break;
+            }
+            $page++;
+        }
+
+        return $branches;
+    }
+
+    /**
      * Public wrapper around substituteNamespace() for callers outside the
      * bootstrap flow that need the same 0000 -> orderNum substitution.
      *

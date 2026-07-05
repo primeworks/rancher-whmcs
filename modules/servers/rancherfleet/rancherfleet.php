@@ -1703,6 +1703,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Clear Retry Queue'      => 'ClearRetryQueue',
         'Push Backup CronJob'    => 'PushBackupCronJob',
         'Push Backup Sidecar'    => 'PushBackupSidecar',
+        'Patch Backup Storage'   => 'PatchBackupStorage',
         'Refresh Webhook Secret' => 'RefreshWebhookSecret',
         'Remove Custom URL'      => 'RemoveCustomUrl',
         'Patch Template Updates' => 'PatchTemplateUpdates',
@@ -2451,6 +2452,161 @@ function rancherfleet_PushBackupSidecar(array $params)
         $msg = "PushBackupSidecar FAILED{$nsDisplay}: " . $e->getMessage();
         RancherFleet\Logger::error($msg);
         RancherFleet\Logger::error("Stack trace: " . $e->getTraceAsString());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+function rancherfleet_PatchBackupStorage(array $params)
+{
+    try {
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // Check if we're in step 2 (confirmation/apply mode)
+        $pending = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_patch')
+            ->where('setting', 'pending_backup_storage_patch')
+            ->first();
+
+        if ($pending) {
+            // Step 2: Check timestamp and apply patches
+            $pendingData = @json_decode($pending->value, true);
+            if (!$pendingData || !isset($pendingData['branches']) || !isset($pendingData['timestamp'])) {
+                throw new \Exception("Invalid pending patch data");
+            }
+
+            $elapsedSeconds = time() - $pendingData['timestamp'];
+            if ($elapsedSeconds > 60) {
+                // Confirmation expired, delete and restart
+                \WHMCS\Database\Capsule::table('tbladdonmodules')
+                    ->where('module', 'rancherfleet_patch')
+                    ->where('setting', 'pending_backup_storage_patch')
+                    ->delete();
+                RancherFleet\Logger::info("PatchBackupStorage: confirmation expired, restarting scan");
+                return "Confirmation expired. Run 'Patch Backup Storage' again to re-scan.";
+            }
+
+            // Apply patches to each branch
+            $patchedCount = 0;
+            $patchedList = array();
+            foreach ($pendingData['branches'] as $branch) {
+                try {
+                    $orderNum = str_replace('whmcs-client-', '', $branch);
+                    RancherFleet\Logger::info("PatchBackupStorage: patching branch {$branch} (orderNum={$orderNum})");
+
+                    $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
+                    if (!$odooYaml) {
+                        RancherFleet\Logger::warn("PatchBackupStorage: could not read odoo.yml from {$branch}");
+                        continue;
+                    }
+
+                    // Replace old volumeMount (subPath) with NFS mount
+                    $oldMount = "          - name: odoo-data\n            mountPath: /backups\n            subPath: backups";
+                    $newMount = "          - name: nfs-backups\n            mountPath: /backups";
+                    $updated = str_replace($oldMount, $newMount, $odooYaml);
+
+                    // Add NFS volume if not present
+                    if (strpos($updated, 'name: nfs-backups') === false) {
+                        $nfsVolume = "      - name: nfs-backups\n        nfs:\n          server: 162.35.166.55\n          path: /export/share1\n";
+                        // Insert before "      - name: config" or other volumes
+                        $volumePattern = '/(^\s{6}volumes:\s*\n)/m';
+                        $updated = preg_replace($volumePattern, '$1' . $nfsVolume, $updated, 1);
+                    }
+
+                    // Update BACKUP_DIR in the script
+                    $oldBackupDir = "          BACKUP_DIR=/backups\n          mkdir -p \"$BACKUP_DIR\"";
+                    $newBackupDir = "          BACKUP_DIR=\"/backups/${ORDER_NUM}\"\n          mkdir -p \"$BACKUP_DIR\"";
+                    $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
+
+                    // Verify changes were made
+                    if ($updated === $odooYaml) {
+                        RancherFleet\Logger::warn("PatchBackupStorage: no changes made to {$branch}");
+                        continue;
+                    }
+
+                    // Write back to branch
+                    $github->writeFileToBranch(
+                        'odoo.yml',
+                        $updated,
+                        $branch,
+                        'chore: patch backup storage to use NFS'
+                    );
+
+                    $patchedCount++;
+                    $patchedList[] = $branch;
+                    RancherFleet\Logger::info("PatchBackupStorage: successfully patched {$branch}");
+
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::error("PatchBackupStorage: failed to patch {$branch}: " . $e->getMessage());
+                    continue;
+                }
+            }
+
+            // Delete the pending record
+            \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_patch')
+                ->where('setting', 'pending_backup_storage_patch')
+                ->delete();
+
+            $branchList = implode(', ', $patchedList);
+            RancherFleet\Logger::info("PatchBackupStorage: complete - patched {$patchedCount} instances");
+            return "Success: Patched {$patchedCount} instances ({$branchList}). Fleet will auto-sync within ~15s.";
+
+        } else {
+            // Step 1: Scan for branches needing patch
+            RancherFleet\Logger::info("PatchBackupStorage: scanning for instances needing patch");
+
+            $branchesToPatch = array();
+            try {
+                $branches = $github->listBranches('whmcs-client-');
+                foreach ($branches as $branch) {
+                    try {
+                        $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
+                        if (!$odooYaml) {
+                            continue;
+                        }
+
+                        // Check if sidecar exists and uses old PVC mount (subPath: backups)
+                        $hasSidecar = strpos($odooYaml, '- name: backup') !== false;
+                        $hasOldMount = strpos($odooYaml, 'subPath: backups') !== false;
+
+                        if ($hasSidecar && $hasOldMount) {
+                            $branchesToPatch[] = $branch;
+                            RancherFleet\Logger::info("PatchBackupStorage: found branch needing patch: {$branch}");
+                        }
+                    } catch (\Exception $e) {
+                        RancherFleet\Logger::warn("PatchBackupStorage: could not check branch {$branch}: " . $e->getMessage());
+                        continue;
+                    }
+                }
+            } catch (\Exception $e) {
+                throw new \Exception("Failed to list branches: " . $e->getMessage());
+            }
+
+            if (empty($branchesToPatch)) {
+                RancherFleet\Logger::info("PatchBackupStorage: all instances already up to date");
+                return "All instances already up to date. No backup storage patches needed.";
+            }
+
+            // Store pending patches with timestamp
+            $pendingData = array(
+                'branches' => $branchesToPatch,
+                'timestamp' => time(),
+            );
+
+            \WHMCS\Database\Capsule::table('tbladdonmodules')->insert([
+                'module'  => 'rancherfleet_patch',
+                'setting' => 'pending_backup_storage_patch',
+                'value'   => json_encode($pendingData),
+            ]);
+
+            $branchList = implode(', ', $branchesToPatch);
+            RancherFleet\Logger::info("PatchBackupStorage: found " . count($branchesToPatch) . " instances needing patch");
+            return "Found " . count($branchesToPatch) . " instances needing patch:\n{$branchList}\n\nRun 'Patch Backup Storage' again within 60 seconds to apply patches.";
+        }
+
+    } catch (\Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("PatchBackupStorage FAILED:\n" . $detail);
         return 'Error: ' . $e->getMessage();
     }
 }
