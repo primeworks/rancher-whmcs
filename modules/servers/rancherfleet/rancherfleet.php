@@ -2500,34 +2500,50 @@ function rancherfleet_PatchBackupStorage(array $params)
                     $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
                     RancherFleet\Logger::info("PatchBackupStorage: read complete for {$branch}, size=" . strlen((string)$odooYaml) . " bytes");
                     if (!$odooYaml) {
-                        RancherFleet\Logger::warn("PatchBackupStorage: could not read odoo.yml from {$branch}");
+                        RancherFleet\Logger::error("PatchBackupStorage: could not read odoo.yml from {$branch}");
                         continue;
                     }
 
-                    // Replace old volumeMount (subPath) with NFS mount
+                    // Check if this branch needs patching: detect old PVC mount with subPath
+                    $detectString = "mountPath: /backups\n            subPath: backups";
+                    $needsPatching = strpos($odooYaml, $detectString) !== false;
+                    RancherFleet\Logger::info("PatchBackupStorage: detection for {$branch}: needsPatching=" . ($needsPatching ? 'true' : 'false'));
+
+                    if (!$needsPatching) {
+                        RancherFleet\Logger::info("PatchBackupStorage: {$branch} does not need patching (old mount not found)");
+                        continue;
+                    }
+
+                    $updated = $odooYaml;
+
+                    // Step 1: Replace old volumeMount (subPath) with NFS mount
                     $oldMount = "          - name: odoo-data\n            mountPath: /backups\n            subPath: backups";
                     $newMount = "          - name: nfs-backups\n            mountPath: /backups";
-                    $updated = str_replace($oldMount, $newMount, $odooYaml);
+                    $updated = str_replace($oldMount, $newMount, $updated);
+                    RancherFleet\Logger::info("PatchBackupStorage: replaced volumeMount in {$branch}");
 
-                    // Add NFS volume if not present
+                    // Step 2: Add NFS volume if not present
                     if (strpos($updated, 'name: nfs-backups') === false) {
                         $nfsVolume = "      - name: nfs-backups\n        nfs:\n          server: 162.35.166.55\n          path: /export/share1\n";
                         // Insert before "      - name: config" or other volumes
-                        $volumePattern = '/(^\s{6}volumes:\s*\n)/m';
-                        $updated = preg_replace($volumePattern, '$1' . $nfsVolume, $updated, 1);
+                        $updated = str_replace("      - name: config", $nfsVolume . "      - name: config", $updated);
+                        RancherFleet\Logger::info("PatchBackupStorage: added nfs-backups volume to {$branch}");
+                    } else {
+                        RancherFleet\Logger::info("PatchBackupStorage: nfs-backups volume already present in {$branch}");
                     }
 
-                    // Update BACKUP_DIR in the script
-                    $oldBackupDir = "          BACKUP_DIR=/backups\n          mkdir -p \"$BACKUP_DIR\"";
-                    $newBackupDir = "          BACKUP_DIR=\"/backups/${ORDER_NUM}\"\n          mkdir -p \"$BACKUP_DIR\"";
+                    // Step 3: Update BACKUP_DIR in the backup script
+                    $oldBackupDir = "          BACKUP_DIR=/backups";
+                    $newBackupDir = "          BACKUP_DIR=\"/backups/${ORDER_NUM}\"";
                     $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
+                    RancherFleet\Logger::info("PatchBackupStorage: updated BACKUP_DIR in {$branch}");
 
                     // Verify changes were made
                     if ($updated === $odooYaml) {
-                        RancherFleet\Logger::info("PatchBackupStorage: no changes needed for {$branch}");
+                        RancherFleet\Logger::error("PatchBackupStorage: changes failed to apply to {$branch}");
                         continue;
                     }
-                    RancherFleet\Logger::info("PatchBackupStorage: changes detected in {$branch}, size=" . strlen($updated) . " bytes");
+                    RancherFleet\Logger::info("PatchBackupStorage: changes applied to {$branch}, size=" . strlen($updated) . " bytes");
 
                     // Write back to branch with detailed logging
                     RancherFleet\Logger::info("PatchBackupStorage: about to write odoo.yml to {$branch}");
@@ -2582,7 +2598,7 @@ function rancherfleet_PatchBackupStorage(array $params)
                             RancherFleet\Logger::info("PatchBackupStorage: found branch needing patch: {$branch}");
                         }
                     } catch (\Exception $e) {
-                        RancherFleet\Logger::warn("PatchBackupStorage: could not check branch {$branch}: " . $e->getMessage());
+                        RancherFleet\Logger::info("PatchBackupStorage: could not check branch {$branch}: " . $e->getMessage());
                         continue;
                     }
                 }
