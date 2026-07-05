@@ -2488,12 +2488,17 @@ function rancherfleet_PatchBackupStorage(array $params)
             // Apply patches to each branch
             $patchedCount = 0;
             $patchedList = array();
+            $totalBranches = count($pendingData['branches']);
+            RancherFleet\Logger::info("PatchBackupStorage: starting to apply patches to {$totalBranches} branches");
+
             foreach ($pendingData['branches'] as $branch) {
                 try {
                     $orderNum = str_replace('whmcs-client-', '', $branch);
-                    RancherFleet\Logger::info("PatchBackupStorage: patching branch {$branch} (orderNum={$orderNum})");
+                    RancherFleet\Logger::info("PatchBackupStorage: [{$patchedCount}/{$totalBranches}] patching branch {$branch} (orderNum={$orderNum})");
 
+                    RancherFleet\Logger::info("PatchBackupStorage: reading odoo.yml from {$branch}");
                     $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
+                    RancherFleet\Logger::info("PatchBackupStorage: read complete for {$branch}, size=" . strlen((string)$odooYaml) . " bytes");
                     if (!$odooYaml) {
                         RancherFleet\Logger::warn("PatchBackupStorage: could not read odoo.yml from {$branch}");
                         continue;
@@ -2519,21 +2524,24 @@ function rancherfleet_PatchBackupStorage(array $params)
 
                     // Verify changes were made
                     if ($updated === $odooYaml) {
-                        RancherFleet\Logger::warn("PatchBackupStorage: no changes made to {$branch}");
+                        RancherFleet\Logger::info("PatchBackupStorage: no changes needed for {$branch}");
                         continue;
                     }
+                    RancherFleet\Logger::info("PatchBackupStorage: changes detected in {$branch}, size=" . strlen($updated) . " bytes");
 
-                    // Write back to branch
+                    // Write back to branch with detailed logging
+                    RancherFleet\Logger::info("PatchBackupStorage: about to write odoo.yml to {$branch}");
                     $github->writeFileToBranch(
                         'odoo.yml',
                         $updated,
                         $branch,
                         'chore: patch backup storage to use NFS'
                     );
+                    RancherFleet\Logger::info("PatchBackupStorage: writeFileToBranch completed for {$branch}");
 
                     $patchedCount++;
                     $patchedList[] = $branch;
-                    RancherFleet\Logger::info("PatchBackupStorage: successfully patched {$branch}");
+                    RancherFleet\Logger::info("PatchBackupStorage: successfully patched {$branch} ({$patchedCount}/{$totalBranches} complete)");
 
                 } catch (\Exception $e) {
                     RancherFleet\Logger::error("PatchBackupStorage: failed to patch {$branch}: " . $e->getMessage());
