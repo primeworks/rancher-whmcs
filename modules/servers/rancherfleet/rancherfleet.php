@@ -2515,7 +2515,7 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
           DATE=$(date +%Y-%m-%d)
           ORDER_NUM=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "' . $orderNum . '")
           DB_NAME="odoo-${ORDER_NUM}"
-          BACKUP_DIR=/backups
+          BACKUP_DIR="/backups/${ORDER_NUM}"
           mkdir -p "$BACKUP_DIR"
           pg_dump -Fc -d "$DB_NAME" \
             -h postgres16.default.svc.cluster.local \
@@ -2568,8 +2568,7 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
           name: odoo-data
           subPath: odoo
         - mountPath: /backups
-          name: odoo-data
-          subPath: backups
+          name: nfs-backups
         - mountPath: /etc/rfm-db
           name: rfm-db-admin
           readOnly: true
@@ -2589,6 +2588,10 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
     // Step 4: Add volumes ONLY within Deployment if not already present
     // Look for Deployment's volumes: section specifically (after the Deployment kind: line)
     // and insert before "      - name: config" which is always the first volume in the template
+    $nfsVolume = '      - name: nfs-backups
+        nfs:
+          server: 162.35.166.55
+          path: /export/share1';
     $dbVolume = '      - name: rfm-db-admin
         secret:
           secretName: rfm-db-admin-' . $orderNum;
@@ -2598,28 +2601,34 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
 
     // Check if volumes already exist (look for them anywhere in Deployment)
     $deploymentHasVolumes = preg_match('/kind:\s*Deployment.*?rfm-db-admin/is', $yamlContent);
+    $deploymentHasNfsVolume = preg_match('/kind:\s*Deployment.*?nfs-backups/is', $yamlContent);
 
-    if (!$deploymentHasVolumes) {
+    if (!$deploymentHasVolumes || !$deploymentHasNfsVolume) {
         // Find Deployment block's volumes section and insert before "      - name: config"
         // Pattern: start from "kind: Deployment", find "volumes:", then "- name: config"
         $volumePattern = '/(kind:\s*Deployment.*?)(^\s{6}volumes:\s*\n)(^\s{6}- name: config)/ms';
+        $volumeInsert = (!$deploymentHasNfsVolume ? $nfsVolume . "\n" : '')
+                       . (!$deploymentHasVolumes ? $dbVolume . "\n" . $webhookVolume . "\n" : '');
         $newContent = preg_replace(
             $volumePattern,
-            '${1}${2}' . $dbVolume . "\n" . $webhookVolume . "\n" . '${3}',
+            '${1}${2}' . $volumeInsert . '${3}',
             $yamlContent
         );
         if (!$newContent) {
-            throw new \Exception("Failed to inject backup secret volumes into Deployment volumes section");
+            throw new \Exception("Failed to inject backup volumes into Deployment volumes section");
         }
         $yamlContent = $newContent;
-        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes injected into Deployment");
+        RancherFleet\Logger::info("injectBackupSidecar: backup volumes (NFS + secrets) injected into Deployment");
     } else {
-        RancherFleet\Logger::info("injectBackupSidecar: backup secret volumes already present in Deployment");
+        RancherFleet\Logger::info("injectBackupSidecar: backup volumes already present in Deployment");
     }
 
-    // Step 5: Atomic validation — verify BOTH sidecar and volumes are now present
+    // Step 5: Atomic validation — verify sidecar and all volumes are now present
     if (!preg_match('/kind:\s*Deployment.*?- name:\s+backup\s*\n/is', $yamlContent)) {
         throw new \Exception("Atomic validation failed: backup sidecar container not found after injection");
+    }
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+nfs-backups\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: nfs-backups volume not found after injection");
     }
     if (!preg_match('/kind:\s*Deployment.*?- name:\s+rfm-db-admin\s*\n/is', $yamlContent)) {
         throw new \Exception("Atomic validation failed: rfm-db-admin volume not found after injection");
@@ -2627,8 +2636,11 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
     if (!preg_match('/kind:\s*Deployment.*?- name:\s+rfm-webhook-config\s*\n/is', $yamlContent)) {
         throw new \Exception("Atomic validation failed: rfm-webhook-config volume not found after injection");
     }
+    if (!preg_match('/mountPath:\s+\/backups\s*\n\s+name:\s+nfs-backups/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: sidecar volumeMount for nfs-backups not found after injection");
+    }
 
-    RancherFleet\Logger::info("injectBackupSidecar: atomic validation passed - sidecar and volumes present");
+    RancherFleet\Logger::info("injectBackupSidecar: atomic validation passed - sidecar and all volumes present");
     return $yamlContent;
 }
 
