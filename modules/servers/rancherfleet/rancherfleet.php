@@ -1747,6 +1747,234 @@ PYTHON;
 
 
 /**
+ * Converts CPU value (millicores as "125m" or nanocores as "125000000n") to millicores.
+ *
+ * @param  string $cpuValue
+ * @return int    CPU in millicores
+ */
+function rancherfleet_parseCpuToMillicores($cpuValue)
+{
+    if (empty($cpuValue)) return 0;
+
+    if (strpos($cpuValue, 'm') !== false) {
+        return (int)str_replace('m', '', $cpuValue);
+    } elseif (strpos($cpuValue, 'n') !== false) {
+        $nanos = (int)str_replace('n', '', $cpuValue);
+        return (int)($nanos / 1000000);
+    }
+
+    return 0;
+}
+
+
+/**
+ * Converts memory value to MB.
+ * Input can be "256Mi", "1Gi", or raw bytes as "12345678".
+ *
+ * @param  string $memValue
+ * @return int    Memory in MB
+ */
+function rancherfleet_parseMemoryToMb($memValue)
+{
+    if (empty($memValue)) return 0;
+
+    if (strpos($memValue, 'Gi') !== false) {
+        return (int)str_replace('Gi', '', $memValue) * 1024;
+    } elseif (strpos($memValue, 'Mi') !== false) {
+        return (int)str_replace('Mi', '', $memValue);
+    } elseif (strpos($memValue, 'Ki') !== false) {
+        return (int)str_replace('Ki', '', $memValue) / 1024;
+    } else {
+        $bytes = (int)$memValue;
+        return (int)($bytes / (1024 * 1024));
+    }
+}
+
+
+/**
+ * Gets cached health metrics or empty array if expired/missing.
+ * Cache TTL: 60 seconds.
+ *
+ * @param  int $serviceId
+ * @return array  ['cpu_m' => int, 'memory_mb' => int, 'memory_limit_mb' => int, 'cpu_limit_m' => int, 'cached_at' => int]
+ */
+function rancherfleet_getHealthMetrics($serviceId)
+{
+    try {
+        $cached = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_health')
+            ->where('setting', 'metrics_' . $serviceId)
+            ->first();
+
+        if ($cached) {
+            $data = json_decode($cached->value, true);
+            if (isset($data['cached_at']) && (time() - $data['cached_at']) < 60) {
+                return $data;
+            }
+        }
+    } catch (\Exception $e) {
+        RancherFleet\Logger::info("getHealthMetrics: cache read error (non-fatal): " . $e->getMessage());
+    }
+
+    return array();
+}
+
+
+/**
+ * Caches health metrics for 60 seconds.
+ */
+function rancherfleet_cacheHealthMetrics($serviceId, array $metrics)
+{
+    $metrics['cached_at'] = time();
+    try {
+        \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+            array('module' => 'rancherfleet_health', 'setting' => 'metrics_' . $serviceId),
+            array('value' => json_encode($metrics))
+        );
+    } catch (\Exception $e) {
+        RancherFleet\Logger::info("cacheHealthMetrics: cache write error (non-fatal): " . $e->getMessage());
+    }
+}
+
+
+/**
+ * Fetches CPU and memory metrics from Kubernetes metrics API.
+ * Returns cached metrics if available and fresh (< 60s old).
+ *
+ * @param  array  $params
+ * @param  string $namespace
+ * @param  string $podName    First pod name from deployment
+ * @return array  ['cpu_m' => int, 'memory_mb' => int, 'memory_limit_mb' => int, 'cpu_limit_m' => int] or empty on error
+ */
+function rancherfleet_fetchPodMetrics(array $params, $namespace, $podName)
+{
+    $serviceId = (int)$params['serviceid'];
+    $cached = rancherfleet_getHealthMetrics($serviceId);
+
+    if (!empty($cached)) {
+        return $cached;
+    }
+
+    RancherFleet\Logger::info("fetchPodMetrics: querying for {$namespace}/{$podName}");
+
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+        $cfg = rancherfleet_getConfig($params);
+        $clusterId = isset($cfg['target_cluster_id']) ? $cfg['target_cluster_id'] : 'local';
+
+        $metricsPath = '/k8s/clusters/' . rawurlencode($clusterId)
+                     . '/apis/metrics.k8s.io/v1beta1/namespaces/' . rawurlencode($namespace)
+                     . '/pods/' . rawurlencode($podName);
+
+        $metrics = $rancher->rawRequest('GET', $metricsPath);
+
+        if (!isset($metrics['containers']) || empty($metrics['containers'])) {
+            RancherFleet\Logger::info("fetchPodMetrics: no containers in metrics response");
+            return array();
+        }
+
+        $container = $metrics['containers'][0];
+        $usage = isset($container['usage']) ? $container['usage'] : array();
+
+        $cpuM = rancherfleet_parseCpuToMillicores(isset($usage['cpu']) ? $usage['cpu'] : '');
+        $memoryMb = rancherfleet_parseMemoryToMb(isset($usage['memory']) ? $usage['memory'] : '');
+
+        $result = array(
+            'cpu_m'           => $cpuM,
+            'memory_mb'       => $memoryMb,
+            'memory_limit_mb' => 4096,
+            'cpu_limit_m'     => 2000,
+        );
+
+        rancherfleet_cacheHealthMetrics($serviceId, $result);
+        return $result;
+
+    } catch (\Exception $e) {
+        if (strpos($e->getMessage(), '404') !== false) {
+            RancherFleet\Logger::info("fetchPodMetrics: metrics API unavailable (404)");
+        } else {
+            RancherFleet\Logger::error("fetchPodMetrics: " . $e->getMessage());
+        }
+        return array();
+    }
+}
+
+
+/**
+ * Renders health metrics with progress bars and color coding.
+ * Color: green 0-70%, amber 70-90%, red 90%+.
+ */
+function rancherfleet_renderHealthMetrics(array $metrics, $storageUsage = null)
+{
+    $html = '';
+
+    if (empty($metrics) && empty($storageUsage)) {
+        return '<div style="font-size:12px;color:#888;">Health metrics unavailable</div>';
+    }
+
+    $html .= '<div style="margin-top:14px;padding-top:12px;border-top:1px solid #eee;">';
+
+    // CPU
+    if (!empty($metrics['cpu_m']) || !empty($metrics['cpu_limit_m'])) {
+        $cpuM = isset($metrics['cpu_m']) ? $metrics['cpu_m'] : 0;
+        $cpuLimitM = isset($metrics['cpu_limit_m']) ? $metrics['cpu_limit_m'] : 2000;
+        $cpuPercent = $cpuLimitM > 0 ? (int)($cpuM * 100 / $cpuLimitM) : 0;
+        $cpuPercent = min($cpuPercent, 100);
+
+        $cpuColor = $cpuPercent < 70 ? '#27ae60' : ($cpuPercent < 90 ? '#f39c12' : '#e74c3c');
+
+        $html .= '<div style="margin-bottom:12px;">';
+        $html .= '<div style="font-size:12px;font-weight:bold;margin-bottom:4px;color:#333;">CPU Usage</div>';
+        $html .= '<div style="background:#f0f0f0;border-radius:8px;height:20px;overflow:hidden;margin-bottom:4px;">';
+        $html .= '<div style="background:' . $cpuColor . ';height:100%;width:' . $cpuPercent . '%;transition:width 0.3s ease;"></div>';
+        $html .= '</div>';
+        $html .= '<div style="font-size:11px;color:#666;">' . $cpuM . 'm / ' . $cpuLimitM . 'm (' . $cpuPercent . '%)</div>';
+        $html .= '</div>';
+    }
+
+    // Memory
+    if (!empty($metrics['memory_mb']) || !empty($metrics['memory_limit_mb'])) {
+        $memoryMb = isset($metrics['memory_mb']) ? $metrics['memory_mb'] : 0;
+        $memoryLimitMb = isset($metrics['memory_limit_mb']) ? $metrics['memory_limit_mb'] : 4096;
+        $memoryPercent = $memoryLimitMb > 0 ? (int)($memoryMb * 100 / $memoryLimitMb) : 0;
+        $memoryPercent = min($memoryPercent, 100);
+
+        $memoryColor = $memoryPercent < 70 ? '#27ae60' : ($memoryPercent < 90 ? '#f39c12' : '#e74c3c');
+
+        $html .= '<div style="margin-bottom:12px;">';
+        $html .= '<div style="font-size:12px;font-weight:bold;margin-bottom:4px;color:#333;">Memory Usage</div>';
+        $html .= '<div style="background:#f0f0f0;border-radius:8px;height:20px;overflow:hidden;margin-bottom:4px;">';
+        $html .= '<div style="background:' . $memoryColor . ';height:100%;width:' . $memoryPercent . '%;transition:width 0.3s ease;"></div>';
+        $html .= '</div>';
+        $html .= '<div style="font-size:11px;color:#666;">' . $memoryMb . ' MB / ' . $memoryLimitMb . ' MB (' . $memoryPercent . '%)</div>';
+        $html .= '</div>';
+    }
+
+    // Storage (from Longhorn if available)
+    if (!empty($storageUsage) && isset($storageUsage['usedGb']) && isset($storageUsage['sizeGb'])) {
+        $usedGb = $storageUsage['usedGb'];
+        $totalGb = $storageUsage['sizeGb'];
+        $storagePercent = $totalGb > 0 ? (int)($usedGb * 100 / $totalGb) : 0;
+        $storagePercent = min($storagePercent, 100);
+
+        $storageColor = $storagePercent < 70 ? '#27ae60' : ($storagePercent < 90 ? '#f39c12' : '#e74c3c');
+
+        $html .= '<div>';
+        $html .= '<div style="font-size:12px;font-weight:bold;margin-bottom:4px;color:#333;">Storage Usage</div>';
+        $html .= '<div style="background:#f0f0f0;border-radius:8px;height:20px;overflow:hidden;margin-bottom:4px;">';
+        $html .= '<div style="background:' . $storageColor . ';height:100%;width:' . $storagePercent . '%;transition:width 0.3s ease;"></div>';
+        $html .= '</div>';
+        $html .= '<div style="font-size:11px;color:#666;">' . number_format($usedGb, 1) . ' GB / ' . (int)$totalGb . ' GB (' . $storagePercent . '%)</div>';
+        $html .= '</div>';
+    }
+
+    $html .= '</div>';
+
+    return $html;
+}
+
+
+/**
  * Curated list of Odoo modules available for installation.
  */
 function rancherfleet_getAvailableModules()
@@ -5676,6 +5904,27 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
                        . '<div class="rfm-stat">' . $uptime . '</div>'
                        . '</div>';
             }
+            $html .= '</div>';
+        }
+
+        // Health metrics (collapsible)
+        $healthMetricsHtml = '';
+        if (!$isSuspended && !empty($status['pods'])) {
+            $firstPodName = $status['pods'][0]['name'];
+            $metrics = rancherfleet_fetchPodMetrics($params, $namespace, $firstPodName);
+            $storageUsage = rancherfleet_getStorageUsage($params, $namespace, 'odoo-' . $orderNum);
+
+            if (!empty($metrics) || !empty($storageUsage)) {
+                $healthMetricsHtml = rancherfleet_renderHealthMetrics($metrics, $storageUsage);
+            }
+        }
+
+        if (!empty($healthMetricsHtml)) {
+            $html .= '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #eee;">';
+            $html .= '<a href="javascript:void(0)" onclick="var el=document.getElementById(\'rfm-health-metrics\'); el.style.display=el.style.display===\'none\'?\'block\':\'none\'; this.textContent = el.style.display===\'none\' ? \'▼ Show Health Metrics\' : \'▲ Hide Health Metrics\'; return false;" style="font-size:12px;color:#2980b9;text-decoration:none;cursor:pointer;">▼ Show Health Metrics</a>';
+            $html .= '<div id="rfm-health-metrics" style="display:none;">';
+            $html .= $healthMetricsHtml;
+            $html .= '</div>';
             $html .= '</div>';
         }
 
