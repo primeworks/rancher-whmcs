@@ -1583,7 +1583,7 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
 
 /**
  * Handles Odoo admin password reset from client area.
- * Creates a Kubernetes Job with the Odoo container to update the password directly.
+ * Creates a Kubernetes Job to update the password via passlib hashing and SQL.
  *
  * @param  array  $params
  * @param  string $namespace
@@ -1602,24 +1602,34 @@ function rancherfleet_handleOdooPasswordReset(array $params, $namespace, $orderN
 
         $dbName = 'odoo-' . $orderNum;
 
-        // Python script to reset password via Odoo's internal API
-        // User ID 2 is always the admin user in a standard Odoo installation
+        // DB credentials from Module Settings
+        $dbUser = isset($params['configoption20']) ? trim($params['configoption20']) : 'postgres';
+        $dbPass = isset($params['configoption21']) ? trim($params['configoption21']) : '';
+
+        // Python script to reset password with passlib pbkdf2_sha512 hashing
+        // Uses passlib to generate the correct Odoo 19 password hash
         $pythonScript = <<<'PYTHON'
-import odoo
+from passlib.context import CryptContext
+import psycopg2
 import sys
+
 try:
-    odoo.tools.config.parse_config(['--config=/etc/odoo/odoo.conf', '--no-http', '--without-demo=all'])
-    from odoo.api import Environment
-    from odoo import registry
+    new_pwd = sys.argv[1]
+    db = sys.argv[2]
+    host = 'postgres16.default.svc.cluster.local'
+    user = open('/etc/rfm-db/username').read().strip()
+    password = open('/etc/rfm-db/password').read().strip()
 
-    db = sys.argv[1]
-    new_pwd = sys.argv[2]
+    ctx = CryptContext(schemes=['pbkdf2_sha512'])
+    hashed = ctx.hash(new_pwd)
 
-    reg = registry(db)
-    with reg.cursor() as cr:
-        env = Environment(cr, 2, {})
-        env['res.users'].browse(2).write({'password': new_pwd})
-        cr.commit()
+    conn = psycopg2.connect(host=host, dbname=db, user=user, password=password)
+    cur = conn.cursor()
+    cur.execute("UPDATE res_users SET password = %s WHERE login = 'admin'", (hashed,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    print('Password reset successful')
     sys.exit(0)
 except Exception as e:
     sys.stderr.write(str(e))
@@ -1647,19 +1657,25 @@ PYTHON;
                             'name'    => 'resetpwd',
                             'image'   => 'odoo:19',
                             'command' => array('python3', '-c', $pythonScript),
-                            'args'    => array($dbName, $newPassword),
+                            'args'    => array($newPassword, $dbName),
                             'volumeMounts' => array(
                                 array(
-                                    'name'      => 'odoo-config',
-                                    'mountPath' => '/etc/odoo',
+                                    'name'      => 'db-admin-secret',
+                                    'mountPath' => '/etc/rfm-db',
+                                    'readOnly'  => true,
                                 ),
                             ),
                         )),
                         'volumes' => array(
                             array(
-                                'name'      => 'odoo-config',
-                                'configMap' => array(
-                                    'name' => 'odoo-' . $orderNum . '.conf',
+                                'name'   => 'db-admin-secret',
+                                'secret' => array(
+                                    'secretName' => 'rfm-db-admin-' . $orderNum,
+                                    'optional'   => true,
+                                    'items'      => array(
+                                        array('key' => 'username', 'path' => 'username'),
+                                        array('key' => 'password', 'path' => 'password'),
+                                    ),
                                 ),
                             ),
                         ),
@@ -1710,7 +1726,7 @@ PYTHON;
 
         if ($succeeded) {
             RancherFleet\Logger::info("odooPasswordReset: SUCCESS");
-            rancherfleet_logHistory($params, 'Odoo Password Reset', 'Password reset via Odoo Job');
+            rancherfleet_logHistory($params, 'Odoo Password Reset', 'Password reset via SQL');
             return 'odoo_password_reset_success:' . $newPassword;
         } elseif ($failed) {
             RancherFleet\Logger::error("odooPasswordReset: Job failed");
