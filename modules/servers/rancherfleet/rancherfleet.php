@@ -1858,13 +1858,14 @@ function rancherfleet_fetchPodMetrics(array $params, $namespace, $podName)
     RancherFleet\Logger::info("fetchPodMetrics: querying for {$namespace}/{$podName}");
 
     try {
-        list($rancher) = rancherfleet_buildClients($params);
-        $cfg = rancherfleet_getConfig($params);
-        $clusterId = isset($cfg['target_cluster_id']) ? $cfg['target_cluster_id'] : 'local';
+        list($rancher, , , $cfg) = rancherfleet_buildClients($params);
 
-        $metricsPath = '/k8s/clusters/' . rawurlencode($clusterId)
-                     . '/apis/metrics.k8s.io/v1beta1/namespaces/' . rawurlencode($namespace)
+        $targetClusterId = isset($cfg['target_cluster_id']) ? $cfg['target_cluster_id'] : 'local';
+        $metricsPath = '/apis/metrics.k8s.io/v1beta1/namespaces/' . rawurlencode($namespace)
                      . '/pods/' . rawurlencode($podName);
+
+        $fullUrl = '/k8s/clusters/' . rawurlencode($targetClusterId) . $metricsPath;
+        RancherFleet\Logger::info("fetchPodMetrics: calling metrics API: " . $fullUrl);
 
         $metrics = $rancher->rawRequest('GET', $metricsPath);
 
