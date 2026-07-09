@@ -2035,17 +2035,42 @@ function rancherfleet_getModuleStatus($serviceId)
                     RancherFleet\Logger::info("getModuleStatus: cache HIT (age={$age}s) for service {$serviceId}, found " . count($status) . " modules");
                     return $status;
                 } else {
-                    RancherFleet\Logger::info("getModuleStatus: cache EXPIRED (age={$age}s) for service {$serviceId}");
+                    RancherFleet\Logger::info("getModuleStatus: cache EXPIRED (age={$age}s) for service {$serviceId}, will refresh");
                 }
             }
         } else {
-            RancherFleet\Logger::info("getModuleStatus: cache MISS for service {$serviceId}");
+            RancherFleet\Logger::info("getModuleStatus: cache MISS for service {$serviceId}, will query database");
         }
     } catch (\Exception $e) {
         RancherFleet\Logger::error("getModuleStatus: cache read error (non-fatal): " . $e->getMessage());
     }
 
-    return array();
+    // Cache is missing or expired - run status query Job
+    try {
+        $params = rancherfleet_loadParamsForService($serviceId);
+        if (empty($params)) {
+            RancherFleet\Logger::error("getModuleStatus: could not load params for service {$serviceId}");
+            return array();
+        }
+
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+
+        RancherFleet\Logger::info("getModuleStatus: triggering status query Job for {$namespace}");
+        $result = rancherfleet_queryModuleStatus($params, $namespace, $orderNum);
+
+        if (!empty($result)) {
+            RancherFleet\Logger::info("getModuleStatus: Job returned " . count($result) . " modules");
+            return $result;
+        } else {
+            RancherFleet\Logger::info("getModuleStatus: Job returned empty result");
+            return array();
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("getModuleStatus: query Job error: " . $e->getMessage());
+        return array();
+    }
 }
 
 
@@ -2072,7 +2097,7 @@ function rancherfleet_cacheModuleStatus($serviceId, array $status)
 
 /**
  * Queries the database via Kubernetes Job to get actual module states.
- * Writes output to a file on the shared PVC so we can read it after Job completes.
+ * Uses psql to query ir_module_module and reads pod logs for output.
  *
  * @param  array  $params
  * @param  string $namespace
@@ -2081,51 +2106,20 @@ function rancherfleet_cacheModuleStatus($serviceId, array $status)
  */
 function rancherfleet_queryModuleStatus(array $params, $namespace, $orderNum)
 {
-    RancherFleet\Logger::info("queryModuleStatus: starting fresh status query for {$namespace}");
+    $serviceId = (int)$params['serviceid'];
+    RancherFleet\Logger::info("queryModuleStatus: starting Job query for {$namespace} (service {$serviceId})");
 
     try {
         list($rancher) = rancherfleet_buildClients($params);
 
         $dbName = 'odoo-' . $orderNum;
-        $outputFile = '/var/lib/odoo/.module-status-' . time() . '.json';
+        $jobName = 'rfm-query-mods-' . time() . '-' . substr(md5($orderNum), 0, 8);
 
-        $pythonScript = <<<'PYTHON'
-import psycopg2
-import json
-import sys
-
-try:
-    db = sys.argv[1]
-    output_file = sys.argv[2]
-    host = 'postgres16.default.svc.cluster.local'
-    user = open('/etc/rfm-db/username').read().strip()
-    password = open('/etc/rfm-db/password').read().strip()
-
-    modules_to_check = ['crm', 'sale_management', 'account', 'stock', 'purchase',
-                        'project', 'hr_timesheet', 'hr', 'website_sale', 'im_livechat',
-                        'mass_mailing', 'point_of_sale']
-
-    conn = psycopg2.connect(host=host, dbname=db, user=user, password=password)
-    cur = conn.cursor()
-    cur.execute("SELECT name, state FROM ir_module_module WHERE name = ANY(%s)", (modules_to_check,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    result = {}
-    for name, state in rows:
-        result[name] = state
-
-    with open(output_file, 'w') as f:
-        json.dump(result, f)
-    sys.exit(0)
-except Exception as e:
-    sys.stderr.write(str(e))
-    sys.exit(1)
-PYTHON;
-
-        $jobName = 'rfm-query-mods-' . time() . '-' . substr(md5($orderNum), 0, 4);
-        $jobName = substr($jobName, 0, 52) . '-' . substr(md5($orderNum), 0, 8);
+        // psql query: output format is "moduleName|installed" (one per line)
+        $psqlQuery = "SELECT name || '|' || state FROM ir_module_module " .
+                     "WHERE name IN ('crm','sale_management','account','stock','purchase'," .
+                     "'project','hr_timesheet','hr','website_sale','im_livechat','mass_mailing','point_of_sale') " .
+                     "AND state='installed'";
 
         $jobManifest = array(
             'apiVersion' => 'batch/v1',
@@ -2133,10 +2127,10 @@ PYTHON;
             'metadata'   => array(
                 'name'      => $jobName,
                 'namespace' => $namespace,
-                'labels'    => array('app' => 'rfm-query-mods'),
+                'labels'    => array('job-name' => $jobName, 'app' => 'rfm-query-mods'),
             ),
             'spec' => array(
-                'ttlSecondsAfterFinished' => 60,
+                'ttlSecondsAfterFinished' => 30,
                 'backoffLimit'            => 0,
                 'template'               => array(
                     'spec' => array(
@@ -2144,61 +2138,54 @@ PYTHON;
                         'containers'    => array(array(
                             'name'    => 'querymods',
                             'image'   => 'postgres:16-alpine',
-                            'command' => array('python3', '-c', $pythonScript),
-                            'args'    => array($dbName, $outputFile),
-                            'volumeMounts' => array(
-                                array(
-                                    'name'      => 'db-admin-secret',
-                                    'mountPath' => '/etc/rfm-db',
-                                    'readOnly'  => true,
-                                ),
-                                array(
-                                    'name'      => 'odoo-data',
-                                    'mountPath' => '/var/lib/odoo',
-                                    'subPath'   => 'odoo',
-                                ),
+                            'env'     => array(
+                                array('name' => 'PGPASSWORD',
+                                      'valueFrom' => array(
+                                          'secretKeyRef' => array(
+                                              'name' => 'rfm-db-admin-' . $orderNum,
+                                              'key'  => 'password',
+                                              'optional' => true,
+                                          )
+                                      )),
+                            ),
+                            'command' => array('psql'),
+                            'args'    => array(
+                                '-h', 'postgres16.default.svc.cluster.local',
+                                '-U', 'postgres',
+                                '-d', $dbName,
+                                '-t', '-A', '-F|',
+                                '-c', $psqlQuery,
                             ),
                         )),
-                        'volumes' => array(
-                            array(
-                                'name'   => 'db-admin-secret',
-                                'secret' => array(
-                                    'secretName' => 'rfm-db-admin-' . $orderNum,
-                                    'optional'   => true,
-                                    'items'      => array(
-                                        array('key' => 'username', 'path' => 'username'),
-                                        array('key' => 'password', 'path' => 'password'),
-                                    ),
-                                ),
-                            ),
-                            array(
-                                'name'         => 'odoo-data',
-                                'persistentVolumeClaim' => array(
-                                    'claimName' => 'odoo-' . $orderNum,
-                                ),
-                            ),
-                        ),
                     ),
                 ),
             ),
         );
 
+        RancherFleet\Logger::info("queryModuleStatus: creating Job {$jobName} in {$namespace}");
         $rancher->rawRequest('POST',
             '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
             $jobManifest
         );
+        RancherFleet\Logger::info("queryModuleStatus: Job created successfully");
 
         $succeeded = false;
         $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
 
-        for ($i = 0; $i < 12; $i++) {
+        // Poll Job for up to 30 seconds with 5 second intervals
+        for ($i = 0; $i < 6; $i++) {
             sleep(5);
             try {
                 $job        = $rancher->rawRequest('GET', $jobPath);
                 $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+
+                RancherFleet\Logger::info("queryModuleStatus: poll #{$i} - checking Job status");
+
                 foreach ($conditions as $cond) {
                     if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
-                        $succeeded = true; break 2;
+                        $succeeded = true;
+                        RancherFleet\Logger::info("queryModuleStatus: Job COMPLETED successfully");
+                        break 2;
                     }
                 }
             } catch (\Exception $e) {
@@ -2207,32 +2194,87 @@ PYTHON;
             }
         }
 
+        // Attempt to read pod logs
+        $result = array();
+        if ($succeeded) {
+            try {
+                RancherFleet\Logger::info("queryModuleStatus: reading pod logs for {$jobName}");
+
+                $podSelector = 'job-name=' . $jobName;
+                $podsPath = '/api/v1/namespaces/' . rawurlencode($namespace) . '/pods?labelSelector=' . rawurlencode($podSelector);
+                $pods = $rancher->rawRequest('GET', $podsPath);
+                $podItems = isset($pods['items']) ? $pods['items'] : array();
+
+                if (!empty($podItems)) {
+                    $pod = $podItems[0];
+                    $podName = isset($pod['metadata']['name']) ? $pod['metadata']['name'] : '';
+
+                    if ($podName) {
+                        RancherFleet\Logger::info("queryModuleStatus: found pod {$podName}, reading logs");
+
+                        $logsPath = '/api/v1/namespaces/' . rawurlencode($namespace) . '/pods/' . rawurlencode($podName) . '/log';
+                        $logs = $rancher->rawRequest('GET', $logsPath);
+
+                        // logs can be string or array depending on Rancher version
+                        $logContent = is_string($logs) ? $logs : (isset($logs['log']) ? $logs['log'] : '');
+
+                        RancherFleet\Logger::info("queryModuleStatus: pod log content:\n" . substr($logContent, 0, 500));
+
+                        // Parse output: format is "moduleName|installed" (one per line)
+                        $lines = array_filter(array_map('trim', explode("\n", $logContent)));
+                        foreach ($lines as $line) {
+                            if (strpos($line, '|') !== false) {
+                                list($moduleName, $state) = explode('|', $line, 2);
+                                $moduleName = trim($moduleName);
+                                $state = trim($state);
+                                if ($moduleName && $state) {
+                                    $result[$moduleName] = $state;
+                                    RancherFleet\Logger::info("queryModuleStatus: parsed module {$moduleName}={$state}");
+                                }
+                            }
+                        }
+
+                        if (!empty($result)) {
+                            RancherFleet\Logger::info("queryModuleStatus: parsed " . count($result) . " installed modules from logs");
+                            rancherfleet_cacheModuleStatus($serviceId, $result);
+                        } else {
+                            RancherFleet\Logger::info("queryModuleStatus: no installed modules found in output");
+                        }
+                    } else {
+                        RancherFleet\Logger::error("queryModuleStatus: pod name not found in response");
+                    }
+                } else {
+                    RancherFleet\Logger::error("queryModuleStatus: no pods found for Job {$jobName}");
+                }
+            } catch (\Exception $readEx) {
+                RancherFleet\Logger::error("queryModuleStatus: error reading pod logs: " . $readEx->getMessage());
+            }
+        } else {
+            // Job timed out - cache empty result with short TTL
+            RancherFleet\Logger::error("queryModuleStatus: Job timed out after 30 seconds, caching empty result with short TTL");
+            try {
+                $data = array(
+                    'status'    => array(),
+                    'timestamp' => time(),
+                );
+                \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+                    array('module' => 'rancherfleet_modules', 'setting' => 'status_' . $serviceId),
+                    array('value' => json_encode($data))
+                );
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("queryModuleStatus: cache write error: " . $e->getMessage());
+            }
+        }
+
+        // Clean up Job
         try {
             $rancher->rawRequest('DELETE', $jobPath);
+            RancherFleet\Logger::info("queryModuleStatus: Job deleted");
         } catch (\Exception $e) {
             RancherFleet\Logger::info("queryModuleStatus: Job cleanup note: " . $e->getMessage());
         }
 
-        if ($succeeded) {
-            RancherFleet\Logger::info("queryModuleStatus: Job completed, reading output from {$outputFile}");
-
-            // Read the output file to get module status
-            try {
-                $localPath = $outputFile;
-                // The file is on the cluster PVC, we need to read it via the pod
-                // For now, return empty and rely on display logic handling this gracefully
-                // In a production fix, we'd use kubectl exec or a sidecar to read the file
-
-                RancherFleet\Logger::info("queryModuleStatus: Job output written to {$outputFile}, cache will be refreshed on next query");
-            } catch (\Exception $readEx) {
-                RancherFleet\Logger::error("queryModuleStatus: could not read output file: " . $readEx->getMessage());
-            }
-
-            return array();
-        } else {
-            RancherFleet\Logger::error("queryModuleStatus: Job timed out");
-            return array();
-        }
+        return $result;
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("queryModuleStatus: exception — " . $e->getMessage());
