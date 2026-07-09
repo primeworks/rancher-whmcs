@@ -6677,33 +6677,38 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         }
 
         RancherFleet\Logger::info("CreateStagingUpgrade: request details: " . json_encode($request));
+        RancherFleet\Logger::info("CreateStagingUpgrade: invoiceId check: " . var_export($request['invoiceId'] ?? null, true));
+        RancherFleet\Logger::info("CreateStagingUpgrade: status check: " . var_export($request['status'] ?? 'unknown', true));
 
         $targetVersion = $request['version'];
         $currentVersion = null;
         $fee = $request['fee'];
 
-        RancherFleet\Logger::info("CreateStagingUpgrade: {$namespace} to version {$targetVersion}");
-
-        list($rancher, $github) = rancherfleet_buildClients($params);
-
-        // Get current version
-        $status = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
-        if ($status['image'] && preg_match('/odoo:([0-9.]+)/', $status['image'], $m)) {
-            $currentVersion = $m[1];
-        }
-
-        if (!$currentVersion) {
-            return 'Error: Could not determine current Odoo version.';
-        }
-
-        // 1. Charge credit (or reuse existing invoice if already charged)
-        $invoiceId = null;
-        if (isset($request['invoiceId']) && $request['invoiceId'] > 0) {
-            // Upgrade request already charged; reuse existing invoice
-            $invoiceId = (int)$request['invoiceId'];
-            RancherFleet\Logger::info("CreateStagingUpgrade: skipping charge, reusing existing invoice {$invoiceId}");
+        // Skip if already charged (check both invoiceId and status)
+        $requestStatus = isset($request['status']) ? $request['status'] : 'pending';
+        if ($requestStatus !== 'pending') {
+            RancherFleet\Logger::info("CreateStagingUpgrade: skipping charge, request status is '{$requestStatus}', not 'pending'");
+            $invoiceId = isset($request['invoiceId']) ? (int)$request['invoiceId'] : null;
+            if (!$invoiceId) {
+                return 'Error: Request is in status ' . $requestStatus . ' but has no invoiceId.';
+            }
         } else {
-            // First attempt; charge credit
+            RancherFleet\Logger::info("CreateStagingUpgrade: {$namespace} to version {$targetVersion}");
+
+            list($rancher, $github) = rancherfleet_buildClients($params);
+
+            // Get current version
+            $deploymentStatus = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
+            if ($deploymentStatus['image'] && preg_match('/odoo:([0-9.]+)/', $deploymentStatus['image'], $m)) {
+                $currentVersion = $m[1];
+            }
+
+            if (!$currentVersion) {
+                return 'Error: Could not determine current Odoo version.';
+            }
+
+            // 1. Charge credit (status is 'pending', so charge if no invoiceId yet)
+            $invoiceId = null;
             RancherFleet\Logger::info("CreateStagingUpgrade: charging ${fee}");
             $payment = rancherfleet_chargeCredit(
                 $clientId,
@@ -6715,8 +6720,32 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             }
             $invoiceId = $payment['invoiceId'];
 
-            // Store invoice ID in request for future retries
-            rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee, $invoiceId);
+            // Update request record directly with invoiceId and status, preserving all other fields
+            try {
+                \WHMCS\Database\Capsule::table('tbladdonmodules')
+                    ->where('module', 'rancherfleet_upgrade')
+                    ->where('setting', 'request_' . $serviceId)
+                    ->update(array('value' => json_encode(array_merge($request, array(
+                        'invoiceId'      => $invoiceId,
+                        'status'         => 'charging_complete',
+                        'charged_at'     => time(),
+                    )))));
+
+                // Verify it was saved
+                $verifyRecord = \WHMCS\Database\Capsule::table('tbladdonmodules')
+                    ->where('module', 'rancherfleet_upgrade')
+                    ->where('setting', 'request_' . $serviceId)
+                    ->value('value');
+
+                if ($verifyRecord) {
+                    $verified = json_decode($verifyRecord, true);
+                    RancherFleet\Logger::info("CreateStagingUpgrade: record persisted, invoiceId=" . ($verified['invoiceId'] ?? 'null') . ", status=" . ($verified['status'] ?? 'unknown'));
+                } else {
+                    RancherFleet\Logger::error("CreateStagingUpgrade: failed to verify persisted record");
+                }
+            } catch (\Exception $updateEx) {
+                RancherFleet\Logger::error("CreateStagingUpgrade: error persisting invoiceId: " . $updateEx->getMessage());
+            }
 
             RancherFleet\Logger::info("CreateStagingUpgrade: credit charged, invoice {$invoiceId}");
         }
