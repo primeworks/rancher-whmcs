@@ -2646,7 +2646,7 @@ function rancherfleet_getUpgradeRequest($serviceId)
 /**
  * Stores upgrade request in tbladdonmodules with staging support.
  */
-function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee)
+function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee, $invoiceId = null)
 {
     try {
         $data = array(
@@ -2656,7 +2656,7 @@ function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee)
             'status'            => 'pending',
             'staging_url'       => null,
             'staging_shared'    => false,
-            'invoiceId'         => null,
+            'invoiceId'         => $invoiceId,
             'staging_created_at' => null,
         );
         \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
@@ -6630,39 +6630,50 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Could not determine current Odoo version.';
         }
 
-        // 1. Charge credit
-        RancherFleet\Logger::info("CreateStagingUpgrade: charging ${fee}");
-        try {
-            $invoiceResult = localAPI('CreateInvoice', array(
-                'userid'           => $clientId,
-                'status'           => 'Unpaid',
-                'itemdescription1' => "Odoo version upgrade from {$currentVersion} to {$targetVersion} (staging)",
-                'itemamount1'      => $fee,
-                'itemtaxed1'       => false,
-                'paymentmethod'    => '',
-            ));
+        // 1. Charge credit (or reuse existing invoice if already charged)
+        $invoiceId = null;
+        if (isset($request['invoiceId']) && $request['invoiceId'] > 0) {
+            // Upgrade request already charged; reuse existing invoice
+            $invoiceId = (int)$request['invoiceId'];
+            RancherFleet\Logger::info("CreateStagingUpgrade: skipping charge, reusing existing invoice {$invoiceId}");
+        } else {
+            // First attempt; charge credit
+            RancherFleet\Logger::info("CreateStagingUpgrade: charging ${fee}");
+            try {
+                $invoiceResult = localAPI('CreateInvoice', array(
+                    'userid'           => $clientId,
+                    'status'           => 'Unpaid',
+                    'itemdescription1' => "Odoo version upgrade from {$currentVersion} to {$targetVersion} (staging)",
+                    'itemamount1'      => $fee,
+                    'itemtaxed1'       => false,
+                    'paymentmethod'    => '',
+                ));
 
-            if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
-                $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
-                return 'Error: Could not create invoice: ' . $err;
+                if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
+                    $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
+                    return 'Error: Could not create invoice: ' . $err;
+                }
+
+                $invoiceId = (int)$invoiceResult['invoiceid'];
+
+                $creditResult = localAPI('ApplyCredit', array(
+                    'clientid' => $clientId,
+                    'amount'   => $fee,
+                ));
+
+                if (!isset($creditResult['result']) || $creditResult['result'] !== 'success') {
+                    $err = isset($creditResult['message']) ? $creditResult['message'] : json_encode($creditResult);
+                    return 'Error: Could not apply credit: ' . $err;
+                }
+
+                // Store invoice ID in request for future retries
+                rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee, $invoiceId);
+
+                RancherFleet\Logger::info("CreateStagingUpgrade: credit charged, invoice {$invoiceId}");
+            } catch (\Exception $payEx) {
+                RancherFleet\Logger::error("CreateStagingUpgrade: payment error: " . $payEx->getMessage());
+                return 'Error: Payment processing failed: ' . $payEx->getMessage();
             }
-
-            $invoiceId = (int)$invoiceResult['invoiceid'];
-
-            $creditResult = localAPI('ApplyCredit', array(
-                'clientid' => $clientId,
-                'amount'   => $fee,
-            ));
-
-            if (!isset($creditResult['result']) || $creditResult['result'] !== 'success') {
-                $err = isset($creditResult['message']) ? $creditResult['message'] : json_encode($creditResult);
-                return 'Error: Could not apply credit: ' . $err;
-            }
-
-            RancherFleet\Logger::info("CreateStagingUpgrade: credit charged, invoice {$invoiceId}");
-        } catch (\Exception $payEx) {
-            RancherFleet\Logger::error("CreateStagingUpgrade: payment error: " . $payEx->getMessage());
-            return 'Error: Payment processing failed: ' . $payEx->getMessage();
         }
 
         // 2. Take backup before staging
