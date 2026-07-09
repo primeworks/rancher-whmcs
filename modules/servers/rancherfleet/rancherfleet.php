@@ -6592,6 +6592,70 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
 
 
 /**
+ * Helper: charge client credit for an operation.
+ *
+ * @param  int    $clientId
+ * @param  float  $fee
+ * @param  string $description
+ * @return array  ['success' => bool, 'error' => string|null, 'invoiceId' => int|null]
+ */
+function rancherfleet_chargeCredit($clientId, $fee, $description)
+{
+    try {
+        $invoiceResult = localAPI('CreateInvoice', array(
+            'userid'           => $clientId,
+            'status'           => 'Unpaid',
+            'itemdescription1' => $description,
+            'itemamount1'      => $fee,
+            'itemtaxed1'       => false,
+            'paymentmethod'    => '',
+        ));
+
+        if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
+            $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
+            return array('success' => false, 'error' => 'Could not create invoice: ' . $err, 'invoiceId' => null);
+        }
+
+        $invoiceId = (int)$invoiceResult['invoiceid'];
+
+        $creditResult = localAPI('ApplyCredit', array(
+            'clientid' => $clientId,
+            'amount'   => $fee,
+        ));
+
+        if (!isset($creditResult['result']) || $creditResult['result'] !== 'success') {
+            $err = isset($creditResult['message']) ? $creditResult['message'] : json_encode($creditResult);
+            return array('success' => false, 'error' => 'Could not apply credit: ' . $err, 'invoiceId' => $invoiceId);
+        }
+
+        return array('success' => true, 'error' => null, 'invoiceId' => $invoiceId);
+
+    } catch (\Exception $e) {
+        return array('success' => false, 'error' => $e->getMessage(), 'invoiceId' => null);
+    }
+}
+
+
+/**
+ * Helper: refund client credit for a failed operation.
+ *
+ * @param int    $clientId
+ * @param float  $fee
+ * @param int    $invoiceId
+ * @param string $reason
+ */
+function rancherfleet_refundCredit($clientId, $fee, $invoiceId, $reason)
+{
+    try {
+        RancherFleet\Logger::info("refundCredit: refunding \${$fee} to client {$clientId}, invoice {$invoiceId}, reason: {$reason}");
+        localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("refundCredit: error refunding: " . $e->getMessage());
+    }
+}
+
+
+/**
  * Admin button handler to create a staging environment for version upgrade.
  * Creates staging namespace, database, branch, and GitRepo.
  */
@@ -6611,6 +6675,8 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         if (empty($request)) {
             return 'No pending upgrade request for this service.';
         }
+
+        RancherFleet\Logger::info("CreateStagingUpgrade: request details: " . json_encode($request));
 
         $targetVersion = $request['version'];
         $currentVersion = null;
@@ -6639,41 +6705,20 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         } else {
             // First attempt; charge credit
             RancherFleet\Logger::info("CreateStagingUpgrade: charging ${fee}");
-            try {
-                $invoiceResult = localAPI('CreateInvoice', array(
-                    'userid'           => $clientId,
-                    'status'           => 'Unpaid',
-                    'itemdescription1' => "Odoo version upgrade from {$currentVersion} to {$targetVersion} (staging)",
-                    'itemamount1'      => $fee,
-                    'itemtaxed1'       => false,
-                    'paymentmethod'    => '',
-                ));
-
-                if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
-                    $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
-                    return 'Error: Could not create invoice: ' . $err;
-                }
-
-                $invoiceId = (int)$invoiceResult['invoiceid'];
-
-                $creditResult = localAPI('ApplyCredit', array(
-                    'clientid' => $clientId,
-                    'amount'   => $fee,
-                ));
-
-                if (!isset($creditResult['result']) || $creditResult['result'] !== 'success') {
-                    $err = isset($creditResult['message']) ? $creditResult['message'] : json_encode($creditResult);
-                    return 'Error: Could not apply credit: ' . $err;
-                }
-
-                // Store invoice ID in request for future retries
-                rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee, $invoiceId);
-
-                RancherFleet\Logger::info("CreateStagingUpgrade: credit charged, invoice {$invoiceId}");
-            } catch (\Exception $payEx) {
-                RancherFleet\Logger::error("CreateStagingUpgrade: payment error: " . $payEx->getMessage());
-                return 'Error: Payment processing failed: ' . $payEx->getMessage();
+            $payment = rancherfleet_chargeCredit(
+                $clientId,
+                $fee,
+                "Odoo version upgrade from {$currentVersion} to {$targetVersion} (staging)"
+            );
+            if (!$payment['success']) {
+                return 'Error: ' . $payment['error'];
             }
+            $invoiceId = $payment['invoiceId'];
+
+            // Store invoice ID in request for future retries
+            rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee, $invoiceId);
+
+            RancherFleet\Logger::info("CreateStagingUpgrade: credit charged, invoice {$invoiceId}");
         }
 
         // 2. Take backup before staging
@@ -6682,12 +6727,12 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             $backupResult = rancherfleet_handleBackupRestore($params, $namespace, $orderNum, '', 'db', true);
             if (strpos($backupResult, 'error') !== false) {
                 RancherFleet\Logger::error("CreateStagingUpgrade: backup failed, refunding");
-                localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+                rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Backup failed');
                 return 'Error: Backup failed. Credit refunded.';
             }
         } catch (\Exception $backEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: backup exception: " . $backEx->getMessage());
-            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Backup exception: ' . $backEx->getMessage());
             return 'Error: ' . $backEx->getMessage() . ' Credit refunded.';
         }
 
@@ -6698,7 +6743,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             sleep(2);
         } catch (\Exception $nsEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: namespace creation failed: " . $nsEx->getMessage());
-            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Namespace creation failed: ' . $nsEx->getMessage());
             return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage() . ' Credit refunded.';
         }
 
@@ -6741,7 +6786,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         } catch (\Exception $dbEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: database creation failed: " . $dbEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
-            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Database creation failed: ' . $dbEx->getMessage());
             return 'Error: Failed to create staging database: ' . $dbEx->getMessage() . ' Credit refunded.';
         }
 
@@ -6754,7 +6799,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         } catch (\Exception $branchEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: branch clone failed: " . $branchEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
-            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Branch clone failed: ' . $branchEx->getMessage());
             return 'Error: Failed to clone branch: ' . $branchEx->getMessage() . ' Credit refunded.';
         }
 
@@ -6794,7 +6839,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             RancherFleet\Logger::error("CreateStagingUpgrade: manifest update failed: " . $manifestEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
             $github->deleteBranch($stagingBranch);
-            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Manifest update failed: ' . $manifestEx->getMessage());
             return 'Error: Failed to update staging manifests: ' . $manifestEx->getMessage() . ' Credit refunded.';
         }
 
@@ -6824,7 +6869,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             RancherFleet\Logger::error("CreateStagingUpgrade: GitRepo creation failed: " . $gitRepoEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
             $github->deleteBranch('whmcs-client-' . $orderNum . '-staging');
-            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'GitRepo creation failed: ' . $gitRepoEx->getMessage());
             return 'Error: Failed to create staging GitRepo: ' . $gitRepoEx->getMessage() . ' Credit refunded.';
         }
 
