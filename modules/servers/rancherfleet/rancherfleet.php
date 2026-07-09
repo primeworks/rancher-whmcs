@@ -1580,6 +1580,137 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
     }
 }
 
+/**
+ * Handles Odoo admin password reset from client area.
+ * Creates a Kubernetes Job that updates the password in the database.
+ *
+ * @param  array  $params
+ * @param  string $namespace
+ * @param  string $orderNum
+ * @return string  'odoo_password_reset_success:{password}' or 'odoo_password_reset_error:{message}'
+ */
+function rancherfleet_handleOdooPasswordReset(array $params, $namespace, $orderNum)
+{
+    RancherFleet\Logger::info("odooPasswordReset: starting for {$namespace}");
+
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+
+        // Generate random 16-character password
+        $newPassword = bin2hex(random_bytes(8));
+
+        // DB credentials from Module Settings
+        $dbUser = isset($params['configoption20']) ? trim($params['configoption20']) : 'postgres';
+        $dbPass = isset($params['configoption21']) ? trim($params['configoption21']) : '';
+        $dbHost = 'postgres16.default.svc.cluster.local';
+        $dbPort = '5432';
+        $dbName = 'odoo-' . $orderNum;
+
+        if (empty($dbUser)) {
+            RancherFleet\Logger::error("odooPasswordReset: DB Admin Username not configured");
+            return 'odoo_password_reset_error:Database credentials not configured';
+        }
+
+        $jobName = 'rfm-reset-pwd-' . $orderNum . '-' . substr(md5(microtime()), 0, 8);
+        $jobName = substr($jobName, 0, 52) . '-' . substr(md5($orderNum), 0, 8);
+
+        $jobManifest = array(
+            'apiVersion' => 'batch/v1',
+            'kind'       => 'Job',
+            'metadata'   => array(
+                'name'      => $jobName,
+                'namespace' => $namespace,
+                'labels'    => array('app' => 'rfm-reset-pwd'),
+            ),
+            'spec' => array(
+                'ttlSecondsAfterFinished' => 120,
+                'backoffLimit'            => 0,
+                'template'               => array(
+                    'spec' => array(
+                        'restartPolicy' => 'Never',
+                        'containers'    => array(array(
+                            'name'    => 'resetpwd',
+                            'image'   => 'postgres:16-alpine',
+                            'command' => array('sh', '-c',
+                                'psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE '
+                                . '-c "CREATE EXTENSION IF NOT EXISTS pgcrypto; '
+                                . 'UPDATE res_users SET password = crypt(\'' . addslashes($newPassword) . '\', gen_salt(\'bf\')) '
+                                . 'WHERE login = \'admin\';"'
+                            ),
+                            'env' => array(
+                                array('name' => 'PGHOST',     'value' => $dbHost),
+                                array('name' => 'PGPORT',     'value' => $dbPort),
+                                array('name' => 'PGUSER',     'value' => $dbUser),
+                                array('name' => 'PGPASSWORD', 'value' => $dbPass),
+                                array('name' => 'PGDATABASE', 'value' => $dbName),
+                            ),
+                        )),
+                    ),
+                ),
+            ),
+        );
+
+        RancherFleet\Logger::info("odooPasswordReset: creating Job {$jobName}");
+
+        // Create the Job
+        $rancher->rawRequest('POST',
+            '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
+            $jobManifest
+        );
+
+        // Poll for completion — up to 60 seconds
+        $succeeded = false;
+        $failed    = false;
+        $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
+
+        for ($i = 0; $i < 12; $i++) {
+            sleep(5);
+            try {
+                $job        = $rancher->rawRequest('GET', $jobPath);
+                $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                foreach ($conditions as $cond) {
+                    if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                        $succeeded = true; break 2;
+                    }
+                    if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                        $failed = true; break 2;
+                    }
+                }
+                RancherFleet\Logger::info("odooPasswordReset: waiting for Job... " . (($i + 1) * 5) . "s elapsed");
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("odooPasswordReset: error polling Job: " . $e->getMessage());
+                break;
+            }
+        }
+
+        // Clean up the Job
+        try {
+            $rancher->rawRequest('DELETE', $jobPath);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("odooPasswordReset: Job cleanup note: " . $e->getMessage());
+        }
+
+        if ($succeeded) {
+            RancherFleet\Logger::info("odooPasswordReset: SUCCESS — admin password reset");
+            rancherfleet_logHistory($params, 'Odoo Password Reset', 'Admin password reset via Job');
+            return 'odoo_password_reset_success:' . $newPassword;
+        } elseif ($failed) {
+            RancherFleet\Logger::error("odooPasswordReset: Job failed");
+            rancherfleet_logHistory($params, 'Password Reset Failed', 'Job failed');
+            return 'odoo_password_reset_error:Password reset job failed. Check admin logs for details.';
+        } else {
+            RancherFleet\Logger::error("odooPasswordReset: Job timed out after 60s");
+            rancherfleet_logHistory($params, 'Password Reset Timeout', 'Job timeout');
+            return 'odoo_password_reset_error:Password reset job timed out. Please try again.';
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("odooPasswordReset: exception — " . $e->getMessage());
+        rancherfleet_logHistory($params, 'Password Reset Error', $e->getMessage());
+        return 'odoo_password_reset_error:' . $e->getMessage();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase A: Provisioning Rollback
 
@@ -3791,6 +3922,8 @@ function rancherfleet_ClientArea(array $params)
         }
     } elseif ($action === 'custom_url_connect') {
         $message = rancherfleet_handleCustomUrlConnect($params, $namespace, $orderNum);
+    } elseif ($action === 'odoo_password_reset') {
+        $message = rancherfleet_handleOdooPasswordReset($params, $namespace, $orderNum);
     }
 
     // Build the output
@@ -4218,11 +4351,11 @@ function rancherfleet_domainPurchaseModal($sld, $tld, $serviceUrl)
 
 
 /**
- * Renders the client's WHMCS credit balance as a small styled badge.
+ * Renders the client's WHMCS credit balance as a small styled badge with an "Add Credit" button.
  * Reads from tblclients.credit.
  *
  * @param  array $params
- * @return string  HTML badge
+ * @return string  HTML badge with button
  */
 function rancherfleet_creditBalanceHtml(array $params)
 {
@@ -4237,10 +4370,36 @@ function rancherfleet_creditBalanceHtml(array $params)
         $creditBalance = (float)$client->credit;
         $currency = isset($params['clientsdetails']['currency_code'])
                   ? $params['clientsdetails']['currency_code'] : 'USD';
-        return '<div style="display:inline-block;background:#e8f4f8;border:1px solid #a8d5dd;color:#0c5460;padding:6px 12px;border-radius:12px;font-size:11px;font-weight:bold;margin-bottom:12px;">&#127874; Credit Balance: <strong>' . $currency . ' ' . number_format($creditBalance, 2) . '</strong></div>';
+        $html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">';
+        $html .= '<div style="display:inline-block;background:#e8f4f8;border:1px solid #a8d5dd;color:#0c5460;padding:6px 12px;border-radius:12px;font-size:11px;font-weight:bold;">&#127874; Credit Balance: <strong>' . $currency . ' ' . number_format($creditBalance, 2) . '</strong></div>';
+        $html .= '<a href="/clientarea.php?action=addfunds" style="background:#2980b9;color:#fff;border:none;border-radius:4px;padding:6px 14px;font-size:11px;font-weight:bold;text-decoration:none;display:inline-block;">+ Add Funds</a>';
+        $html .= '</div>';
+        return $html;
     } catch (\Exception $e) {
         return '';
     }
+}
+
+/**
+ * Renders the Odoo password reset card in the client area.
+ * Allows users to generate a new admin password via Kubernetes Job.
+ *
+ * @param  array $params
+ * @param  string $orderNum
+ * @return string HTML card
+ */
+function rancherfleet_passwordResetCardHtml(array $params, $orderNum)
+{
+    $serviceUrl = htmlspecialchars($_SERVER['REQUEST_URI'] ?? '');
+    $html = '<div class="rfm-ca-card">';
+    $html .= '<h4>Reset Odoo Password</h4>';
+    $html .= '<p style="font-size:12px;color:#666;margin-bottom:10px;">If you\'ve been locked out or forgotten your Odoo admin password, click below to generate a new one. The new password will be shown once — save it immediately.</p>';
+    $html .= '<form method="post" action="' . $serviceUrl . '" onsubmit="return confirm(\'Generate a new admin password? This will replace your current password.\')">';
+    $html .= '<input type="hidden" name="clientaction" value="odoo_password_reset">';
+    $html .= '<button type="submit" style="background:#e67e22;color:#fff;border:none;border-radius:4px;padding:8px 18px;font-size:13px;font-weight:bold;cursor:pointer;">Generate New Password</button>';
+    $html .= '</form>';
+    $html .= '</div>';
+    return $html;
 }
 
 /**
@@ -4818,6 +4977,15 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars($subdomain) . ' has been connected. Your SSL certificate will be issued automatically within a few minutes.</div>';
     } elseif (strpos($message, 'custom_url_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('custom_url_error:'))) . '</div>';
+    } elseif (strpos($message, 'odoo_password_reset_success:') === 0) {
+        $newPassword = substr($message, strlen('odoo_password_reset_success:'));
+        $html .= '<div style="background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:12px 14px;border-radius:4px;margin-bottom:12px;font-size:13px;">';
+        $html .= '<p style="margin:0 0 10px;font-weight:bold;">&#9888; Your new Odoo admin password has been generated:</p>';
+        $html .= '<div style="background:#fff;border:1px solid #ffc107;border-radius:4px;padding:10px;font-family:monospace;font-size:14px;font-weight:bold;color:#333;word-break:break-all;margin-bottom:10px;">' . htmlspecialchars($newPassword) . '</div>';
+        $html .= '<p style="margin:0;font-size:12px;"><strong>Save this password now</strong> — it will not be shown again. You can log in using username <code>admin</code> and this password.</p>';
+        $html .= '</div>';
+    } elseif (strpos($message, 'odoo_password_reset_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; Password reset failed: ' . htmlspecialchars(substr($message, strlen('odoo_password_reset_error:'))) . '</div>';
     }
 
     try {
@@ -4888,6 +5056,11 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '</div>';
         $html .= '</div>';
         $html .= '</div>'; // instance link card
+
+        // -----------------------------------------------------------------------
+        // Reset Odoo Password Card
+        // -----------------------------------------------------------------------
+        $html .= rancherfleet_passwordResetCardHtml($params, $orderNum);
 
         // -----------------------------------------------------------------------
         // Custom Subdomain Ingress Card
