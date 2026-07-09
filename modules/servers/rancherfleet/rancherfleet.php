@@ -6677,23 +6677,15 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         }
 
         RancherFleet\Logger::info("CreateStagingUpgrade: request details: " . json_encode($request));
-        RancherFleet\Logger::info("CreateStagingUpgrade: invoiceId check: " . var_export($request['invoiceId'] ?? null, true));
-        RancherFleet\Logger::info("CreateStagingUpgrade: status check: " . var_export($request['status'] ?? 'unknown', true));
 
-        $targetVersion = $request['version'];
-        $currentVersion = null;
-        $fee = $request['fee'];
-
-        // Skip if already charged (check both invoiceId and status)
-        $requestStatus = isset($request['status']) ? $request['status'] : 'pending';
-        if ($requestStatus !== 'pending') {
-            RancherFleet\Logger::info("CreateStagingUpgrade: skipping charge, request status is '{$requestStatus}', not 'pending'");
-            $invoiceId = isset($request['invoiceId']) ? (int)$request['invoiceId'] : null;
-            if (!$invoiceId) {
-                return 'Error: Request is in status ' . $requestStatus . ' but has no invoiceId.';
-            }
+        // Check if already charged — if status is not 'pending', skip payment
+        if ($request['status'] !== 'pending') {
+            $invoiceId = $request['invoiceId'];
+            RancherFleet\Logger::info("CreateStagingUpgrade: skipping charge, status={$request['status']}, reusing invoice {$invoiceId}");
         } else {
-            RancherFleet\Logger::info("CreateStagingUpgrade: {$namespace} to version {$targetVersion}");
+            // Status is 'pending' — charge the credit now
+            $targetVersion = $request['version'];
+            $fee = $request['fee'];
 
             list($rancher, $github) = rancherfleet_buildClients($params);
 
@@ -6701,14 +6693,11 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             $deploymentStatus = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
             if ($deploymentStatus['image'] && preg_match('/odoo:([0-9.]+)/', $deploymentStatus['image'], $m)) {
                 $currentVersion = $m[1];
-            }
-
-            if (!$currentVersion) {
+            } else {
                 return 'Error: Could not determine current Odoo version.';
             }
 
-            // 1. Charge credit (status is 'pending', so charge if no invoiceId yet)
-            $invoiceId = null;
+            // Charge credit
             RancherFleet\Logger::info("CreateStagingUpgrade: charging ${fee}");
             $payment = rancherfleet_chargeCredit(
                 $clientId,
@@ -6720,52 +6709,18 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             }
             $invoiceId = $payment['invoiceId'];
 
-            // Update request record directly with invoiceId and status, preserving all other fields
-            try {
-                \WHMCS\Database\Capsule::table('tbladdonmodules')
-                    ->where('module', 'rancherfleet_upgrade')
-                    ->where('setting', 'request_' . $serviceId)
-                    ->update(array('value' => json_encode(array_merge($request, array(
-                        'invoiceId'      => $invoiceId,
-                        'status'         => 'charging_complete',
-                        'charged_at'     => time(),
-                    )))));
-
-                // Verify it was saved
-                $verifyRecord = \WHMCS\Database\Capsule::table('tbladdonmodules')
-                    ->where('module', 'rancherfleet_upgrade')
-                    ->where('setting', 'request_' . $serviceId)
-                    ->value('value');
-
-                if ($verifyRecord) {
-                    $verified = json_decode($verifyRecord, true);
-                    RancherFleet\Logger::info("CreateStagingUpgrade: record persisted, invoiceId=" . ($verified['invoiceId'] ?? 'null') . ", status=" . ($verified['status'] ?? 'unknown'));
-                } else {
-                    RancherFleet\Logger::error("CreateStagingUpgrade: failed to verify persisted record");
-                }
-            } catch (\Exception $updateEx) {
-                RancherFleet\Logger::error("CreateStagingUpgrade: error persisting invoiceId: " . $updateEx->getMessage());
-            }
-
-            RancherFleet\Logger::info("CreateStagingUpgrade: credit charged, invoice {$invoiceId}");
+            // Update status IMMEDIATELY before anything else can fail
+            \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_upgrade')
+                ->where('setting', 'request_' . $serviceId)
+                ->update(array('value' => json_encode(array_merge($request, array(
+                    'invoiceId' => $invoiceId,
+                    'status'    => 'charging_complete',
+                )))));
+            RancherFleet\Logger::info("CreateStagingUpgrade: status updated to charging_complete, invoice {$invoiceId}");
         }
 
-        // 2. Take backup before staging
-        RancherFleet\Logger::info("CreateStagingUpgrade: taking backup");
-        try {
-            $backupResult = rancherfleet_handleBackupRestore($params, $namespace, $orderNum, '', 'db', true);
-            if (strpos($backupResult, 'error') !== false) {
-                RancherFleet\Logger::error("CreateStagingUpgrade: backup failed, refunding");
-                rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Backup failed');
-                return 'Error: Backup failed. Credit refunded.';
-            }
-        } catch (\Exception $backEx) {
-            RancherFleet\Logger::error("CreateStagingUpgrade: backup exception: " . $backEx->getMessage());
-            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Backup exception: ' . $backEx->getMessage());
-            return 'Error: ' . $backEx->getMessage() . ' Credit refunded.';
-        }
-
-        // 3. Create staging namespace
+        // 2. Create staging namespace (backup runs automatically via sidecar)
         RancherFleet\Logger::info("CreateStagingUpgrade: creating staging namespace");
         try {
             $rancher->createNamespace($stagingNamespace);
@@ -6776,7 +6731,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage() . ' Credit refunded.';
         }
 
-        // 4. Create staging database (clone of production)
+        // 3. Create staging database (clone of production)
         RancherFleet\Logger::info("CreateStagingUpgrade: creating staging database");
         try {
             $dbName = 'odoo-' . $orderNum;
@@ -6819,7 +6774,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Failed to create staging database: ' . $dbEx->getMessage() . ' Credit refunded.';
         }
 
-        // 5. Clone client branch to staging branch
+        // 4. Clone client branch to staging branch
         RancherFleet\Logger::info("CreateStagingUpgrade: cloning branch");
         try {
             $clientBranch = 'whmcs-client-' . $orderNum;
@@ -6832,7 +6787,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Failed to clone branch: ' . $branchEx->getMessage() . ' Credit refunded.';
         }
 
-        // 6. Update staging branch manifests
+        // 5. Update staging branch manifests
         RancherFleet\Logger::info("CreateStagingUpgrade: updating staging manifests");
         try {
             $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
@@ -6872,7 +6827,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Failed to update staging manifests: ' . $manifestEx->getMessage() . ' Credit refunded.';
         }
 
-        // 7. Create staging Fleet GitRepo
+        // 6. Create staging Fleet GitRepo
         RancherFleet\Logger::info("CreateStagingUpgrade: creating staging GitRepo");
         try {
             $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
@@ -6902,7 +6857,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Failed to create staging GitRepo: ' . $gitRepoEx->getMessage() . ' Credit refunded.';
         }
 
-        // 8. Update request record
+        // 7. Update request record
         $stagingUrl = 'https://staging-' . $orderNum . '.webdiscode.com';
         try {
             $data = array(
