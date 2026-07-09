@@ -2514,7 +2514,8 @@ function rancherfleet_handleUpgradeRequest(array $params, $namespace, $orderNum)
             return 'upgrade_error:Could not verify credit balance: ' . $e->getMessage();
         }
 
-        // Store upgrade request
+        // Store upgrade request (only if it doesn't already exist)
+        RancherFleet\Logger::info("handleUpgradeRequest: storing new upgrade request for service {$serviceId}");
         rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee);
 
         // Log activity
@@ -2644,11 +2645,25 @@ function rancherfleet_getUpgradeRequest($serviceId)
 
 
 /**
- * Stores upgrade request in tbladdonmodules with staging support.
+ * Stores upgrade request in tbladdonmodules — only if it doesn't already exist.
+ * This prevents overwriting charged/in-progress requests.
  */
 function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee, $invoiceId = null)
 {
     try {
+        $setting = 'request_' . $serviceId;
+
+        // Check if record already exists
+        $exists = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade')
+            ->where('setting', $setting)
+            ->exists();
+
+        if ($exists) {
+            RancherFleet\Logger::info("storeUpgradeRequest: NOT overwriting existing record for service {$serviceId}");
+            return;
+        }
+
         $data = array(
             'version'           => $version,
             'fee'               => $fee,
@@ -2659,10 +2674,14 @@ function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee, $invoiceId
             'invoiceId'         => $invoiceId,
             'staging_created_at' => null,
         );
-        \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
-            array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
-            array('value' => json_encode($data))
-        );
+
+        \WHMCS\Database\Capsule::table('tbladdonmodules')->insert(array(
+            'module' => 'rancherfleet_upgrade',
+            'setting' => $setting,
+            'value' => json_encode($data),
+        ));
+
+        RancherFleet\Logger::info("storeUpgradeRequest: wrote new record for service {$serviceId}, status=pending, invoiceId=null");
     } catch (\Exception $e) {
         RancherFleet\Logger::error("storeUpgradeRequest: " . $e->getMessage());
     }
@@ -6670,6 +6689,13 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         $serviceId = (int)$params['serviceid'];
         $clientId = (int)$params['userid'];
 
+        // Read raw DB value BEFORE parsing
+        $raw = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade')
+            ->where('setting', 'request_' . $serviceId)
+            ->value('value');
+        RancherFleet\Logger::info("CreateStagingUpgrade: raw DB value: " . $raw);
+
         // Read pending upgrade request
         $request = rancherfleet_getUpgradeRequest($serviceId);
         if (empty($request)) {
@@ -6870,6 +6896,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                 'invoiceId'          => $invoiceId,
                 'staging_created_at' => time(),
             );
+            RancherFleet\Logger::info("CreateStagingUpgrade: writing request record, status=staging, invoiceId={$invoiceId}");
             \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
                 array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
                 array('value' => json_encode($data))
@@ -7086,6 +7113,7 @@ function rancherfleet_ShareStagingUrl(array $params)
 
         // Update request
         $request['staging_shared'] = true;
+        RancherFleet\Logger::info("ShareStagingUrl: writing request record, staging_shared=true");
         \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
             array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
             array('value' => json_encode($request))
@@ -7186,6 +7214,7 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
         try {
             $request['status'] = 'completed';
             $request['completed_at'] = time();
+            RancherFleet\Logger::info("TriggerLiveUpgrade: writing request record, status=completed");
             \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
                 array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
                 array('value' => json_encode($request))
