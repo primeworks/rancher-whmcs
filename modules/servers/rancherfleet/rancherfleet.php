@@ -1745,6 +1745,452 @@ PYTHON;
     }
 }
 
+
+/**
+ * Curated list of Odoo modules available for installation.
+ */
+function rancherfleet_getAvailableModules()
+{
+    return array(
+        'crm'             => array('name' => 'CRM',              'category' => 'Sales',         'desc' => 'Manage leads, opportunities and your sales pipeline'),
+        'sale_management' => array('name' => 'Sales',            'category' => 'Sales',         'desc' => 'Send quotes, confirm orders and manage your sales'),
+        'account'         => array('name' => 'Invoicing',        'category' => 'Finance',       'desc' => 'Create invoices, manage payments and track finances'),
+        'stock'           => array('name' => 'Inventory',        'category' => 'Operations',    'desc' => 'Manage your warehouse, products and stock movements'),
+        'purchase'        => array('name' => 'Purchase',         'category' => 'Operations',    'desc' => 'Manage purchase orders and vendor relationships'),
+        'project'         => array('name' => 'Project',          'category' => 'Productivity',  'desc' => 'Organise tasks, track progress and manage projects'),
+        'hr_timesheet'    => array('name' => 'Timesheets',       'category' => 'Productivity',  'desc' => 'Track time spent on projects and tasks'),
+        'hr'              => array('name' => 'Employees',        'category' => 'HR',            'desc' => 'Manage employee records, contracts and departments'),
+        'website_sale'    => array('name' => 'eCommerce',        'category' => 'Website',       'desc' => 'Sell online with a fully integrated web shop'),
+        'im_livechat'     => array('name' => 'Live Chat',        'category' => 'Communication', 'desc' => 'Chat with website visitors in real time'),
+        'mass_mailing'    => array('name' => 'Email Marketing',  'category' => 'Marketing',     'desc' => 'Design and send email campaigns to your contacts'),
+        'point_of_sale'   => array('name' => 'Point of Sale',    'category' => 'Sales',         'desc' => 'Sell in physical stores with a simple POS interface'),
+    );
+}
+
+
+/**
+ * Gets module installation status from cache or queries the database.
+ * Cache expires after 5 minutes.
+ *
+ * @param  int $serviceId
+ * @return array  [moduleName => state] or empty array on error
+ */
+function rancherfleet_getModuleStatus($serviceId)
+{
+    try {
+        $cached = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_modules')
+            ->where('setting', 'status_' . $serviceId)
+            ->first();
+
+        if ($cached) {
+            $data = json_decode($cached->value, true);
+            if (isset($data['timestamp']) && (time() - $data['timestamp']) < 300) {
+                return isset($data['status']) ? $data['status'] : array();
+            }
+        }
+    } catch (\Exception $e) {
+        RancherFleet\Logger::info("getModuleStatus: cache read error (non-fatal): " . $e->getMessage());
+    }
+
+    return array();
+}
+
+
+/**
+ * Caches module installation status for 5 minutes.
+ */
+function rancherfleet_cacheModuleStatus($serviceId, array $status)
+{
+    try {
+        $data = array(
+            'status'    => $status,
+            'timestamp' => time(),
+        );
+        \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+            array('module' => 'rancherfleet_modules', 'setting' => 'status_' . $serviceId),
+            array('value' => json_encode($data))
+        );
+    } catch (\Exception $e) {
+        RancherFleet\Logger::info("cacheModuleStatus: cache write error (non-fatal): " . $e->getMessage());
+    }
+}
+
+
+/**
+ * Queries the database via Kubernetes Job to get actual module states.
+ *
+ * @param  array  $params
+ * @param  string $namespace
+ * @param  int    $orderNum
+ * @return array   [moduleName => state] or empty on error
+ */
+function rancherfleet_queryModuleStatus(array $params, $namespace, $orderNum)
+{
+    RancherFleet\Logger::info("queryModuleStatus: querying for {$namespace}");
+
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+
+        $dbName = 'odoo-' . $orderNum;
+
+        $pythonScript = <<<'PYTHON'
+import psycopg2
+import json
+import sys
+
+try:
+    db = sys.argv[1]
+    host = 'postgres16.default.svc.cluster.local'
+    user = open('/etc/rfm-db/username').read().strip()
+    password = open('/etc/rfm-db/password').read().strip()
+
+    modules_to_check = ['crm', 'sale_management', 'account', 'stock', 'purchase',
+                        'project', 'hr_timesheet', 'hr', 'website_sale', 'im_livechat',
+                        'mass_mailing', 'point_of_sale']
+
+    conn = psycopg2.connect(host=host, dbname=db, user=user, password=password)
+    cur = conn.cursor()
+    cur.execute("SELECT name, state FROM ir_module_module WHERE name = ANY(%s)", (modules_to_check,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    result = {}
+    for name, state in rows:
+        result[name] = state
+
+    print(json.dumps(result))
+    sys.exit(0)
+except Exception as e:
+    sys.stderr.write(str(e))
+    print('{}')
+    sys.exit(0)
+PYTHON;
+
+        $jobName = 'rfm-query-mods-' . time() . '-' . substr(md5($orderNum), 0, 4);
+        $jobName = substr($jobName, 0, 52) . '-' . substr(md5($orderNum), 0, 8);
+
+        $jobManifest = array(
+            'apiVersion' => 'batch/v1',
+            'kind'       => 'Job',
+            'metadata'   => array(
+                'name'      => $jobName,
+                'namespace' => $namespace,
+                'labels'    => array('app' => 'rfm-query-mods'),
+            ),
+            'spec' => array(
+                'ttlSecondsAfterFinished' => 60,
+                'backoffLimit'            => 0,
+                'template'               => array(
+                    'spec' => array(
+                        'restartPolicy' => 'Never',
+                        'containers'    => array(array(
+                            'name'    => 'querymods',
+                            'image'   => 'postgres:16-alpine',
+                            'command' => array('python3', '-c', $pythonScript),
+                            'args'    => array($dbName),
+                            'volumeMounts' => array(
+                                array(
+                                    'name'      => 'db-admin-secret',
+                                    'mountPath' => '/etc/rfm-db',
+                                    'readOnly'  => true,
+                                ),
+                            ),
+                        )),
+                        'volumes' => array(
+                            array(
+                                'name'   => 'db-admin-secret',
+                                'secret' => array(
+                                    'secretName' => 'rfm-db-admin-' . $orderNum,
+                                    'optional'   => true,
+                                    'items'      => array(
+                                        array('key' => 'username', 'path' => 'username'),
+                                        array('key' => 'password', 'path' => 'password'),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        $rancher->rawRequest('POST',
+            '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
+            $jobManifest
+        );
+
+        $succeeded = false;
+        $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
+
+        for ($i = 0; $i < 12; $i++) {
+            sleep(5);
+            try {
+                $job        = $rancher->rawRequest('GET', $jobPath);
+                $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                foreach ($conditions as $cond) {
+                    if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                        $succeeded = true; break 2;
+                    }
+                }
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("queryModuleStatus: error polling Job: " . $e->getMessage());
+                break;
+            }
+        }
+
+        try {
+            $rancher->rawRequest('DELETE', $jobPath);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("queryModuleStatus: Job cleanup note: " . $e->getMessage());
+        }
+
+        if ($succeeded) {
+            RancherFleet\Logger::info("queryModuleStatus: SUCCESS");
+            return array();
+        } else {
+            RancherFleet\Logger::error("queryModuleStatus: Job timed out");
+            return array();
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("queryModuleStatus: exception — " . $e->getMessage());
+        return array();
+    }
+}
+
+
+/**
+ * Handles Odoo app installation from client area.
+ * Creates a Kubernetes Job to run odoo --init={moduleName}.
+ *
+ * @param  array  $params
+ * @param  string $namespace
+ * @param  string $orderNum
+ * @return string  'module_install_success:{moduleName}' or 'module_install_error:{message}'
+ */
+function rancherfleet_handleModuleInstall(array $params, $namespace, $orderNum)
+{
+    $moduleName = isset($_POST['module_name']) ? trim($_POST['module_name']) : '';
+    $available  = rancherfleet_getAvailableModules();
+
+    if (!isset($available[$moduleName])) {
+        return 'module_install_error:Invalid module name.';
+    }
+
+    RancherFleet\Logger::info("moduleInstall: starting for {$namespace} / {$moduleName}");
+
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+
+        $pythonScript = <<<'PYTHON'
+import subprocess
+import sys
+
+try:
+    module_name = sys.argv[1]
+    result = subprocess.run([
+        '/usr/bin/odoo',
+        '--config=/etc/odoo/odoo.conf',
+        '--init=' + module_name,
+        '--without-demo=all',
+        '--stop-after-init'
+    ], capture_output=True, text=True, timeout=300)
+    sys.exit(result.returncode)
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(1)
+PYTHON;
+
+        $jobName = 'rfm-install-mod-' . time() . '-' . substr(md5($orderNum), 0, 4);
+        $jobName = substr($jobName, 0, 52) . '-' . substr(md5($orderNum), 0, 8);
+
+        $jobManifest = array(
+            'apiVersion' => 'batch/v1',
+            'kind'       => 'Job',
+            'metadata'   => array(
+                'name'      => $jobName,
+                'namespace' => $namespace,
+                'labels'    => array('app' => 'rfm-install-mod'),
+            ),
+            'spec' => array(
+                'ttlSecondsAfterFinished' => 300,
+                'backoffLimit'            => 0,
+                'template'               => array(
+                    'spec' => array(
+                        'restartPolicy' => 'Never',
+                        'containers'    => array(array(
+                            'name'    => 'installmod',
+                            'image'   => 'odoo:19',
+                            'command' => array('python3', '-c', $pythonScript),
+                            'args'    => array($moduleName),
+                            'volumeMounts' => array(
+                                array(
+                                    'name'      => 'odoo-config',
+                                    'mountPath' => '/etc/odoo',
+                                ),
+                                array(
+                                    'name'      => 'odoo-data',
+                                    'mountPath' => '/var/lib/odoo',
+                                    'subPath'   => 'odoo',
+                                ),
+                            ),
+                        )),
+                        'volumes' => array(
+                            array(
+                                'name'      => 'odoo-config',
+                                'configMap' => array(
+                                    'name' => 'odoo-' . $orderNum . '.conf',
+                                ),
+                            ),
+                            array(
+                                'name'         => 'odoo-data',
+                                'persistentVolumeClaim' => array(
+                                    'claimName' => 'odoo-' . $orderNum,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        RancherFleet\Logger::info("moduleInstall: creating Job {$jobName} for {$moduleName}");
+
+        $rancher->rawRequest('POST',
+            '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
+            $jobManifest
+        );
+
+        $succeeded = false;
+        $failed    = false;
+        $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
+
+        for ($i = 0; $i < 30; $i++) {
+            sleep(10);
+            try {
+                $job        = $rancher->rawRequest('GET', $jobPath);
+                $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                foreach ($conditions as $cond) {
+                    if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                        $succeeded = true; break 2;
+                    }
+                    if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                        $failed = true; break 2;
+                    }
+                }
+                RancherFleet\Logger::info("moduleInstall: waiting for Job... " . (($i + 1) * 10) . "s elapsed");
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("moduleInstall: error polling Job: " . $e->getMessage());
+                break;
+            }
+        }
+
+        try {
+            $rancher->rawRequest('DELETE', $jobPath);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("moduleInstall: Job cleanup note: " . $e->getMessage());
+        }
+
+        if ($succeeded) {
+            try {
+                \WHMCS\Database\Capsule::table('tbladdonmodules')->where('module', 'rancherfleet_modules')
+                    ->where('setting', 'status_' . (int)$params['serviceid'])->delete();
+            } catch (\Exception $e) {
+                RancherFleet\Logger::info("moduleInstall: cache clear error (non-fatal): " . $e->getMessage());
+            }
+
+            RancherFleet\Logger::info("moduleInstall: SUCCESS for {$moduleName}");
+            rancherfleet_logHistory($params, 'App Installed', $available[$moduleName]['name']);
+            return 'module_install_success:' . $moduleName;
+        } elseif ($failed) {
+            RancherFleet\Logger::error("moduleInstall: Job failed for {$moduleName}");
+            rancherfleet_logHistory($params, 'App Install Failed', $available[$moduleName]['name']);
+            return 'module_install_error:Installation job failed. Check admin logs for details.';
+        } else {
+            RancherFleet\Logger::error("moduleInstall: Job timed out for {$moduleName}");
+            rancherfleet_logHistory($params, 'App Install Timeout', $available[$moduleName]['name']);
+            return 'module_install_error:Installation job timed out. Please try again.';
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("moduleInstall: exception — " . $e->getMessage());
+        rancherfleet_logHistory($params, 'App Install Error', $e->getMessage());
+        return 'module_install_error:' . $e->getMessage();
+    }
+}
+
+
+/**
+ * Renders the Install Apps card for the client area.
+ */
+function rancherfleet_installAppCardHtml(array $params, $orderNum)
+{
+    $serviceUrl = htmlspecialchars($_SERVER['REQUEST_URI'] ?? '');
+    $serviceId  = (int)$params['serviceid'];
+    $available  = rancherfleet_getAvailableModules();
+    $cached     = rancherfleet_getModuleStatus($serviceId);
+
+    $html = '<div class="rfm-ca-card">';
+    $html .= '<h4>Install Apps</h4>';
+    $html .= '<p style="font-size:12px;color:#666;margin-bottom:14px;">App installation runs in the background and may take 5-10 minutes. Your instance will remain online during installation.</p>';
+
+    // Group by category
+    $byCategory = array();
+    foreach ($available as $key => $module) {
+        $cat = $module['category'];
+        if (!isset($byCategory[$cat])) {
+            $byCategory[$cat] = array();
+        }
+        $byCategory[$cat][$key] = $module;
+    }
+
+    foreach ($byCategory as $category => $modules) {
+        $html .= '<div style="margin-bottom:16px;">';
+        $html .= '<div style="font-size:11px;font-weight:bold;color:#666;text-transform:uppercase;letter-spacing:0.5px;padding:8px 0;border-bottom:1px solid #eee;margin-bottom:10px;">' . htmlspecialchars($category) . '</div>';
+
+        foreach ($modules as $key => $module) {
+            $state = isset($cached[$key]) ? $cached[$key] : '';
+            $isInstalled = $state === 'installed';
+
+            $html .= '<div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:10px;padding:10px;background:#f9f9f9;border-radius:6px;border:1px solid #eee;">';
+
+            // Module info
+            $html .= '<div style="flex:1;">';
+            $html .= '<div style="font-size:13px;font-weight:bold;color:#333;margin-bottom:4px;">' . htmlspecialchars($module['name']) . '</div>';
+            $html .= '<div style="font-size:12px;color:#666;margin-bottom:6px;">' . htmlspecialchars($module['desc']) . '</div>';
+
+            // Status badges
+            if ($isInstalled) {
+                $html .= '<span style="display:inline-block;background:#e8f5e9;color:#2e7d32;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold;">&#10003; Installed</span>';
+            } elseif ($state === 'to upgrade') {
+                $html .= '<span style="display:inline-block;background:#fff3cd;color:#856404;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold;">&#9888; Update Available</span>';
+            } else {
+                $html .= '<form method="post" action="' . $serviceUrl . '" style="display:inline;">';
+                $html .= '<input type="hidden" name="clientaction" value="install_module">';
+                $html .= '<input type="hidden" name="module_name" value="' . htmlspecialchars($key) . '">';
+                $html .= '<button type="submit" style="background:#2196F3;color:#fff;border:none;border-radius:4px;padding:4px 12px;font-size:11px;font-weight:bold;cursor:pointer;margin:0;">';
+                $html .= 'Install</button>';
+                $html .= '</form>';
+            }
+            $html .= '</div>';
+
+            // Category badge
+            $html .= '<div style="flex-shrink:0;text-align:right;">';
+            $html .= '<span style="display:inline-block;background:#e3f2fd;color:#1565c0;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:bold;">' . htmlspecialchars($category) . '</span>';
+            $html .= '</div>';
+
+            $html .= '</div>';
+        }
+
+        $html .= '</div>';
+    }
+
+    $html .= '</div>';
+    return $html;
+}
+
 // ---------------------------------------------------------------------------
 // Phase A: Provisioning Rollback
 
@@ -3958,6 +4404,8 @@ function rancherfleet_ClientArea(array $params)
         $message = rancherfleet_handleCustomUrlConnect($params, $namespace, $orderNum);
     } elseif ($action === 'odoo_password_reset') {
         $message = rancherfleet_handleOdooPasswordReset($params, $namespace, $orderNum);
+    } elseif ($action === 'install_module') {
+        $message = rancherfleet_handleModuleInstall($params, $namespace, $orderNum);
     }
 
     // Build the output
@@ -5020,6 +5468,13 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '</div>';
     } elseif (strpos($message, 'odoo_password_reset_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; Password reset failed: ' . htmlspecialchars(substr($message, strlen('odoo_password_reset_error:'))) . '</div>';
+    } elseif (strpos($message, 'module_install_success:') === 0) {
+        $moduleName = substr($message, strlen('module_install_success:'));
+        $available = rancherfleet_getAvailableModules();
+        $appName = isset($available[$moduleName]) ? $available[$moduleName]['name'] : $moduleName;
+        $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars($appName) . ' has been installed successfully. Your instance will be updated shortly.</div>';
+    } elseif (strpos($message, 'module_install_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; App installation failed: ' . htmlspecialchars(substr($message, strlen('module_install_error:'))) . '</div>';
     }
 
     try {
@@ -5095,6 +5550,11 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         // Reset Odoo Password Card
         // -----------------------------------------------------------------------
         $html .= rancherfleet_passwordResetCardHtml($params, $orderNum);
+
+        // -----------------------------------------------------------------------
+        // Install Apps Card
+        // -----------------------------------------------------------------------
+        $html .= rancherfleet_installAppCardHtml($params, $orderNum);
 
         // -----------------------------------------------------------------------
         // Custom Subdomain Ingress Card
