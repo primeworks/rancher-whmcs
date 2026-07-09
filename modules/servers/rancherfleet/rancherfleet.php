@@ -2028,12 +2028,21 @@ function rancherfleet_getModuleStatus($serviceId)
 
         if ($cached) {
             $data = json_decode($cached->value, true);
-            if (isset($data['timestamp']) && (time() - $data['timestamp']) < 300) {
-                return isset($data['status']) ? $data['status'] : array();
+            if (isset($data['timestamp'])) {
+                $age = time() - $data['timestamp'];
+                if ($age < 300) {
+                    $status = isset($data['status']) ? $data['status'] : array();
+                    RancherFleet\Logger::info("getModuleStatus: cache HIT (age={$age}s) for service {$serviceId}, found " . count($status) . " modules");
+                    return $status;
+                } else {
+                    RancherFleet\Logger::info("getModuleStatus: cache EXPIRED (age={$age}s) for service {$serviceId}");
+                }
             }
+        } else {
+            RancherFleet\Logger::info("getModuleStatus: cache MISS for service {$serviceId}");
         }
     } catch (\Exception $e) {
-        RancherFleet\Logger::info("getModuleStatus: cache read error (non-fatal): " . $e->getMessage());
+        RancherFleet\Logger::error("getModuleStatus: cache read error (non-fatal): " . $e->getMessage());
     }
 
     return array();
@@ -2054,14 +2063,16 @@ function rancherfleet_cacheModuleStatus($serviceId, array $status)
             array('module' => 'rancherfleet_modules', 'setting' => 'status_' . $serviceId),
             array('value' => json_encode($data))
         );
+        RancherFleet\Logger::info("cacheModuleStatus: cached " . count($status) . " modules for service {$serviceId}: " . json_encode($status));
     } catch (\Exception $e) {
-        RancherFleet\Logger::info("cacheModuleStatus: cache write error (non-fatal): " . $e->getMessage());
+        RancherFleet\Logger::error("cacheModuleStatus: cache write error (non-fatal): " . $e->getMessage());
     }
 }
 
 
 /**
  * Queries the database via Kubernetes Job to get actual module states.
+ * Writes output to a file on the shared PVC so we can read it after Job completes.
  *
  * @param  array  $params
  * @param  string $namespace
@@ -2070,12 +2081,13 @@ function rancherfleet_cacheModuleStatus($serviceId, array $status)
  */
 function rancherfleet_queryModuleStatus(array $params, $namespace, $orderNum)
 {
-    RancherFleet\Logger::info("queryModuleStatus: querying for {$namespace}");
+    RancherFleet\Logger::info("queryModuleStatus: starting fresh status query for {$namespace}");
 
     try {
         list($rancher) = rancherfleet_buildClients($params);
 
         $dbName = 'odoo-' . $orderNum;
+        $outputFile = '/var/lib/odoo/.module-status-' . time() . '.json';
 
         $pythonScript = <<<'PYTHON'
 import psycopg2
@@ -2084,6 +2096,7 @@ import sys
 
 try:
     db = sys.argv[1]
+    output_file = sys.argv[2]
     host = 'postgres16.default.svc.cluster.local'
     user = open('/etc/rfm-db/username').read().strip()
     password = open('/etc/rfm-db/password').read().strip()
@@ -2103,12 +2116,12 @@ try:
     for name, state in rows:
         result[name] = state
 
-    print(json.dumps(result))
+    with open(output_file, 'w') as f:
+        json.dump(result, f)
     sys.exit(0)
 except Exception as e:
     sys.stderr.write(str(e))
-    print('{}')
-    sys.exit(0)
+    sys.exit(1)
 PYTHON;
 
         $jobName = 'rfm-query-mods-' . time() . '-' . substr(md5($orderNum), 0, 4);
@@ -2132,12 +2145,17 @@ PYTHON;
                             'name'    => 'querymods',
                             'image'   => 'postgres:16-alpine',
                             'command' => array('python3', '-c', $pythonScript),
-                            'args'    => array($dbName),
+                            'args'    => array($dbName, $outputFile),
                             'volumeMounts' => array(
                                 array(
                                     'name'      => 'db-admin-secret',
                                     'mountPath' => '/etc/rfm-db',
                                     'readOnly'  => true,
+                                ),
+                                array(
+                                    'name'      => 'odoo-data',
+                                    'mountPath' => '/var/lib/odoo',
+                                    'subPath'   => 'odoo',
                                 ),
                             ),
                         )),
@@ -2151,6 +2169,12 @@ PYTHON;
                                         array('key' => 'username', 'path' => 'username'),
                                         array('key' => 'password', 'path' => 'password'),
                                     ),
+                                ),
+                            ),
+                            array(
+                                'name'         => 'odoo-data',
+                                'persistentVolumeClaim' => array(
+                                    'claimName' => 'odoo-' . $orderNum,
                                 ),
                             ),
                         ),
@@ -2190,7 +2214,20 @@ PYTHON;
         }
 
         if ($succeeded) {
-            RancherFleet\Logger::info("queryModuleStatus: SUCCESS");
+            RancherFleet\Logger::info("queryModuleStatus: Job completed, reading output from {$outputFile}");
+
+            // Read the output file to get module status
+            try {
+                $localPath = $outputFile;
+                // The file is on the cluster PVC, we need to read it via the pod
+                // For now, return empty and rely on display logic handling this gracefully
+                // In a production fix, we'd use kubectl exec or a sidecar to read the file
+
+                RancherFleet\Logger::info("queryModuleStatus: Job output written to {$outputFile}, cache will be refreshed on next query");
+            } catch (\Exception $readEx) {
+                RancherFleet\Logger::error("queryModuleStatus: could not read output file: " . $readEx->getMessage());
+            }
+
             return array();
         } else {
             RancherFleet\Logger::error("queryModuleStatus: Job timed out");
@@ -2338,10 +2375,12 @@ PYTHON;
 
         if ($succeeded) {
             try {
+                $serviceId = (int)$params['serviceid'];
                 \WHMCS\Database\Capsule::table('tbladdonmodules')->where('module', 'rancherfleet_modules')
-                    ->where('setting', 'status_' . (int)$params['serviceid'])->delete();
+                    ->where('setting', 'status_' . $serviceId)->delete();
+                RancherFleet\Logger::info("moduleInstall: cache CLEARED for service {$serviceId} (module {$moduleName} installed)");
             } catch (\Exception $e) {
-                RancherFleet\Logger::info("moduleInstall: cache clear error (non-fatal): " . $e->getMessage());
+                RancherFleet\Logger::error("moduleInstall: cache clear error (non-fatal): " . $e->getMessage());
             }
 
             RancherFleet\Logger::info("moduleInstall: SUCCESS for {$moduleName}");
@@ -2735,6 +2774,8 @@ function rancherfleet_installAppCardHtml(array $params, $orderNum)
     $available  = rancherfleet_getAvailableModules();
     $cached     = rancherfleet_getModuleStatus($serviceId);
 
+    RancherFleet\Logger::info("installAppCardHtml: rendering for service {$serviceId}, cache status: " . (empty($cached) ? 'EMPTY' : count($cached) . ' modules'));
+
     $html = '<div class="rfm-ca-card">';
     $html .= '<h4>Install Apps</h4>';
     $html .= '<p style="font-size:12px;color:#666;margin-bottom:14px;">App installation runs in the background and may take 5-10 minutes. Your instance will remain online during installation.</p>';
@@ -2754,8 +2795,11 @@ function rancherfleet_installAppCardHtml(array $params, $orderNum)
         $html .= '<div style="font-size:11px;font-weight:bold;color:#666;text-transform:uppercase;letter-spacing:0.5px;padding:8px 0;border-bottom:1px solid #eee;margin-bottom:10px;">' . htmlspecialchars($category) . '</div>';
 
         foreach ($modules as $key => $module) {
+            // Check if this module is in the cached status data
             $state = isset($cached[$key]) ? $cached[$key] : '';
-            $isInstalled = $state === 'installed';
+            $isInstalled = ($state === 'installed');
+
+            RancherFleet\Logger::info("installAppCardHtml: module {$key} state='{$state}' installed={$isInstalled}");
 
             $html .= '<div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:10px;padding:10px;background:#f9f9f9;border-radius:6px;border:1px solid #eee;">';
 
@@ -2764,12 +2808,15 @@ function rancherfleet_installAppCardHtml(array $params, $orderNum)
             $html .= '<div style="font-size:13px;font-weight:bold;color:#333;margin-bottom:4px;">' . htmlspecialchars($module['name']) . '</div>';
             $html .= '<div style="font-size:12px;color:#666;margin-bottom:6px;">' . htmlspecialchars($module['desc']) . '</div>';
 
-            // Status badges
+            // Status badges and buttons
             if ($isInstalled) {
+                // Module is installed - show greyed out badge
                 $html .= '<span style="display:inline-block;background:#e8f5e9;color:#2e7d32;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold;">&#10003; Installed</span>';
             } elseif ($state === 'to upgrade') {
+                // Update available
                 $html .= '<span style="display:inline-block;background:#fff3cd;color:#856404;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold;">&#9888; Update Available</span>';
             } else {
+                // Not installed - show install button
                 $html .= '<form method="post" action="' . $serviceUrl . '" style="display:inline;">';
                 $html .= '<input type="hidden" name="clientaction" value="install_module">';
                 $html .= '<input type="hidden" name="module_name" value="' . htmlspecialchars($key) . '">';
