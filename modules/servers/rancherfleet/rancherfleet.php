@@ -2739,7 +2739,16 @@ function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentV
     if (!empty($existingRequest)) {
         $status = isset($existingRequest['status']) ? $existingRequest['status'] : 'pending';
 
-        if ($status === 'pending') {
+        if ($status === 'awaiting_payment') {
+            // Invoice created but not yet paid
+            $invoiceId = isset($existingRequest['invoiceId']) ? (int)$existingRequest['invoiceId'] : 0;
+            $html .= '<div style="background:#cfe2ff;border:1px solid #0d6efd;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0 0 10px;font-size:12px;color:#004085;">Your upgrade request to Odoo <strong>' . htmlspecialchars($existingRequest['version']) . '</strong> is ready. Invoice #' . $invoiceId . ' has been created.</p>';
+            if ($invoiceId > 0) {
+                $html .= '<a href="/clientarea.php?action=invoices&id=' . $invoiceId . '" style="display:inline-block;background:#0d6efd;color:#fff;text-decoration:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:bold;">Pay Invoice #' . $invoiceId . '</a>';
+            }
+            $html .= '</div>';
+        } elseif ($status === 'pending') {
             // Pending staging creation
             $html .= '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:12px;">';
             $html .= '<p style="margin:0;font-size:12px;color:#856404;">Your upgrade request to Odoo <strong>' . htmlspecialchars($existingRequest['version']) . '</strong> is pending. Our team is preparing your staging environment.</p>';
@@ -2796,7 +2805,7 @@ function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentV
     $html .= '</div>';
 
     $html .= '<div id="fee-display" style="display:none;margin-bottom:12px;padding:10px;background:#f8f9fa;border-radius:6px;">';
-    $html .= '<div style="font-size:12px;color:#666;">Upgrade fee: <strong id="fee-amount">$0.00</strong> (charged from your credit balance)</div>';
+    $html .= '<div style="font-size:12px;color:#666;">Upgrade fee: <strong id="fee-amount">$0.00</strong> (invoice will be created at checkout)</div>';
     $html .= '</div>';
 
     $html .= '<div style="background:#ffe9e9;border:1px solid #ffcccc;border-radius:6px;padding:12px;margin-bottom:12px;">';
