@@ -2516,25 +2516,25 @@ function rancherfleet_PatchBackupStorage(array $params)
 
                     $updated = $odooYaml;
 
-                    // Step 1: Replace old volumeMount (subPath) with NFS mount
-                    $oldMount = "          - name: odoo-data\n            mountPath: /backups\n            subPath: backups";
-                    $newMount = "          - name: nfs-backups\n            mountPath: /backups";
+                    // Step 1: Replace old PVC volumeMount with NFS volumeMount
+                    $oldMount = "          - name: odoo-data\n            mountPath: /backups\n            subPath: backups\n";
+                    $newMount = "          - name: nfs-backups\n            mountPath: /backups\n";
                     $updated = str_replace($oldMount, $newMount, $updated);
-                    RancherFleet\Logger::info("PatchBackupStorage: replaced volumeMount in {$branch}");
+                    RancherFleet\Logger::info("PatchBackupStorage: replaced volumeMount (PVC→NFS) in {$branch}");
 
                     // Step 2: Add NFS volume if not present
                     if (strpos($updated, 'name: nfs-backups') === false) {
                         $nfsVolume = "      - name: nfs-backups\n        nfs:\n          server: 162.35.166.55\n          path: /export/share1\n";
-                        // Insert before "      - name: config" or other volumes
-                        $updated = str_replace("      - name: config", $nfsVolume . "      - name: config", $updated);
+                        // Insert before "      - name: rfm-db-admin"
+                        $updated = str_replace("      - name: rfm-db-admin", $nfsVolume . "      - name: rfm-db-admin", $updated);
                         RancherFleet\Logger::info("PatchBackupStorage: added nfs-backups volume to {$branch}");
                     } else {
                         RancherFleet\Logger::info("PatchBackupStorage: nfs-backups volume already present in {$branch}");
                     }
 
-                    // Step 3: Update BACKUP_DIR in the backup script
+                    // Step 3: Update BACKUP_DIR in the backup script to use odoo-{ORDER_NUM} directory
                     $oldBackupDir = "          BACKUP_DIR=/backups";
-                    $newBackupDir = "          BACKUP_DIR=\"/backups/${ORDER_NUM}\"";
+                    $newBackupDir = "          BACKUP_DIR=\"/backups/odoo-${ORDER_NUM}\"";
                     $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
                     RancherFleet\Logger::info("PatchBackupStorage: updated BACKUP_DIR in {$branch}");
 
@@ -2695,7 +2695,7 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
           DATE=$(date +%Y-%m-%d)
           ORDER_NUM=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "' . $orderNum . '")
           DB_NAME="odoo-${ORDER_NUM}"
-          BACKUP_DIR="/backups/${ORDER_NUM}"
+          BACKUP_DIR="/backups/odoo-${ORDER_NUM}"
           mkdir -p "$BACKUP_DIR"
           pg_dump -Fc -d "$DB_NAME" \
             -h postgres16.default.svc.cluster.local \
