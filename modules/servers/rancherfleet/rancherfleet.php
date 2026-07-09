@@ -2503,60 +2503,61 @@ function rancherfleet_handleUpgradeRequest(array $params, $namespace, $orderNum)
             return 'upgrade_error:Fee not configured for this version.';
         }
 
-        // Check for existing request — only allow if completed or doesn't exist
+        // Check for existing request — only allow if completed, cancelled, or doesn't exist
+        $clientId = (int)$params['userid'];
         $existingRequest = rancherfleet_getUpgradeRequest($serviceId);
         if (!empty($existingRequest)) {
             $existingStatus = isset($existingRequest['status']) ? $existingRequest['status'] : 'unknown';
-            if ($existingStatus !== 'completed') {
-                return 'upgrade_error:An upgrade request is already pending (status: ' . $existingStatus . '). Please wait for it to complete or contact support to cancel it.';
+            $existingInvoiceId = isset($existingRequest['invoiceId']) ? $existingRequest['invoiceId'] : null;
+            if (!in_array($existingStatus, array('completed', 'cancelled'))) {
+                return 'upgrade_error:You already have a pending upgrade request. ' .
+                       'Please complete payment for invoice #' . $existingInvoiceId . ' or contact support to cancel.';
             }
         }
 
-        // Check credit balance
-        $clientId = (int)$params['userid'];
+        // Create Unpaid invoice for the upgrade
+        RancherFleet\Logger::info("handleUpgradeRequest: creating invoice for upgrade to {$targetVersion}");
         try {
-            $creditResult = localAPI('GetClientsDetails', array('clientid' => $clientId));
-            $credits = isset($creditResult['credit']) ? (float)$creditResult['credit'] : 0;
+            $invoiceResult = localAPI('CreateInvoice', array(
+                'userid'           => $clientId,
+                'status'           => 'Unpaid',
+                'itemdescription1' => "Odoo version upgrade to {$targetVersion}",
+                'itemamount1'      => $fee,
+                'itemtaxed1'       => false,
+                'paymentmethod'    => 'credit',
+                'notes'            => 'rfm_upgrade:' . $serviceId,
+            ));
 
-            if ($credits < $fee) {
-                return 'upgrade_error:Insufficient credit balance. Required: $' . number_format($fee, 2) . ', Available: $' . number_format($credits, 2) . '. Use the Credit Top-Up button to add funds.';
+            if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
+                $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
+                return 'upgrade_error:Could not create invoice: ' . $err;
             }
+
+            $invoiceId = (int)$invoiceResult['invoiceid'];
+            RancherFleet\Logger::info("handleUpgradeRequest: invoice created, ID={$invoiceId}");
         } catch (\Exception $e) {
-            return 'upgrade_error:Could not verify credit balance: ' . $e->getMessage();
+            return 'upgrade_error:Could not create invoice: ' . $e->getMessage();
         }
 
-        // Charge credit immediately at request time
-        RancherFleet\Logger::info("handleUpgradeRequest: charging ${fee} for upgrade to {$targetVersion}");
-        $payment = rancherfleet_chargeCredit(
-            $clientId,
-            $fee,
-            "Odoo version upgrade to {$targetVersion}"
-        );
-        if (!$payment['success']) {
-            return 'upgrade_error:' . $payment['error'];
-        }
-        $invoiceId = $payment['invoiceId'];
-        RancherFleet\Logger::info("handleUpgradeRequest: payment charged, invoice {$invoiceId}");
-
-        // Store upgrade request with invoiceId already set
-        RancherFleet\Logger::info("handleUpgradeRequest: storing upgrade request with invoiceId={$invoiceId}");
-        rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee, $invoiceId);
+        // Store upgrade request with status='awaiting_payment'
+        RancherFleet\Logger::info("handleUpgradeRequest: storing upgrade request with status=awaiting_payment, invoiceId={$invoiceId}");
+        rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee, $invoiceId, 'awaiting_payment');
 
         // Log activity
-        rancherfleet_logHistory($params, 'Upgrade Requested', 'Upgrade to Odoo ' . $targetVersion . ' requested and charged ($' . number_format($fee, 2) . '). Staging environment being prepared.');
+        rancherfleet_logHistory($params, 'Upgrade Requested', 'Upgrade to Odoo ' . $targetVersion . ' requested. Invoice #' . $invoiceId . ' created for $' . number_format($fee, 2) . '. Awaiting payment.');
 
         // Send admin notification
         try {
             logActivity(
                 'Module Output',
-                'Version upgrade requested and charged for service ' . $serviceId . ' (Order #' . $orderNum . ') to Odoo ' . $targetVersion . ' - $' . number_format($fee, 2) . ' (Invoice #' . $invoiceId . ')',
+                'Version upgrade requested for service ' . $serviceId . ' (Order #' . $orderNum . ') to Odoo ' . $targetVersion . ' - $' . number_format($fee, 2) . ' (Invoice #' . $invoiceId . ') - Awaiting payment',
                 'Rancher Fleet Module'
             );
         } catch (\Exception $e) {
             RancherFleet\Logger::info("handleUpgradeRequest: activity log error (non-fatal): " . $e->getMessage());
         }
 
-        return 'upgrade_success:' . $targetVersion;
+        return 'upgrade_success_awaiting_payment:' . $invoiceId;
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("handleUpgradeRequest: " . $e->getMessage());
@@ -2671,8 +2672,14 @@ function rancherfleet_getUpgradeRequest($serviceId)
 /**
  * Stores upgrade request in tbladdonmodules — only if it doesn't already exist.
  * This prevents overwriting charged/in-progress requests.
+ *
+ * @param int    $serviceId
+ * @param string $version    Target Odoo version
+ * @param float  $fee        Upgrade fee
+ * @param int    $invoiceId  WHMCS invoice ID
+ * @param string $status     Request status ('awaiting_payment', 'pending', etc)
  */
-function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee, $invoiceId = null)
+function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee, $invoiceId = null, $status = 'awaiting_payment')
 {
     try {
         $setting = 'request_' . $serviceId;
@@ -2692,7 +2699,7 @@ function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee, $invoiceId
             'version'           => $version,
             'fee'               => $fee,
             'requested_at'      => time(),
-            'status'            => 'pending',
+            'status'            => $status,
             'staging_url'       => null,
             'staging_shared'    => false,
             'invoiceId'         => $invoiceId,
@@ -2705,7 +2712,7 @@ function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee, $invoiceId
             'value' => json_encode($data),
         ));
 
-        RancherFleet\Logger::info("storeUpgradeRequest: wrote new record for service {$serviceId}, status=pending, invoiceId=null");
+        RancherFleet\Logger::info("storeUpgradeRequest: wrote new record for service {$serviceId}, status={$status}, invoiceId={$invoiceId}");
     } catch (\Exception $e) {
         RancherFleet\Logger::error("storeUpgradeRequest: " . $e->getMessage());
     }
@@ -6728,20 +6735,26 @@ function rancherfleet_CreateStagingUpgrade(array $params)
 
         RancherFleet\Logger::info("CreateStagingUpgrade: request details: " . json_encode($request));
 
-        // Validate request status — payment was already charged at request time
-        if ($request['status'] !== 'pending') {
-            return 'Error: Request status is ' . $request['status'] . ', not pending. Please contact support.';
+        // Validate request status — only proceed if invoice has been paid
+        $requestStatus = isset($request['status']) ? $request['status'] : 'unknown';
+        $invoiceId = isset($request['invoiceId']) ? $request['invoiceId'] : null;
+
+        if ($requestStatus === 'awaiting_payment') {
+            return 'Error: Payment not yet received. Ask the client to pay invoice #' . $invoiceId . ' first.';
+        }
+
+        if ($requestStatus !== 'pending') {
+            return 'Error: Request status is ' . $requestStatus . ', not pending. Please contact support.';
         }
 
         $targetVersion = $request['version'];
         $fee = $request['fee'];
-        $invoiceId = $request['invoiceId'];
 
         if (!$invoiceId) {
-            return 'Error: Request has no invoiceId. Payment was not charged. Please cancel and resubmit the upgrade request.';
+            return 'Error: Request has no invoiceId. Please contact support.';
         }
 
-        RancherFleet\Logger::info("CreateStagingUpgrade: proceeding with staging, version={$targetVersion}, fee={$fee}, invoice={$invoiceId}");
+        RancherFleet\Logger::info("CreateStagingUpgrade: proceeding with staging, version={$targetVersion}, fee={$fee}, invoice={$invoiceId} (already paid via invoice)");
 
         list($rancher, $github) = rancherfleet_buildClients($params);
 
@@ -6769,8 +6782,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             sleep(2);
         } catch (\Exception $nsEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: namespace creation failed: " . $nsEx->getMessage());
-            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Namespace creation failed: ' . $nsEx->getMessage());
-            return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage() . ' Credit refunded.';
+            return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage();
         }
 
         // 3. Create staging database (clone of production)
@@ -6812,8 +6824,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         } catch (\Exception $dbEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: database creation failed: " . $dbEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
-            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Database creation failed: ' . $dbEx->getMessage());
-            return 'Error: Failed to create staging database: ' . $dbEx->getMessage() . ' Credit refunded.';
+            return 'Error: Failed to create staging database: ' . $dbEx->getMessage();
         }
 
         // 4. Clone client branch to staging branch
@@ -6825,8 +6836,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         } catch (\Exception $branchEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: branch clone failed: " . $branchEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
-            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Branch clone failed: ' . $branchEx->getMessage());
-            return 'Error: Failed to clone branch: ' . $branchEx->getMessage() . ' Credit refunded.';
+            return 'Error: Failed to clone branch: ' . $branchEx->getMessage();
         }
 
         // 5. Update staging branch manifests
@@ -6865,8 +6875,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             RancherFleet\Logger::error("CreateStagingUpgrade: manifest update failed: " . $manifestEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
             $github->deleteBranch($stagingBranch);
-            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'Manifest update failed: ' . $manifestEx->getMessage());
-            return 'Error: Failed to update staging manifests: ' . $manifestEx->getMessage() . ' Credit refunded.';
+            return 'Error: Failed to update staging manifests: ' . $manifestEx->getMessage();
         }
 
         // 6. Create staging Fleet GitRepo
@@ -6895,8 +6904,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             RancherFleet\Logger::error("CreateStagingUpgrade: GitRepo creation failed: " . $gitRepoEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
             $github->deleteBranch('whmcs-client-' . $orderNum . '-staging');
-            rancherfleet_refundCredit($clientId, $fee, $invoiceId, 'GitRepo creation failed: ' . $gitRepoEx->getMessage());
-            return 'Error: Failed to create staging GitRepo: ' . $gitRepoEx->getMessage() . ' Credit refunded.';
+            return 'Error: Failed to create staging GitRepo: ' . $gitRepoEx->getMessage();
         }
 
         // 7. Update request record

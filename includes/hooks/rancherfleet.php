@@ -222,6 +222,75 @@ add_hook('ShutdownHook', 1, function($vars) {
 });
 
 // ---------------------------------------------------------------------------
+// Hook 3: Invoice Paid — Update upgrade request status
+// ---------------------------------------------------------------------------
+
+/**
+ * When an upgrade invoice is paid, transition the request from
+ * 'awaiting_payment' to 'pending' so the admin can proceed with CreateStagingUpgrade.
+ */
+add_hook('InvoicePaid', 1, function($vars) {
+    $invoiceId = isset($vars['invoiceid']) ? (int)$vars['invoiceid'] : 0;
+    if (!$invoiceId) {
+        return;
+    }
+
+    try {
+        // Fetch invoice to check notes for rfm_upgrade:{serviceId}
+        $invoice = \WHMCS\Database\Capsule::table('tblinvoices')
+            ->where('id', $invoiceId)
+            ->first();
+
+        if (!$invoice) {
+            return;
+        }
+
+        $notes = isset($invoice->notes) ? $invoice->notes : '';
+        if (empty($notes) || !preg_match('/rfm_upgrade:(\d+)/', $notes, $matches)) {
+            return;
+        }
+
+        $serviceId = (int)$matches[1];
+        RancherFleet\Logger::info("InvoicePaid: upgrade invoice {$invoiceId} paid for service={$serviceId}");
+
+        // Load the upgrade request
+        $record = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade')
+            ->where('setting', 'request_' . $serviceId)
+            ->first();
+
+        if (!$record) {
+            RancherFleet\Logger::error("InvoicePaid: no upgrade request found for service={$serviceId}");
+            return;
+        }
+
+        $request = json_decode($record->value, true);
+        if (!is_array($request)) {
+            $request = array();
+        }
+
+        // Only transition if currently awaiting payment
+        if (isset($request['status']) && $request['status'] === 'awaiting_payment') {
+            $request['status'] = 'pending';
+            $request['paid_at'] = time();
+
+            \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_upgrade')
+                ->where('setting', 'request_' . $serviceId)
+                ->update(array('value' => json_encode($request)));
+
+            RancherFleet\Logger::info("InvoicePaid: updated request status to 'pending' for service={$serviceId}");
+
+            // Log activity for admin visibility
+            logActivity("RancherFleet: Upgrade invoice #{$invoiceId} paid for service #{$serviceId}. Admin may now create staging environment.", $serviceId);
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("InvoicePaid: error: " . $e->getMessage());
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Helper: load module params for a service ID
 // ---------------------------------------------------------------------------
 
