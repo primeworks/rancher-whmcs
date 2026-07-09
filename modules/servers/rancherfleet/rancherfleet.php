@@ -2501,6 +2501,15 @@ function rancherfleet_handleUpgradeRequest(array $params, $namespace, $orderNum)
             return 'upgrade_error:Fee not configured for this version.';
         }
 
+        // Check for existing request — only allow if completed or doesn't exist
+        $existingRequest = rancherfleet_getUpgradeRequest($serviceId);
+        if (!empty($existingRequest)) {
+            $existingStatus = isset($existingRequest['status']) ? $existingRequest['status'] : 'unknown';
+            if ($existingStatus !== 'completed') {
+                return 'upgrade_error:An upgrade request is already pending (status: ' . $existingStatus . '). Please wait for it to complete or contact support to cancel it.';
+            }
+        }
+
         // Check credit balance
         $clientId = (int)$params['userid'];
         try {
@@ -2514,18 +2523,31 @@ function rancherfleet_handleUpgradeRequest(array $params, $namespace, $orderNum)
             return 'upgrade_error:Could not verify credit balance: ' . $e->getMessage();
         }
 
-        // Store upgrade request (only if it doesn't already exist)
-        RancherFleet\Logger::info("handleUpgradeRequest: storing new upgrade request for service {$serviceId}");
-        rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee);
+        // Charge credit immediately at request time
+        RancherFleet\Logger::info("handleUpgradeRequest: charging ${fee} for upgrade to {$targetVersion}");
+        $payment = rancherfleet_chargeCredit(
+            $clientId,
+            $fee,
+            "Odoo version upgrade to {$targetVersion}"
+        );
+        if (!$payment['success']) {
+            return 'upgrade_error:' . $payment['error'];
+        }
+        $invoiceId = $payment['invoiceId'];
+        RancherFleet\Logger::info("handleUpgradeRequest: payment charged, invoice {$invoiceId}");
+
+        // Store upgrade request with invoiceId already set
+        RancherFleet\Logger::info("handleUpgradeRequest: storing upgrade request with invoiceId={$invoiceId}");
+        rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee, $invoiceId);
 
         // Log activity
-        rancherfleet_logHistory($params, 'Upgrade Requested', 'Upgrade to Odoo ' . $targetVersion . ' ($' . number_format($fee, 2) . ') pending admin approval');
+        rancherfleet_logHistory($params, 'Upgrade Requested', 'Upgrade to Odoo ' . $targetVersion . ' requested and charged ($' . number_format($fee, 2) . '). Staging environment being prepared.');
 
         // Send admin notification
         try {
-            $logActivity = logActivity(
+            logActivity(
                 'Module Output',
-                'Version upgrade requested for service ' . $serviceId . ' (Order #' . $orderNum . ') to Odoo ' . $targetVersion . ' - $' . number_format($fee, 2),
+                'Version upgrade requested and charged for service ' . $serviceId . ' (Order #' . $orderNum . ') to Odoo ' . $targetVersion . ' - $' . number_format($fee, 2) . ' (Invoice #' . $invoiceId . ')',
                 'Rancher Fleet Module'
             );
         } catch (\Exception $e) {
@@ -6704,47 +6726,39 @@ function rancherfleet_CreateStagingUpgrade(array $params)
 
         RancherFleet\Logger::info("CreateStagingUpgrade: request details: " . json_encode($request));
 
-        // Check if already charged — if status is not 'pending', skip payment
+        // Validate request status — payment was already charged at request time
         if ($request['status'] !== 'pending') {
-            $invoiceId = $request['invoiceId'];
-            RancherFleet\Logger::info("CreateStagingUpgrade: skipping charge, status={$request['status']}, reusing invoice {$invoiceId}");
-        } else {
-            // Status is 'pending' — charge the credit now
-            $targetVersion = $request['version'];
-            $fee = $request['fee'];
-
-            list($rancher, $github) = rancherfleet_buildClients($params);
-
-            // Get current version
-            $deploymentStatus = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
-            if ($deploymentStatus['image'] && preg_match('/odoo:([0-9.]+)/', $deploymentStatus['image'], $m)) {
-                $currentVersion = $m[1];
-            } else {
-                return 'Error: Could not determine current Odoo version.';
-            }
-
-            // Charge credit
-            RancherFleet\Logger::info("CreateStagingUpgrade: charging ${fee}");
-            $payment = rancherfleet_chargeCredit(
-                $clientId,
-                $fee,
-                "Odoo version upgrade from {$currentVersion} to {$targetVersion} (staging)"
-            );
-            if (!$payment['success']) {
-                return 'Error: ' . $payment['error'];
-            }
-            $invoiceId = $payment['invoiceId'];
-
-            // Update status IMMEDIATELY before anything else can fail
-            \WHMCS\Database\Capsule::table('tbladdonmodules')
-                ->where('module', 'rancherfleet_upgrade')
-                ->where('setting', 'request_' . $serviceId)
-                ->update(array('value' => json_encode(array_merge($request, array(
-                    'invoiceId' => $invoiceId,
-                    'status'    => 'charging_complete',
-                )))));
-            RancherFleet\Logger::info("CreateStagingUpgrade: status updated to charging_complete, invoice {$invoiceId}");
+            return 'Error: Request status is ' . $request['status'] . ', not pending. Please contact support.';
         }
+
+        $targetVersion = $request['version'];
+        $fee = $request['fee'];
+        $invoiceId = $request['invoiceId'];
+
+        if (!$invoiceId) {
+            return 'Error: Request has no invoiceId. Payment was not charged. Please cancel and resubmit the upgrade request.';
+        }
+
+        RancherFleet\Logger::info("CreateStagingUpgrade: proceeding with staging, version={$targetVersion}, fee={$fee}, invoice={$invoiceId}");
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // Get current version
+        $deploymentStatus = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
+        if ($deploymentStatus['image'] && preg_match('/odoo:([0-9.]+)/', $deploymentStatus['image'], $m)) {
+            $currentVersion = $m[1];
+        } else {
+            return 'Error: Could not determine current Odoo version.';
+        }
+
+        // Update status IMMEDIATELY to mark staging as in progress
+        \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade')
+            ->where('setting', 'request_' . $serviceId)
+            ->update(array('value' => json_encode(array_merge($request, array(
+                'status'    => 'staging_in_progress',
+            )))));
+        RancherFleet\Logger::info("CreateStagingUpgrade: status updated to staging_in_progress");
 
         // 2. Create staging namespace (backup runs automatically via sidecar)
         RancherFleet\Logger::info("CreateStagingUpgrade: creating staging namespace");
