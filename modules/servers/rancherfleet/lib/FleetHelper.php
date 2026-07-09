@@ -51,15 +51,26 @@ class FleetHelper
         $this->gitBasicPassword = $gitBasicPassword;
     }
 
+    public function getFleetNamespace()
+    {
+        return $this->fleetNamespace;
+    }
+
+    public function getTargetClusterName()
+    {
+        return $this->clusterId;
+    }
+
     // -----------------------------------------------------------------------
     // Phase 4: GitRepo CRUD
     // -----------------------------------------------------------------------
 
     /**
      * Creates a Fleet GitRepo for a client namespace.
+     * Files are expected at the branch root (no subfolder).
      *
      * @param string $namespace  Target namespace (whmcs-client-{id})
-     * @param string $repoPath   Path in repo (clients/whmcs-client-{id})
+     * @param string $repoPath   (Deprecated, no longer used — files are at branch root)
      */
     public function createGitRepo($namespace, $repoPath)
     {
@@ -69,7 +80,6 @@ class FleetHelper
         $spec = array(
             'repo'            => $repoUrl,
             'branch'          => $namespace,
-            'paths'           => array($repoPath),
             'pollingInterval' => '15s',
             'targets'         => array(
                 array(
@@ -239,8 +249,8 @@ class FleetHelper
 
     private function fleetRequest($method, $path, $body = array())
     {
-        // Fleet GitRepo CRD accessed via kubectl-proxy using the configured cluster ID.
-        // This uses the same auth path as namespace and deployment operations.
-        return $this->rancher->rawRequest($method, self::FLEET_API_PATH . $path, $body);
+        // Fleet GitRepo CRD lives on the local management cluster, not the downstream cluster.
+        // Use rancherRequest with full path including /k8s/clusters/local prefix.
+        return $this->rancher->rancherRequest($method, '/k8s/clusters/local' . self::FLEET_API_PATH . $path, $body);
     }
 }

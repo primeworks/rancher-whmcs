@@ -529,56 +529,43 @@ function rancherfleet_createDbAdminSecret(array $params, $rancher, $namespace, $
         return;
     }
 
-    // Determine WHMCS base URL for the webhook
+    // Determine WHMCS base URL for the webhook (with fallback if empty)
     $whmcsUrl = function_exists('App') ? \App::getSystemUrl() : '';
+    if (empty($whmcsUrl)) {
+        $whmcsUrl = 'https://host.webdiscode.com';
+    }
     $webhookUrl = rtrim($whmcsUrl, '/') . '/modules/servers/rancherfleet/backup_webhook.php';
 
     $secrets = array(
         'rfm-db-admin-' . $orderNum => array(
-            'username' => base64_encode($dbUser),
-            'password' => base64_encode($dbPass),
+            'username' => $dbUser,
+            'password' => $dbPass,
         ),
         'rfm-webhook-' . $orderNum => array(
-            'url'        => base64_encode($webhookUrl),
-            'secret'     => base64_encode($authSecret),
-            'service_id' => base64_encode((string)$serviceId),
+            'url'        => $webhookUrl,
+            'secret'     => $authSecret,
+            'service_id' => (string)$serviceId,
         ),
     );
 
+    $secretsCreated = array();
     foreach ($secrets as $secretName => $data) {
-        $secretBody = array(
-            'apiVersion' => 'v1',
-            'kind'       => 'Secret',
-            'metadata'   => array(
-                'name'      => $secretName,
-                'namespace' => $namespace,
-            ),
-            'type' => 'Opaque',
-            'data' => $data,
-        );
-
         try {
-            try {
-                $rancher->rawRequest('POST',
-                    '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets',
-                    $secretBody
-                );
-                RancherFleet\Logger::info("createDbAdminSecret: created {$secretName} in {$namespace}");
-            } catch (RancherFleet\RancherApiException $e) {
-                if ($e->getHttpCode() === 409) {
-                    $rancher->rawRequest('PATCH',
-                        '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets/' . rawurlencode($secretName),
-                        array('data' => $data),
-                        array('Content-Type: application/strategic-merge-patch+json')
-                    );
-                    RancherFleet\Logger::info("createDbAdminSecret: patched {$secretName}");
-                } else {
-                    throw $e;
-                }
-            }
+            $rancher->applySecret($namespace, $secretName, $data);
+            RancherFleet\Logger::info("createDbAdminSecret: applied {$secretName} in {$namespace}");
+            $secretsCreated[$secretName] = true;
         } catch (\Exception $e) {
             RancherFleet\Logger::error("createDbAdminSecret: FAILED {$secretName} in {$namespace}: " . $e->getMessage());
+            $secretsCreated[$secretName] = false;
         }
+    }
+
+    // Verify both required secrets were created
+    if (empty($secretsCreated['rfm-db-admin-' . $orderNum])) {
+        RancherFleet\Logger::error("createDbAdminSecret: rfm-db-admin-{$orderNum} not created in {$namespace}");
+    }
+    if (empty($secretsCreated['rfm-webhook-' . $orderNum])) {
+        RancherFleet\Logger::error("createDbAdminSecret: rfm-webhook-{$orderNum} not created in {$namespace}");
     }
 }
 
@@ -723,6 +710,9 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
 
             if ($secret) {
                 $token = rancherfleet_generateBackupToken($secret, $orderNum, $fname);
+                $html .= '<div style="display:flex;gap:6px;align-items:center;">';
+
+                // Download button
                 $html .= '<form method="post" action="' . $serviceUrl . '" style="margin:0;">';
                 $html .= '<input type="hidden" name="clientaction" value="backup_download">';
                 $html .= '<input type="hidden" name="backup_file" value="' . htmlspecialchars($fname) . '">';
@@ -730,8 +720,21 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
                        . 'border-radius:4px;padding:5px 12px;font-size:11px;font-weight:bold;cursor:pointer;">'
                        . '&#11015; Download</button>';
                 $html .= '</form>';
+
+                // Restore button
+                $html .= '<form method="post" action="' . $serviceUrl . '" style="margin:0;" '
+                       . 'onsubmit="return confirm(\'WARNING: This will restore from this backup. Your current ' . htmlspecialchars($ftype) . ' data will be overwritten and the instance will be briefly offline. Continue?\');">';
+                $html .= '<input type="hidden" name="clientaction" value="backup_restore">';
+                $html .= '<input type="hidden" name="backup_file" value="' . htmlspecialchars($fname) . '">';
+                $html .= '<input type="hidden" name="backup_type" value="' . htmlspecialchars($ftype) . '">';
+                $html .= '<button type="submit" style="background:#e67e22;color:#fff;border:none;'
+                       . 'border-radius:4px;padding:5px 12px;font-size:11px;font-weight:bold;cursor:pointer;">'
+                       . '&#8635; Restore</button>';
+                $html .= '</form>';
+
+                $html .= '</div>';
             } else {
-                $html .= '<span style="font-size:11px;color:#aaa;">Download unavailable — Backup Auth Secret not configured</span>';
+                $html .= '<span style="font-size:11px;color:#aaa;">Actions unavailable — Backup Auth Secret not configured</span>';
             }
 
             $html .= '</div>';
@@ -880,7 +883,7 @@ function rancherfleet_buildClients(array $params)
     // Fleet's GitRepo spec.targets[].clusterName matches against the Fleet
     // Cluster CRD's metadata.name — the cluster's DISPLAY NAME, not its
     // c-xxxxx ID. Resolve and cache it via the Rancher v3 API.
-    $targetClusterName = $rancher->getClusterName();
+    $targetClusterName = $rancher->testConnection();
 
     $github = new RancherFleet\GitHubClient(
         isset($cfg['github_pat'])         ? $cfg['github_pat']         : '',
@@ -1008,6 +1011,8 @@ function rancherfleet_exceptionDetail($e)
 
 function rancherfleet_CreateAccount(array $params)
 {
+    RancherFleet\Logger::info("CreateAccount: starting");
+
     // If automatic provisioning is disabled, skip all phases.
     if (!rancherfleet_isAutomatic($params)) {
         RancherFleet\Logger::info("CreateAccount: automatic provisioning disabled, skipping.");
@@ -1040,7 +1045,9 @@ function rancherfleet_CreateAccount(array $params)
     // Phase 1: Connection test
     try {
         list($rancher) = rancherfleet_buildClients($params);
+        RancherFleet\Logger::info("CreateAccount: rancherfleet_buildClients() completed");
         $rancher->testConnection();
+        RancherFleet\Logger::info("CreateAccount: testConnection() completed");
     } catch (Exception $e) {
         RancherFleet\RetryQueue::enqueue($serviceId, 'TestConnection', $namespace, $e->getMessage());
         return 'Error (Phase 1 - Connection): ' . $e->getMessage();
@@ -1049,26 +1056,23 @@ function rancherfleet_CreateAccount(array $params)
     // Phase 2: Create namespace
     try {
         list($rancher) = rancherfleet_buildClients($params);
-
-        // Phase A: Validate template before creating namespace
-        list($rancher, $github) = rancherfleet_buildClients($params);
-        $validationErrors = $github->validateTemplate();
-        if (!empty($validationErrors)) {
-            return 'Error (Phase 3 - Template Validation): ' . implode('; ', $validationErrors);
-        }
+        RancherFleet\Logger::info("CreateAccount: rancherfleet_buildClients() completed for Phase 2");
 
         $rancher->createNamespace($namespace);
         $completed['namespace_created'] = true;
+        RancherFleet\Logger::info("CreateAccount: createNamespace() completed for {$namespace}");
 
         // Phase C: Create client ServiceAccount for kubeconfig
         $rancher->createClientServiceAccount($namespace);
-        RancherFleet\Logger::info("CreateAccount: service account created for {$namespace}");
+        RancherFleet\Logger::info("CreateAccount: createClientServiceAccount() completed for {$namespace}");
 
         // Phase C: Inject secrets from product custom fields
         rancherfleet_doInjectSecrets($params, $namespace);
+        RancherFleet\Logger::info("CreateAccount: doInjectSecrets() completed for {$namespace}");
 
         // Phase C: Create DB admin Secret for backup CronJob
         rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+        RancherFleet\Logger::info("CreateAccount: createDbAdminSecret() completed for {$namespace}");
 
     } catch (Exception $e) {
         rancherfleet_doRollback($params, $completed);
@@ -1346,6 +1350,223 @@ function rancherfleet_terminateDatabase(array $params, $rancher, $namespace)
     }
 }
 
+/**
+ * Handles backup restore from client area.
+ *
+ * Creates a Job that:
+ * 1. Scales the Deployment to 0 replicas
+ * 2. Creates pre-restore snapshots (db dump + filestore tar)
+ * 3. Restores from the selected backup (db or filestore)
+ * 4. Scales back to original replica count
+ * 5. Cleans up temporary snapshots
+ *
+ * @param  array  $params
+ * @param  string $namespace
+ * @param  string $orderNum
+ * @param  string $filename   Backup filename (e.g. "db-0000-2024-01-01.dump")
+ * @param  string $backupType "db" or "filestore"
+ * @return string            'backup_restore_success:...' or 'backup_restore_error:...'
+ */
+function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, $filename, $backupType)
+{
+    RancherFleet\Logger::info("backupRestore: starting for {$namespace} file={$filename} type={$backupType}");
+
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+
+        // Get current deployment status (replica count)
+        $deploymentName = 'odoo-' . $orderNum;
+        $status = $rancher->getDeploymentStatus($namespace, $deploymentName);
+        $originalReplicas = max(1, isset($status['replicas']) ? (int)$status['replicas'] : 1);
+
+        // DB credentials from Module Settings
+        $dbUser = isset($params['configoption20']) ? trim($params['configoption20']) : 'postgres';
+        $dbPass = isset($params['configoption21']) ? trim($params['configoption21']) : '';
+        $dbHost = 'postgres16.default.svc.cluster.local';
+        $dbPort = '5432';
+        $dbName = 'odoo-' . $orderNum;
+
+        if (empty($dbUser)) {
+            RancherFleet\Logger::error("backupRestore: DB Admin Username not configured");
+            return 'backup_restore_error:Database credentials not configured';
+        }
+
+        // Validate backup file exists by checking the manifest
+        $files = rancherfleet_getBackupFiles((int)$params['serviceid']);
+        $backupFile = null;
+        foreach ($files as $f) {
+            if ($f['name'] === $filename) {
+                $backupFile = $f;
+                break;
+            }
+        }
+
+        if (!$backupFile) {
+            RancherFleet\Logger::error("backupRestore: backup file not found in manifest");
+            return 'backup_restore_error:Backup file not found';
+        }
+
+        // Validate backup type matches filename pattern
+        if ($backupType === 'db' && !preg_match('/^db-\d+-\d{4}-\d{2}-\d{2}\.dump$/', $filename)) {
+            return 'backup_restore_error:Invalid database backup filename format';
+        }
+        if ($backupType === 'filestore' && !preg_match('/^filestore-\d+-\d{4}-\d{2}-\d{2}\.tar\.gz$/', $filename)) {
+            return 'backup_restore_error:Invalid filestore backup filename format';
+        }
+
+        // Generate unique job name
+        $timestamp = time();
+        $jobName = 'rfm-restore-' . $backupType . '-' . $timestamp . '-' . substr(md5($orderNum), 0, 4);
+        $jobName = substr($jobName, 0, 60); // Keep under 63 char DNS limit
+
+        // Build restore shell script
+        // The script will:
+        // 1. Scale deployment to 0
+        // 2. Create pre-restore snapshots
+        // 3. Restore from backup
+        // 4. Scale back to original replicas
+        if ($backupType === 'db') {
+            $preRestoreDbFile = 'pre-restore-db-' . date('Y-m-d-H-i-s') . '.dump';
+            $restoreCmd = 'set -e && '
+                . 'echo "Scaling deployment to 0..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=0 -n ' . escapeshellarg($namespace) . ' && '
+                . 'sleep 5 && '
+                . 'echo "Creating pre-restore database snapshot..." && '
+                . 'pg_dump -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -Fc > /backups/' . escapeshellarg($preRestoreDbFile) . ' 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
+                . 'echo "Restoring database from backup..." && '
+                . 'pg_restore -h $PGHOST -p $PGPORT -U $PGUSER --clean --if-exists -d $PGDATABASE /backups/' . escapeshellarg($filename) . ' 2>&1 && '
+                . 'echo "Scaling deployment back to ' . $originalReplicas . ' replicas..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=' . (int)$originalReplicas . ' -n ' . escapeshellarg($namespace) . ' && '
+                . 'echo "Restore complete"';
+        } else {
+            // filestore restore
+            $preRestoreFilestore = 'pre-restore-filestore-' . date('Y-m-d-H-i-s') . '.tar.gz';
+            $restoreCmd = 'set -e && '
+                . 'echo "Scaling deployment to 0..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=0 -n ' . escapeshellarg($namespace) . ' && '
+                . 'sleep 5 && '
+                . 'echo "Creating pre-restore filestore snapshot..." && '
+                . 'tar -czf /backups/' . escapeshellarg($preRestoreFilestore) . ' -C /var/lib/odoo . 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
+                . 'echo "Restoring filestore from backup..." && '
+                . 'tar -xzf /backups/' . escapeshellarg($filename) . ' -C /var/lib/odoo && '
+                . 'echo "Scaling deployment back to ' . $originalReplicas . ' replicas..." && '
+                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=' . (int)$originalReplicas . ' -n ' . escapeshellarg($namespace) . ' && '
+                . 'echo "Restore complete"';
+        }
+
+        // Build Job manifest
+        $jobManifest = array(
+            'apiVersion' => 'batch/v1',
+            'kind'       => 'Job',
+            'metadata'   => array(
+                'name'      => $jobName,
+                'namespace' => $namespace,
+                'labels'    => array('app' => 'rfm-restore'),
+            ),
+            'spec' => array(
+                'ttlSecondsAfterFinished' => 300,
+                'backoffLimit'            => 0,
+                'template'               => array(
+                    'spec' => array(
+                        'restartPolicy' => 'Never',
+                        'containers'    => array(array(
+                            'name'    => 'restore',
+                            'image'   => $backupType === 'db' ? 'postgres:16-alpine' : 'alpine:latest',
+                            'command' => array('sh', '-c', $restoreCmd),
+                            'env'     => $backupType === 'db' ? array(
+                                array('name' => 'PGHOST',     'value' => $dbHost),
+                                array('name' => 'PGPORT',     'value' => $dbPort),
+                                array('name' => 'PGUSER',     'value' => $dbUser),
+                                array('name' => 'PGPASSWORD', 'value' => $dbPass),
+                                array('name' => 'PGDATABASE', 'value' => $dbName),
+                            ) : array(),
+                            'volumeMounts' => array(
+                                array(
+                                    'name'      => 'odoo-pvc',
+                                    'mountPath' => '/var/lib/odoo',
+                                    'subPath'   => 'filestore',
+                                ),
+                                array(
+                                    'name'      => 'odoo-pvc',
+                                    'mountPath' => '/backups',
+                                    'subPath'   => 'backups',
+                                ),
+                            ),
+                        )),
+                        'volumes' => array(
+                            array(
+                                'name'         => 'odoo-pvc',
+                                'persistentVolumeClaim' => array(
+                                    'claimName' => 'odoo-' . $orderNum,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        RancherFleet\Logger::info("backupRestore: creating Job {$jobName} for {$backupType} restore");
+
+        // Create the Job
+        $rancher->rawRequest('POST',
+            '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
+            $jobManifest
+        );
+
+        // Poll for completion — up to 120 seconds
+        $succeeded = false;
+        $failed    = false;
+        $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
+
+        for ($i = 0; $i < 24; $i++) {
+            sleep(5);
+            try {
+                $job        = $rancher->rawRequest('GET', $jobPath);
+                $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                foreach ($conditions as $cond) {
+                    if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                        $succeeded = true; break 2;
+                    }
+                    if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                        $failed = true; break 2;
+                    }
+                }
+                RancherFleet\Logger::info("backupRestore: waiting for Job... " . (($i + 1) * 5) . "s elapsed");
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("backupRestore: error polling Job: " . $e->getMessage());
+                break;
+            }
+        }
+
+        // Clean up the Job
+        try {
+            $rancher->rawRequest('DELETE', $jobPath);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("backupRestore: Job cleanup note: " . $e->getMessage());
+        }
+
+        if ($succeeded) {
+            RancherFleet\Logger::info("backupRestore: SUCCESS — {$backupType} restored from {$filename}");
+            rancherfleet_logHistory($params, 'Backup Restored', $backupType . ' restored from ' . $filename);
+            return 'backup_restore_success:' . $backupType;
+        } elseif ($failed) {
+            RancherFleet\Logger::error("backupRestore: Job failed");
+            rancherfleet_logHistory($params, 'Restore Failed', 'Job failed for ' . $filename);
+            return 'backup_restore_error:Restore job failed. Check admin logs for details.';
+        } else {
+            RancherFleet\Logger::error("backupRestore: Job timed out after 120s");
+            rancherfleet_logHistory($params, 'Restore Timeout', 'Job timeout for ' . $filename);
+            return 'backup_restore_error:Restore job timed out after 2 minutes';
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("backupRestore: exception — " . $e->getMessage());
+        rancherfleet_logHistory($params, 'Restore Error', $e->getMessage());
+        return 'backup_restore_error:' . $e->getMessage();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase A: Provisioning Rollback
 
@@ -1481,6 +1702,11 @@ function rancherfleet_AdminCustomButtonArray()
         'Dry Run'                => 'DryRunProvision',
         'Clear Retry Queue'      => 'ClearRetryQueue',
         'Push Backup CronJob'    => 'PushBackupCronJob',
+        'Push Backup Sidecar'    => 'PushBackupSidecar',
+        'Patch Backup Storage'   => 'PatchBackupStorage',
+        'Refresh Webhook Secret' => 'RefreshWebhookSecret',
+        'Remove Custom URL'      => 'RemoveCustomUrl',
+        'Patch Template Updates' => 'PatchTemplateUpdates',
     );
 }
 
@@ -1597,15 +1823,15 @@ function rancherfleet_RepairGitRepo(array $params)
         if ($oldFleetNs !== $correctFleetNs) {
             try {
                 // Fleet GitRepo CRDs live on the LOCAL (Fleet management) cluster,
-                // not the downstream cluster — use localClusterRequest().
-                $old = $rancher->localClusterRequest(
+                // not the downstream cluster — use rancherRequest with /k8s/clusters/local path.
+                $old = $rancher->rancherRequest(
                     'GET',
-                    RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
+                    '/k8s/clusters/local' . RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
                 );
                 if (!empty($old)) {
-                    $rancher->localClusterRequest(
+                    $rancher->rancherRequest(
                         'DELETE',
-                        RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
+                        '/k8s/clusters/local' . RancherFleet\FleetHelper::FLEET_API_PATH . '/namespaces/' . $oldFleetNs . '/gitrepos/' . $gitRepoName
                     );
                     $actions[] = "removed stale GitRepo from namespace '{$oldFleetNs}'";
                 }
@@ -1620,12 +1846,12 @@ function rancherfleet_RepairGitRepo(array $params)
         // the corrected repo URL, branch, paths, and clusterName.
         $existing = $fleet->getGitRepo($namespace);
         if (!empty($existing)) {
-            $fleet->updateGitRepoTarget($namespace, $repoPath);
-            $actions[] = "updated GitRepo in '{$correctFleetNs}'";
-        } else {
-            $fleet->createGitRepo($namespace, $repoPath);
-            $actions[] = "created GitRepo in '{$correctFleetNs}'";
+            $fleet->deleteGitRepo($namespace);
         }
+        $fleet->createGitRepo($namespace, $repoPath);
+        $actions[] = !empty($existing)
+            ? "updated GitRepo in '{$correctFleetNs}'"
+            : "created GitRepo in '{$correctFleetNs}'";
 
         $actions[] = "clusterName='" . $fleet->getTargetClusterName() . "'";
 
@@ -2136,6 +2362,742 @@ function rancherfleet_PushBackupCronJob(array $params)
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("PushBackupCronJob FAILED: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Pushes the backup sidecar container into the Odoo Deployment.
+ * Replaces CronJob-based backups with a sidecar that runs dcron inline.
+ *
+ * Reads odoo.yml from the client branch, injects the backup sidecar container
+ * into the spec.template.spec.containers array, adds necessary volumes, and
+ * writes it back.
+ */
+function rancherfleet_PushBackupSidecar(array $params)
+{
+    $orderNum  = null;
+    $namespace = null;
+
+    try {
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        $clientBranch = $github->clientBranch($namespace);
+
+        // Read odoo.yml from the client branch
+        try {
+            $odooYaml = $github->getClientFileContent($namespace, 'odoo.yml');
+            if (!$odooYaml) {
+                return "Error: odoo.yml not found on client branch '{$clientBranch}'.";
+            }
+        } catch (\Exception $readEx) {
+            throw new \Exception("Failed to read odoo.yml from GitHub: " . $readEx->getMessage());
+        }
+
+        RancherFleet\Logger::info("PushBackupSidecar: read odoo.yml for {$namespace}");
+
+        // Inject the backup sidecar container and volumes
+        try {
+            $updatedYaml = rancherfleet_injectBackupSidecar($odooYaml, $orderNum);
+        } catch (\Exception $injectEx) {
+            throw new \Exception("Failed to inject backup sidecar: " . $injectEx->getMessage());
+        }
+
+        if (!$updatedYaml) {
+            throw new \Exception("injectBackupSidecar returned empty YAML");
+        }
+
+        if ($updatedYaml === $odooYaml) {
+            RancherFleet\Logger::info("PushBackupSidecar: sidecar already present, no changes needed");
+            return "No changes: backup sidecar already injected.";
+        }
+
+        RancherFleet\Logger::info("PushBackupSidecar: sidecar container injected for {$namespace}");
+
+        // Write back to the client branch
+        try {
+            $github->writeFileToBranch('odoo.yml', $updatedYaml, $clientBranch,
+                "chore: inject backup sidecar container for {$namespace}");
+        } catch (\Exception $writeEx) {
+            throw new \Exception("Failed to write odoo.yml to GitHub: " . $writeEx->getMessage());
+        }
+
+        RancherFleet\Logger::info("PushBackupSidecar: odoo.yml written to branch for {$namespace}");
+
+        // Create the DB admin Secret in the namespace (ensures rfm-db-admin and rfm-webhook Secrets exist)
+        try {
+            rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+        } catch (\Exception $secretEx) {
+            throw new \Exception("Failed to create DB admin secret: " . $secretEx->getMessage());
+        }
+
+        RancherFleet\Logger::info("PushBackupSidecar: DB admin secret updated for {$namespace}");
+
+        try {
+            rancherfleet_logHistory($params, 'Backup Sidecar Injected', $namespace);
+        } catch (\Exception $historyEx) {
+            // History logging is non-critical; log but don't fail
+            RancherFleet\Logger::info("PushBackupSidecar: failed to log history: " . $historyEx->getMessage());
+        }
+
+        RancherFleet\Logger::info("PushBackupSidecar: SUCCESS for {$namespace}");
+        return "Success: Backup sidecar injected into '{$clientBranch}' odoo.yml. DB admin Secret updated. Fleet will auto-sync within ~15s.";
+
+    } catch (\Exception $e) {
+        $nsDisplay = $namespace ? " [{$namespace}]" : '';
+        $msg = "PushBackupSidecar FAILED{$nsDisplay}: " . $e->getMessage();
+        RancherFleet\Logger::error($msg);
+        RancherFleet\Logger::error("Stack trace: " . $e->getTraceAsString());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+function rancherfleet_PatchBackupStorage(array $params)
+{
+    try {
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // Check if we're in step 2 (confirmation/apply mode)
+        $pending = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_patch')
+            ->where('setting', 'pending_backup_storage_patch')
+            ->first();
+
+        if ($pending) {
+            // Step 2: Check timestamp and apply patches
+            $pendingData = @json_decode($pending->value, true);
+            if (!$pendingData || !isset($pendingData['branches']) || !isset($pendingData['timestamp'])) {
+                throw new \Exception("Invalid pending patch data");
+            }
+
+            $elapsedSeconds = time() - $pendingData['timestamp'];
+            if ($elapsedSeconds > 60) {
+                // Confirmation expired, delete and restart
+                \WHMCS\Database\Capsule::table('tbladdonmodules')
+                    ->where('module', 'rancherfleet_patch')
+                    ->where('setting', 'pending_backup_storage_patch')
+                    ->delete();
+                RancherFleet\Logger::info("PatchBackupStorage: confirmation expired, restarting scan");
+                return "Confirmation expired. Run 'Patch Backup Storage' again to re-scan.";
+            }
+
+            // Apply patches to each branch
+            $patchedCount = 0;
+            $patchedList = array();
+            $totalBranches = count($pendingData['branches']);
+            RancherFleet\Logger::info("PatchBackupStorage: starting to apply patches to {$totalBranches} branches");
+
+            foreach ($pendingData['branches'] as $branch) {
+                try {
+                    $orderNum = str_replace('whmcs-client-', '', $branch);
+                    RancherFleet\Logger::info("PatchBackupStorage: [{$patchedCount}/{$totalBranches}] patching branch {$branch} (orderNum={$orderNum})");
+
+                    RancherFleet\Logger::info("PatchBackupStorage: reading odoo.yml from {$branch}");
+                    $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
+                    RancherFleet\Logger::info("PatchBackupStorage: read complete for {$branch}, size=" . strlen((string)$odooYaml) . " bytes");
+                    if (!$odooYaml) {
+                        RancherFleet\Logger::error("PatchBackupStorage: could not read odoo.yml from {$branch}");
+                        continue;
+                    }
+
+                    // Check if this branch needs patching: detect old PVC mount with subPath
+                    $detectString = "mountPath: /backups\n            subPath: backups";
+                    $needsPatching = strpos($odooYaml, $detectString) !== false;
+                    RancherFleet\Logger::info("PatchBackupStorage: detection for {$branch}: needsPatching=" . ($needsPatching ? 'true' : 'false'));
+
+                    if (!$needsPatching) {
+                        RancherFleet\Logger::info("PatchBackupStorage: {$branch} does not need patching (old mount not found)");
+                        continue;
+                    }
+
+                    $updated = $odooYaml;
+
+                    // Step 1: Replace old PVC volumeMount with NFS volumeMount
+                    $oldMount = "          - name: odoo-data\n            mountPath: /backups\n            subPath: backups\n";
+                    $newMount = "          - name: nfs-backups\n            mountPath: /backups\n";
+                    $updated = str_replace($oldMount, $newMount, $updated);
+                    RancherFleet\Logger::info("PatchBackupStorage: replaced volumeMount (PVC→NFS) in {$branch}");
+
+                    // Step 2: Add NFS volume if not present
+                    if (strpos($updated, 'name: nfs-backups') === false) {
+                        $nfsVolume = "      - name: nfs-backups\n        nfs:\n          server: 162.35.166.55\n          path: /export/share1\n";
+                        // Insert before "      - name: rfm-db-admin"
+                        $updated = str_replace("      - name: rfm-db-admin", $nfsVolume . "      - name: rfm-db-admin", $updated);
+                        RancherFleet\Logger::info("PatchBackupStorage: added nfs-backups volume to {$branch}");
+                    } else {
+                        RancherFleet\Logger::info("PatchBackupStorage: nfs-backups volume already present in {$branch}");
+                    }
+
+                    // Step 3: Update BACKUP_DIR in the backup script to use odoo-{ORDER_NUM} directory
+                    $oldBackupDir = "          BACKUP_DIR=/backups";
+                    $newBackupDir = "          BACKUP_DIR=\"/backups/odoo-${ORDER_NUM}\"";
+                    $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
+                    RancherFleet\Logger::info("PatchBackupStorage: updated BACKUP_DIR in {$branch}");
+
+                    // Verify changes were made
+                    if ($updated === $odooYaml) {
+                        RancherFleet\Logger::error("PatchBackupStorage: changes failed to apply to {$branch}");
+                        continue;
+                    }
+                    RancherFleet\Logger::info("PatchBackupStorage: changes applied to {$branch}, size=" . strlen($updated) . " bytes");
+
+                    // Write back to branch with detailed logging
+                    RancherFleet\Logger::info("PatchBackupStorage: about to write odoo.yml to {$branch}");
+                    $github->writeFileToBranch(
+                        'odoo.yml',
+                        $updated,
+                        $branch,
+                        'chore: patch backup storage to use NFS'
+                    );
+                    RancherFleet\Logger::info("PatchBackupStorage: writeFileToBranch completed for {$branch}");
+
+                    $patchedCount++;
+                    $patchedList[] = $branch;
+                    RancherFleet\Logger::info("PatchBackupStorage: successfully patched {$branch} ({$patchedCount}/{$totalBranches} complete)");
+
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::error("PatchBackupStorage: failed to patch {$branch}: " . $e->getMessage());
+                    continue;
+                }
+            }
+
+            // Delete the pending record
+            \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_patch')
+                ->where('setting', 'pending_backup_storage_patch')
+                ->delete();
+
+            $branchList = implode(', ', $patchedList);
+            RancherFleet\Logger::info("PatchBackupStorage: complete - patched {$patchedCount} instances");
+            return "Success: Patched {$patchedCount} instances ({$branchList}). Fleet will auto-sync within ~15s.";
+
+        } else {
+            // Step 1: Scan for branches needing patch
+            RancherFleet\Logger::info("PatchBackupStorage: scanning for instances needing patch");
+
+            $branchesToPatch = array();
+            try {
+                $branches = $github->listBranches('whmcs-client-');
+                foreach ($branches as $branch) {
+                    try {
+                        $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
+                        if (!$odooYaml) {
+                            continue;
+                        }
+
+                        // Check if sidecar exists and uses old PVC mount (subPath: backups)
+                        $hasSidecar = strpos($odooYaml, '- name: backup') !== false;
+                        $hasOldMount = strpos($odooYaml, 'subPath: backups') !== false;
+
+                        if ($hasSidecar && $hasOldMount) {
+                            $branchesToPatch[] = $branch;
+                            RancherFleet\Logger::info("PatchBackupStorage: found branch needing patch: {$branch}");
+                        }
+                    } catch (\Exception $e) {
+                        RancherFleet\Logger::info("PatchBackupStorage: could not check branch {$branch}: " . $e->getMessage());
+                        continue;
+                    }
+                }
+            } catch (\Exception $e) {
+                throw new \Exception("Failed to list branches: " . $e->getMessage());
+            }
+
+            if (empty($branchesToPatch)) {
+                RancherFleet\Logger::info("PatchBackupStorage: all instances already up to date");
+                return "All instances already up to date. No backup storage patches needed.";
+            }
+
+            // Store pending patches with timestamp
+            $pendingData = array(
+                'branches' => $branchesToPatch,
+                'timestamp' => time(),
+            );
+
+            \WHMCS\Database\Capsule::table('tbladdonmodules')->insert([
+                'module'  => 'rancherfleet_patch',
+                'setting' => 'pending_backup_storage_patch',
+                'value'   => json_encode($pendingData),
+            ]);
+
+            $branchList = implode(', ', $branchesToPatch);
+            RancherFleet\Logger::info("PatchBackupStorage: found " . count($branchesToPatch) . " instances needing patch");
+            return "Found " . count($branchesToPatch) . " instances needing patch:\n{$branchList}\n\nRun 'Patch Backup Storage' again within 60 seconds to apply patches.";
+        }
+
+    } catch (\Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("PatchBackupStorage FAILED:\n" . $detail);
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Injects the backup sidecar container and necessary volumes into odoo.yml YAML content.
+ *
+ * The sidecar:
+ * - Installs curl and dcron
+ * - Writes a backup script to /backup.sh
+ * - Schedules it to run at 3am UTC daily via crontab
+ * - Creates pre-compressed backups and rotates 3-day retention
+ * - POSTs manifest.json to the WHMCS webhook
+ *
+ * Volumes mounted:
+ * - odoo-data (PVC filestore + backups subPaths)
+ * - rfm-db-admin (Secret with DB credentials)
+ * - rfm-webhook-config (Secret with webhook URL/credentials)
+ *
+ * @param  string $yamlContent  Current odoo.yml YAML
+ * @param  string $orderNum     Order/client number for substitution
+ * @return string               Updated YAML content
+ */
+function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
+{
+    // Step 0: Remove any existing NFS CronJob (old backup approach)
+    $cronJobName = 'odoo-' . $orderNum . '-backup';
+    $cronJobPattern = '/^---\n.*?kind:\s*CronJob\s*\n.*?name:\s*' . preg_quote($cronJobName, '/') . '\s*\n.*?(?=^---|$)/ms';
+    $yamlContent = preg_replace($cronJobPattern, '', $yamlContent);
+
+    // Clean up any double document separators left behind
+    $yamlContent = preg_replace('/\n---\n---/', "\n---", $yamlContent);
+    $yamlContent = preg_replace('/^---\n---/', "---", $yamlContent);
+
+    RancherFleet\Logger::info("injectBackupSidecar: removed old NFS CronJob '{$cronJobName}' if present");
+
+    // Step 1: Find the Deployment resource
+    if (!preg_match('/kind:\s*Deployment/i', $yamlContent, $m)) {
+        throw new \Exception("No Deployment resource found in odoo.yml");
+    }
+    RancherFleet\Logger::info("injectBackupSidecar: found Deployment resource");
+
+    // Step 2: Check if backup sidecar already exists in Deployment
+    if (preg_match('/kind:\s*Deployment.*?- name:\s+backup\s*\n/is', $yamlContent)) {
+        RancherFleet\Logger::info("injectBackupSidecar: backup sidecar already present in Deployment");
+        return $yamlContent;
+    }
+    RancherFleet\Logger::info("injectBackupSidecar: sidecar not found, proceeding with injection");
+
+    // Step 3: Find Deployment's restartPolicy and insert sidecar container BEFORE it
+    // Pattern: within Deployment (kind: Deployment ... until next "kind:" or end of file),
+    // find "      restartPolicy:" at 6-space indent and insert sidecar before it
+    $sidecarContainer = '      - name: backup
+        image: postgres:16-alpine
+        command: [sh, -c]
+        args:
+        - |
+          apk add --no-cache curl dcron
+          cat > /backup.sh << \'SCRIPT\'
+          #!/bin/sh
+          set -e
+          DATE=$(date +%Y-%m-%d)
+          ORDER_NUM=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "' . $orderNum . '")
+          DB_NAME="odoo-${ORDER_NUM}"
+          BACKUP_DIR="/backups/odoo-${ORDER_NUM}"
+          mkdir -p "$BACKUP_DIR"
+          pg_dump -Fc -d "$DB_NAME" \
+            -h postgres16.default.svc.cluster.local \
+            -U $(cat /etc/rfm-db/username) \
+            -f "$BACKUP_DIR/db-${ORDER_NUM}-${DATE}.dump"
+          tar -czf "$BACKUP_DIR/filestore-${ORDER_NUM}-${DATE}.tar.gz" \
+            -C /var/lib/odoo . 2>/dev/null || true
+          find "$BACKUP_DIR" -maxdepth 1 \
+            \( -name "db-${ORDER_NUM}-*.dump" \
+            -o -name "filestore-${ORDER_NUM}-*.tar.gz" \) \
+            -mtime +3 -delete
+          MANIFEST="$BACKUP_DIR/manifest.json"
+          printf \'[\n\' > "$MANIFEST"
+          FIRST=1
+          for FILE in $(ls -t "$BACKUP_DIR"/db-${ORDER_NUM}-*.dump \
+            "$BACKUP_DIR"/filestore-${ORDER_NUM}-*.tar.gz 2>/dev/null); do
+            FNAME=$(basename "$FILE")
+            FSIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+            FMTIME=$(stat -c%Y "$FILE" 2>/dev/null || echo 0)
+            TYPE="db"
+            echo "$FNAME" | grep -q "^filestore-" && TYPE="filestore"
+            if [ "$FIRST" = "0" ]; then printf \',\n\' >> "$MANIFEST"; fi
+            printf \'  {"name":"%s","size":%s,"mtime":%s,"type":"%s"}\' \
+              "$FNAME" "$FSIZE" "$FMTIME" "$TYPE" >> "$MANIFEST"
+            FIRST=0
+          done
+          printf \']\n\' >> "$MANIFEST"
+          URL=$(cat /etc/rfm-webhook/url 2>/dev/null || echo "")
+          SECRET=$(cat /etc/rfm-webhook/secret 2>/dev/null || echo "")
+          SID=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "")
+          if [ -n "$URL" ] && [ -n "$SECRET" ] && [ -n "$SID" ]; then
+            PAYLOAD=$(printf \
+              \'{"service_id":%s,"order_num":"%s","secret":"%s","files":%s}\' \
+              "$SID" "$ORDER_NUM" "$SECRET" "$(cat $MANIFEST)")
+            curl -sf -X POST -H "Content-Type: application/json" \
+              -d "$PAYLOAD" "$URL" || true
+          fi
+          SCRIPT
+          chmod +x /backup.sh
+          echo "0 3 * * * /backup.sh >> /var/log/backup.log 2>&1" | crontab -
+          crond -f -l 2
+        env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rfm-db-admin-' . $orderNum . '
+              key: password
+        volumeMounts:
+        - mountPath: /var/lib/odoo
+          name: odoo-data
+          subPath: odoo
+        - mountPath: /backups
+          name: nfs-backups
+        - mountPath: /etc/rfm-db
+          name: rfm-db-admin
+          readOnly: true
+        - mountPath: /etc/rfm-webhook
+          name: rfm-webhook-config
+          readOnly: true';
+
+    // Find Deployment block and insert sidecar before restartPolicy
+    $pattern = '/(kind:\s*Deployment.*?)(^\s{6}restartPolicy:)/ms';
+    $newContent = preg_replace($pattern, '${1}' . $sidecarContainer . "\n" . '${2}', $yamlContent);
+    if (!$newContent) {
+        throw new \Exception("Failed to inject sidecar container before restartPolicy");
+    }
+    $yamlContent = $newContent;
+    RancherFleet\Logger::info("injectBackupSidecar: sidecar container injected before restartPolicy");
+
+    // Step 4: Add volumes ONLY within Deployment if not already present
+    // Look for Deployment's volumes: section specifically (after the Deployment kind: line)
+    // and insert before "      - name: config" which is always the first volume in the template
+    $nfsVolume = '      - name: nfs-backups
+        nfs:
+          server: 162.35.166.55
+          path: /export/share1';
+    $dbVolume = '      - name: rfm-db-admin
+        secret:
+          secretName: rfm-db-admin-' . $orderNum;
+    $webhookVolume = '      - name: rfm-webhook-config
+        secret:
+          secretName: rfm-webhook-' . $orderNum;
+
+    // Check if volumes already exist (look for them anywhere in Deployment)
+    $deploymentHasVolumes = preg_match('/kind:\s*Deployment.*?rfm-db-admin/is', $yamlContent);
+    $deploymentHasNfsVolume = preg_match('/kind:\s*Deployment.*?nfs-backups/is', $yamlContent);
+
+    if (!$deploymentHasVolumes || !$deploymentHasNfsVolume) {
+        // Find Deployment block's volumes section and insert before "      - name: config"
+        // Pattern: start from "kind: Deployment", find "volumes:", then "- name: config"
+        $volumePattern = '/(kind:\s*Deployment.*?)(^\s{6}volumes:\s*\n)(^\s{6}- name: config)/ms';
+        $volumeInsert = (!$deploymentHasNfsVolume ? $nfsVolume . "\n" : '')
+                       . (!$deploymentHasVolumes ? $dbVolume . "\n" . $webhookVolume . "\n" : '');
+        $newContent = preg_replace(
+            $volumePattern,
+            '${1}${2}' . $volumeInsert . '${3}',
+            $yamlContent
+        );
+        if (!$newContent) {
+            throw new \Exception("Failed to inject backup volumes into Deployment volumes section");
+        }
+        $yamlContent = $newContent;
+        RancherFleet\Logger::info("injectBackupSidecar: backup volumes (NFS + secrets) injected into Deployment");
+    } else {
+        RancherFleet\Logger::info("injectBackupSidecar: backup volumes already present in Deployment");
+    }
+
+    // Step 5: Atomic validation — verify sidecar and all volumes are now present
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+backup\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: backup sidecar container not found after injection");
+    }
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+nfs-backups\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: nfs-backups volume not found after injection");
+    }
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+rfm-db-admin\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: rfm-db-admin volume not found after injection");
+    }
+    if (!preg_match('/kind:\s*Deployment.*?- name:\s+rfm-webhook-config\s*\n/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: rfm-webhook-config volume not found after injection");
+    }
+    if (!preg_match('/mountPath:\s+\/backups\s*\n\s+name:\s+nfs-backups/is', $yamlContent)) {
+        throw new \Exception("Atomic validation failed: sidecar volumeMount for nfs-backups not found after injection");
+    }
+
+    RancherFleet\Logger::info("injectBackupSidecar: atomic validation passed - sidecar and all volumes present");
+    return $yamlContent;
+}
+
+// ---------------------------------------------------------------------------
+// Phase F: Patch an existing client branch with the latest template
+// improvements, while preserving whatever Postgres/Odoo version and PVC
+// storage size that client is already running in production.
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts version/size markers from a manifest file's CURRENT content on
+ * a client branch, so they can be restored after applying newer template
+ * content. This is what stops a template patch from silently upgrading a
+ * production instance's Postgres/Odoo version or shrinking paid-for storage.
+ *
+ * @param  string $content  Existing file content from the client branch
+ * @return array
+ */
+function rancherfleet_extractVersionMarkers($content)
+{
+    $markers = array();
+
+    if (preg_match('/image:\s*[\'"]?postgres:([\w.\-]+)[\'"]?/i', $content, $m)) {
+        $markers['pg_image_tag'] = $m[1];
+    }
+
+    if (preg_match('/postgres(\d+)\.default\.svc\.cluster\.local/i', $content, $m)) {
+        $markers['pg_host_version'] = $m[1];
+    }
+
+    if (preg_match('/image:\s*[\'"]?([^\s\'"]*odoo[^\s\'":]*):([\w.\-]+)[\'"]?/i', $content, $m)) {
+        $markers['odoo_image_repo'] = $m[1];
+        $markers['odoo_image_tag']  = $m[2];
+    }
+
+    if (preg_match('/\bstorage:\s*(\S+Gi)/i', $content, $m)) {
+        $markers['pvc_storage'] = $m[1];
+    }
+
+    return $markers;
+}
+
+/**
+ * Re-applies previously captured version/size markers into new template
+ * content, so every other improvement in the template is applied except
+ * the Postgres version, Odoo version, and provisioned PVC storage size.
+ *
+ * @param  string $content  New content fetched from the template branch
+ * @param  array  $markers  Output of rancherfleet_extractVersionMarkers()
+ * @return string
+ */
+function rancherfleet_preserveVersionMarkers($content, array $markers)
+{
+    if (isset($markers['pg_image_tag'])) {
+        $content = preg_replace(
+            '/(image:\s*[\'"]?postgres:)[\w.\-]+([\'"]?)/i',
+            '${1}' . $markers['pg_image_tag'] . '$2',
+            $content
+        );
+    }
+
+    if (isset($markers['pg_host_version'])) {
+        $content = preg_replace(
+            '/postgres\d+(\.default\.svc\.cluster\.local)/i',
+            'postgres' . $markers['pg_host_version'] . '$1',
+            $content
+        );
+    }
+
+    if (isset($markers['odoo_image_repo']) && isset($markers['odoo_image_tag'])) {
+        $content = preg_replace(
+            '/(image:\s*[\'"]?)[^\s\'"]*odoo[^\s\'":]*:[\w.\-]+([\'"]?)/i',
+            '${1}' . $markers['odoo_image_repo'] . ':' . $markers['odoo_image_tag'] . '$2',
+            $content
+        );
+    }
+
+    if (isset($markers['pvc_storage'])) {
+        $content = preg_replace(
+            '/(\bstorage:\s*)\S+Gi/i',
+            '${1}' . $markers['pvc_storage'],
+            $content,
+            1
+        );
+    }
+
+    return $content;
+}
+
+/**
+ * Refreshes the webhook Secret (rfm-webhook-{orderNum}) for an existing
+ * instance. Allows admins to fix an instance that has an incorrect webhook
+ * URL or credentials without needing kubectl access.
+ */
+function rancherfleet_RefreshWebhookSecret(array $params)
+{
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+
+        rancherfleet_createDbAdminSecret($params, $rancher, $namespace, $orderNum);
+
+        RancherFleet\Logger::info("RefreshWebhookSecret: SUCCESS - recreated Secrets for {$namespace}");
+        return 'Success: rfm-db-admin and rfm-webhook Secrets have been recreated with current values.';
+    } catch (Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("RefreshWebhookSecret FAILED:\n" . $detail);
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+function rancherfleet_RemoveCustomUrl(array $params)
+{
+    try {
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        // Read stored custom URL from tbladdonmodules
+        RancherFleet\Logger::info("RemoveCustomUrl: reading stored URL for service {$serviceId}");
+        $customUrl = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_custom_url')
+            ->where('setting', 'url_' . $serviceId)
+            ->value('value');
+
+        if (!$customUrl) {
+            RancherFleet\Logger::info("RemoveCustomUrl: no custom URL found for service {$serviceId}");
+            return 'Error: No custom URL found for this service';
+        }
+
+        RancherFleet\Logger::info("RemoveCustomUrl: found custom URL {$customUrl}");
+
+        // Build clients
+        list($rancher, $github, $fleet) = rancherfleet_buildClients($params);
+
+        // Read odoo.yml from client branch
+        RancherFleet\Logger::info("RemoveCustomUrl: reading odoo.yml from {$namespace}");
+        $manifestContent = $github->getClientFileContent($namespace, 'odoo.yml');
+        if (!$manifestContent) {
+            RancherFleet\Logger::error("RemoveCustomUrl: failed to read odoo.yml from {$namespace}");
+            return 'Error: Could not read manifest file. Please contact support.';
+        }
+        RancherFleet\Logger::info("RemoveCustomUrl: odoo.yml read successfully");
+
+        // Search for the custom subdomain in the manifest
+        if (strpos($manifestContent, $customUrl) === false) {
+            RancherFleet\Logger::error("RemoveCustomUrl: custom subdomain '{$customUrl}' not found in odoo.yml");
+            return 'Error: Custom subdomain not found in manifest. Please contact support.';
+        }
+        RancherFleet\Logger::info("RemoveCustomUrl: found custom subdomain '{$customUrl}' in manifest");
+
+        // Replace all occurrences of custom subdomain with www.{orderNum}.com
+        $restoreString = 'www.' . $orderNum . '.com';
+        RancherFleet\Logger::info("RemoveCustomUrl: replacing '{$customUrl}' with '{$restoreString}'");
+        $updated = str_replace($customUrl, $restoreString, $manifestContent);
+
+        // Verify the replacement actually worked
+        if ($updated === $manifestContent) {
+            RancherFleet\Logger::error("RemoveCustomUrl: str_replace failed - content unchanged");
+            return 'Error: Could not update manifest. Please contact support.';
+        }
+
+        // Verify restore string now appears in the updated content
+        if (strpos($updated, $restoreString) === false) {
+            RancherFleet\Logger::error("RemoveCustomUrl: restore string '{$restoreString}' not found in updated manifest");
+            return 'Error: Manifest restoration verification failed. Please contact support.';
+        }
+        RancherFleet\Logger::info("RemoveCustomUrl: manifest updated successfully");
+
+        // Write updated manifest back
+        RancherFleet\Logger::info("RemoveCustomUrl: writing updated odoo.yml to {$namespace}");
+        $github->writeFileToBranch(
+            'odoo.yml',
+            $updated,
+            $namespace,
+            'Remove custom subdomain: ' . $customUrl
+        );
+        RancherFleet\Logger::info("RemoveCustomUrl: odoo.yml written successfully");
+
+        // Delete tbladdonmodules record so client area resets to form
+        RancherFleet\Logger::info("RemoveCustomUrl: deleting tbladdonmodules record");
+        \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_custom_url')
+            ->where('setting', 'url_' . $serviceId)
+            ->delete();
+        RancherFleet\Logger::info("RemoveCustomUrl: tbladdonmodules record deleted");
+
+        rancherfleet_logHistory($params, 'Custom Subdomain Removed', $customUrl);
+        RancherFleet\Logger::info("RemoveCustomUrl: SUCCESS - removed {$customUrl} from {$namespace}");
+
+        return "Success: Custom subdomain {$customUrl} has been removed. The Ingress has been updated and will sync shortly.";
+
+    } catch (Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("RemoveCustomUrl FAILED:\n" . $detail);
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+function rancherfleet_PatchTemplateUpdates(array $params)
+{
+    try {
+        list($rancher, $github) = rancherfleet_buildClients($params);
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+
+        if (!$github->branchExists($namespace)) {
+            return "Error: client branch '{$namespace}' does not exist - nothing to patch.";
+        }
+
+        $templateFiles = $github->getTemplateFileList();
+        if (empty($templateFiles)) {
+            return 'Error: no files found on template branch.';
+        }
+
+        $added     = array();
+        $updated   = array();
+        $unchanged = array();
+
+        foreach ($templateFiles as $item) {
+            if (!isset($item['type']) || $item['type'] !== 'file') {
+                continue;
+            }
+
+            $filename   = $item['name'];
+            $newContent = $github->getTemplateFileContent($item['path']);
+            $newContent = $github->applyNamespaceSubstitution($newContent, $namespace, $orderNum);
+
+            $existing = $github->getClientFileContent($namespace, $filename);
+
+            if ($existing === null) {
+                // Template file the client never had (added since they were
+                // provisioned) - nothing to preserve, safe to add as-is.
+                $github->writeFileToBranch(
+                    $filename,
+                    $newContent,
+                    $namespace,
+                    "chore: patch {$namespace} - add new template file {$filename}"
+                );
+                $added[] = $filename;
+                continue;
+            }
+
+            $markers = rancherfleet_extractVersionMarkers($existing);
+            $patched = rancherfleet_preserveVersionMarkers($newContent, $markers);
+
+            if ($patched === $existing) {
+                $unchanged[] = $filename;
+                continue;
+            }
+
+            $github->writeFileToBranch(
+                $filename,
+                $patched,
+                $namespace,
+                "chore: patch {$namespace} - apply template updates (postgres/odoo versions and storage size preserved)"
+            );
+            $updated[] = $filename;
+        }
+
+        $summary = "Patched '{$namespace}': "
+                 . count($updated)   . ' file(s) updated, '
+                 . count($added)     . ' file(s) added, '
+                 . count($unchanged) . ' file(s) already current.';
+
+        if (!empty($updated)) $summary .= ' Updated: ' . implode(', ', $updated) . '.';
+        if (!empty($added))   $summary .= ' Added: '   . implode(', ', $added) . '.';
+
+        rancherfleet_logHistory($params, 'Template Patched', $summary);
+        RancherFleet\Logger::info("PatchTemplateUpdates: {$summary}");
+
+        return "Success: {$summary} Postgres/Odoo versions and storage size were left untouched. Fleet will auto-sync the change within ~15s.";
+
+    } catch (\Exception $e) {
+        $detail = rancherfleet_exceptionDetail($e);
+        RancherFleet\Logger::error("PatchTemplateUpdates FAILED:\n" . $detail);
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -2898,6 +3860,16 @@ function rancherfleet_ClientArea(array $params)
                 exit;
             }
         }
+    } elseif ($action === 'backup_restore') {
+        $filename = isset($_POST['backup_file']) ? basename($_POST['backup_file']) : '';
+        $backupType = isset($_POST['backup_type']) ? $_POST['backup_type'] : '';
+        if ($filename && $backupType) {
+            $message = rancherfleet_handleBackupRestore($params, $namespace, $orderNum, $filename, $backupType);
+        } else {
+            $message = 'error:Invalid backup file or type';
+        }
+    } elseif ($action === 'custom_url_connect') {
+        $message = rancherfleet_handleCustomUrlConnect($params, $namespace, $orderNum);
     }
 
     // Build the output
@@ -3155,6 +4127,7 @@ function rancherfleet_domainPanelHtml(array $params, $namespace, $orderNum)
 {
     $html = '<div class="rfm-ca-card">';
     $html .= '<h4>Domain Name</h4>';
+    $html .= rancherfleet_creditBalanceHtml($params);
 
     // See buildDomainClients() comment re: confirmed numbered positions
     // for product 126 (re-confirmed 2026-06-16 after a module-dropdown
@@ -3322,6 +4295,32 @@ function rancherfleet_domainPurchaseModal($sld, $tld, $serviceUrl)
     return $html;
 }
 
+
+/**
+ * Renders the client's WHMCS credit balance as a small styled badge.
+ * Reads from tblclients.credit.
+ *
+ * @param  array $params
+ * @return string  HTML badge
+ */
+function rancherfleet_creditBalanceHtml(array $params)
+{
+    $clientId = (int)$params['userid'];
+    try {
+        $client = \WHMCS\Database\Capsule::table('tblclients')
+            ->where('id', $clientId)
+            ->first(['credit']);
+        if (!$client) {
+            return '';
+        }
+        $creditBalance = (float)$client->credit;
+        $currency = isset($params['clientsdetails']['currency_code'])
+                  ? $params['clientsdetails']['currency_code'] : 'USD';
+        return '<div style="display:inline-block;background:#e8f4f8;border:1px solid #a8d5dd;color:#0c5460;padding:6px 12px;border-radius:12px;font-size:11px;font-weight:bold;margin-bottom:12px;">&#127874; Credit Balance: <strong>' . $currency . ' ' . number_format($creditBalance, 2) . '</strong></div>';
+    } catch (\Exception $e) {
+        return '';
+    }
+}
 
 /**
  * Reads storage upgrade configuration from params.
@@ -3528,6 +4527,153 @@ function rancherfleet_handleStorageUpgrade(array $params, $namespace, $orderNum)
 }
 
 /**
+ * Handles a custom subdomain connection POST from the client area.
+ * Validates subdomain format, verifies CNAME DNS record, updates odoo.yml Ingress.
+ *
+ * @return string  'custom_url_success:{subdomain}' | 'custom_url_error:{message}'
+ */
+function rancherfleet_handleCustomUrlConnect(array $params, $namespace, $orderNum)
+{
+    $subdomain = isset($_POST['custom_url_subdomain']) ? trim($_POST['custom_url_subdomain']) : '';
+    $serviceId = (int)$params['serviceid'];
+
+    if (!$subdomain) {
+        return 'custom_url_error:Subdomain is required.';
+    }
+
+    // Validate subdomain format: must be subdomain.domain.tld (at least one dot + prefix)
+    // Reject bare domains without subdomain prefix
+    $parts = explode('.', $subdomain);
+    if (count($parts) < 3) {
+        return 'custom_url_error:Enter a subdomain (e.g. www.yourdomain.com), not a bare domain (yourdomain.com).';
+    }
+
+    // Validate each label: letters, numbers, hyphens only
+    foreach ($parts as $label) {
+        if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i', $label)) {
+            return 'custom_url_error:Invalid subdomain format. Use letters, numbers, and hyphens only.';
+        }
+    }
+
+    // Reject webdiscode.com subdomains
+    $rootDomain = implode('.', array_slice($parts, -2));
+    if (strtolower($rootDomain) === 'webdiscode.com') {
+        return 'custom_url_error:Cannot use a webdiscode.com subdomain. Enter your own custom domain.';
+    }
+
+    // Verify CNAME record points to cowboy.webdiscode.com
+    $cnameTarget = 'cowboy.webdiscode.com';
+    $dnsRecords = @dns_get_record($subdomain, DNS_CNAME);
+    $cnameFound = false;
+
+    if ($dnsRecords && is_array($dnsRecords)) {
+        foreach ($dnsRecords as $record) {
+            if (isset($record['target'])) {
+                $target = rtrim($record['target'], '.');
+                if (strtolower($target) === strtolower($cnameTarget)) {
+                    $cnameFound = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!$cnameFound) {
+        return 'custom_url_error:Could not verify CNAME record. Please ensure ' . htmlspecialchars($subdomain)
+            . ' points to ' . $cnameTarget . ' and try again. DNS changes can take up to 24 hours to propagate.';
+    }
+
+    try {
+        list($rancher, $github, $fleet) = rancherfleet_buildClients($params);
+
+        // Read odoo.yml from client branch
+        RancherFleet\Logger::info("handleCustomUrlConnect: reading odoo.yml from {$namespace}");
+        $manifestContent = $github->getClientFileContent($namespace, 'odoo.yml');
+        if (!$manifestContent) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: failed to read odoo.yml from {$namespace}");
+            return 'custom_url_error:Could not read manifest file. Please contact support.';
+        }
+        RancherFleet\Logger::info("handleCustomUrlConnect: odoo.yml read successfully, size=" . strlen($manifestContent) . " bytes");
+
+        // Search for the default www.{orderNum}.com host in the manifest
+        $searchString = 'www.' . $orderNum . '.com';
+        if (strpos($manifestContent, $searchString) === false) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: search string '{$searchString}' not found in odoo.yml");
+            return 'custom_url_error:Could not find default domain in manifest. Please contact support.';
+        }
+        RancherFleet\Logger::info("handleCustomUrlConnect: found '{$searchString}' in manifest");
+
+        // Replace all occurrences of www.{orderNum}.com with the custom subdomain
+        RancherFleet\Logger::info("handleCustomUrlConnect: replacing '{$searchString}' with '{$subdomain}'");
+        $updated = str_replace($searchString, $subdomain, $manifestContent);
+
+        // Verify the replacement actually worked
+        if ($updated === $manifestContent) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: str_replace failed - content unchanged");
+            return 'custom_url_error:Could not update manifest. Please contact support.';
+        }
+
+        // Verify subdomain now appears in the updated content
+        if (strpos($updated, $subdomain) === false) {
+            RancherFleet\Logger::error("handleCustomUrlConnect: subdomain '{$subdomain}' not found in updated manifest");
+            return 'custom_url_error:Manifest update verification failed. Please contact support.';
+        }
+        RancherFleet\Logger::info("handleCustomUrlConnect: manifest updated successfully");
+
+        // Write updated manifest back
+        RancherFleet\Logger::info("handleCustomUrlConnect: writing updated odoo.yml to {$namespace}");
+        $github->writeFileToBranch(
+            'odoo.yml',
+            $updated,
+            $namespace,
+            'Connect custom subdomain: ' . $subdomain
+        );
+        RancherFleet\Logger::info("handleCustomUrlConnect: odoo.yml written successfully");
+
+        // Store the custom subdomain in tbladdonmodules
+        $table = \WHMCS\Database\Capsule::table('tbladdonmodules');
+        $setting = 'url_' . $serviceId;
+        $existing = $table->where('module', 'rancherfleet_custom_url')
+            ->where('setting', $setting)
+            ->first();
+
+        if ($existing) {
+            $table->where('module', 'rancherfleet_custom_url')
+                ->where('setting', $setting)
+                ->update(['value' => $subdomain]);
+            RancherFleet\Logger::info("handleCustomUrlConnect: updated tbladdonmodules");
+        } else {
+            $table->insert([
+                'module'  => 'rancherfleet_custom_url',
+                'setting' => $setting,
+                'value'   => $subdomain,
+            ]);
+            RancherFleet\Logger::info("handleCustomUrlConnect: inserted into tbladdonmodules");
+        }
+
+        rancherfleet_logHistory($params, 'Custom Subdomain Connected', $subdomain);
+        RancherFleet\Logger::info("handleCustomUrlConnect: SUCCESS {$namespace} -> {$subdomain}");
+
+        return 'custom_url_success:' . $subdomain;
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("handleCustomUrlConnect: EXCEPTION " . $e->getMessage() . "\n" . $e->getTraceAsString());
+        return 'custom_url_error:' . $e->getMessage();
+    }
+}
+
+/**
+ * Adds a custom subdomain to the Ingress resource in odoo.yml.
+ * Updates both spec.tls[0].hosts and spec.rules to include the new subdomain.
+ * Uses reliable markers (secretName anchor for TLS, comment markers for rules).
+ *
+ * @param  string $yamlContent  The odoo.yml file content
+ * @param  string $subdomain    The subdomain to add (e.g. www.yourdomain.com)
+ * @param  int    $orderNum     The order number for service name
+ * @return string  Updated YAML content
+ * @throws Exception if injection patterns fail to match
+ */
+/**
  * Renders the storage usage card and upgrade panel for the client area.
  *
  * @param  array  $params
@@ -3549,6 +4695,7 @@ function rancherfleet_storagePanelHtml(array $params, $namespace, $serviceUrl, $
 
     $html  = '<div class="rfm-ca-card">';
     $html .= '<h4>Storage</h4>';
+    $html .= rancherfleet_creditBalanceHtml($params);
 
     // Try to get live usage
     $usage = rancherfleet_getStorageUsage($params, $namespace, $pvcName);
@@ -3740,6 +4887,16 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-error">&#10007; Payment declined: ' . htmlspecialchars(substr($message, strlen('storage_declined:'))) . '</div>';
     } elseif (strpos($message, 'storage_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('storage_error:'))) . '</div>';
+    } elseif (strpos($message, 'backup_restore_success:') === 0) {
+        $backupInfo = substr($message, strlen('backup_restore_success:'));
+        $html .= '<div class="rfm-alert-success">&#10003; Backup restored successfully. Your instance will be back online shortly.</div>';
+    } elseif (strpos($message, 'backup_restore_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; Restore failed: ' . htmlspecialchars(substr($message, strlen('backup_restore_error:'))) . '</div>';
+    } elseif (strpos($message, 'custom_url_success:') === 0) {
+        $subdomain = substr($message, strlen('custom_url_success:'));
+        $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars($subdomain) . ' has been connected. Your SSL certificate will be issued automatically within a few minutes.</div>';
+    } elseif (strpos($message, 'custom_url_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('custom_url_error:'))) . '</div>';
     }
 
     try {
@@ -3810,6 +4967,73 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '</div>';
         $html .= '</div>';
         $html .= '</div>'; // instance link card
+
+        // -----------------------------------------------------------------------
+        // Custom Subdomain Ingress Card
+        // -----------------------------------------------------------------------
+        $customSubdomain = null;
+        try {
+            $customUrlData = \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_custom_url')
+                ->where('setting', 'url_' . $serviceId)
+                ->value('value');
+            if ($customUrlData) {
+                $customSubdomain = $customUrlData;
+            }
+        } catch (\Exception $e) {
+            // Continue without custom subdomain
+        }
+
+        $html .= '<div class="rfm-ca-card">';
+        $html .= '<h4>Connect a Custom Domain</h4>';
+
+        if ($customSubdomain) {
+            $html .= '<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px;">';
+            $html .= '<p style="font-size:12px;color:#666;margin:0 0 8px;">Connected subdomain:</p>';
+            $html .= '<div style="display:flex;align-items:center;gap:10px;">';
+            $html .= '<span style="font-size:13px;font-weight:bold;color:#2980b9;font-family:monospace;">' . htmlspecialchars($customSubdomain) . '</span>';
+            $html .= '<a href="https://' . htmlspecialchars($customSubdomain) . '" target="_blank" style="color:#2980b9;text-decoration:none;font-size:13px;">&#8599;</a>';
+            $html .= '</div>';
+            $html .= '<p style="font-size:11px;color:#888;margin:8px 0 0;">To change or remove this subdomain, contact support.</p>';
+            $html .= '</div>';
+        } else {
+            $html .= '<div style="background:#e3f2fd;border:1px solid #90caf9;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="font-size:12px;color:#1565c0;margin:0 0 8px;line-height:1.4;"><strong>Instructions:</strong> Enter a subdomain you have pointed to cowboy.webdiscode.com via a CNAME record. Use a subdomain only (e.g. www.yourdomain.com, app.yourdomain.com) — do not enter a root domain (yourdomain.com) as this can break email and other services on your domain. Your registrar\'s DNS settings should have:</p>';
+            $html .= '<div style="font-family:monospace;font-size:11px;background:#fff;border:1px solid #90caf9;border-radius:4px;padding:8px;margin:0;color:#1565c0;"><strong>Type:</strong> CNAME  |  <strong>Host:</strong> www  |  <strong>Value:</strong> cowboy.webdiscode.com</div>';
+            $html .= '</div>';
+            $html .= '<form method="post" action="' . $serviceUrl . '">';
+            $html .= '<div style="margin-bottom:12px;">';
+            $html .= '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">';
+            $html .= '<input type="checkbox" name="custom_url_enable" id="custom_url_enable" onchange="document.getElementById(\'custom_url_form\').style.display=this.checked?\'block\':\'none\'" style="cursor:pointer;">';
+            $html .= '<span>I have set up the CNAME record for my subdomain</span>';
+            $html .= '</label>';
+            $html .= '</div>';
+            $html .= '<div id="custom_url_form" style="display:none;margin-bottom:12px;">';
+            $html .= '<label style="display:block;font-size:12px;font-weight:bold;margin:0 0 6px;color:#333;">Subdomain</label>';
+            $html .= '<input type="text" name="custom_url_subdomain" placeholder="www.yourdomain.com" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;box-sizing:border-box;margin-bottom:10px;">';
+            $html .= '</div>';
+            $html .= '<input type="hidden" name="clientaction" value="custom_url_connect">';
+            $html .= '<button type="submit" id="custom_url_btn" disabled style="background:#2980b9;color:#fff;border:none;border-radius:4px;padding:8px 18px;font-size:13px;font-weight:bold;cursor:not-allowed;opacity:0.5;">Verify & Connect</button>';
+            $html .= '<script>
+                document.getElementById("custom_url_enable").addEventListener("change", function() {
+                    const btn = document.getElementById("custom_url_btn");
+                    const input = document.querySelector("input[name=custom_url_subdomain]");
+                    if (this.checked) {
+                        input.addEventListener("input", function() {
+                            btn.disabled = !this.value.trim();
+                            btn.style.opacity = this.value.trim() ? "1" : "0.5";
+                            btn.style.cursor = this.value.trim() ? "pointer" : "not-allowed";
+                        });
+                    } else {
+                        btn.disabled = true;
+                        btn.style.opacity = "0.5";
+                        btn.style.cursor = "not-allowed";
+                    }
+                });
+            </script>';
+            $html .= '</form>';
+        }
+        $html .= '</div>';
 
         // -----------------------------------------------------------------------
         // Status Card
@@ -3912,13 +5136,43 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         if (!$isSuspended && !empty($status['pods'])) {
             $firstPod = $status['pods'][0];
             try {
-                $rawLogs = $rancher->getPodLogs(
-                    $namespace,
-                    $firstPod['name'],
-                    $firstPod['container_name'],
-                    3600,
-                    200
-                );
+                $rawLogs = null;
+                try {
+                    $rawLogs = $rancher->getPodLogs(
+                        $namespace,
+                        $firstPod['name'],
+                        $firstPod['container_name'],
+                        3600,
+                        200
+                    );
+                } catch (RancherApiException $logEx) {
+                    if ($logEx->getHttpCode() === 404) {
+                        // Pod name stale — fetch current pods and retry with first Running pod
+                        $freshPods = $rancher->listPods($namespace);
+                        $runningPod = null;
+                        foreach ($freshPods as $pod) {
+                            if (isset($pod['status']['phase']) && $pod['status']['phase'] === 'Running') {
+                                $runningPod = $pod;
+                                break;
+                            }
+                        }
+                        if ($runningPod) {
+                            $podName = isset($runningPod['metadata']['name']) ? $runningPod['metadata']['name'] : '';
+                            $containerName = '';
+                            $podContainers = isset($runningPod['spec']['containers']) ? $runningPod['spec']['containers'] : array();
+                            foreach ($podContainers as $pc) {
+                                $containerName = isset($pc['name']) ? $pc['name'] : '';
+                                break;
+                            }
+                            if ($podName && $containerName) {
+                                $rawLogs = $rancher->getPodLogs($namespace, $podName, $containerName, 3600, 200);
+                            }
+                        }
+                    }
+                    if (!$rawLogs) {
+                        throw $logEx;
+                    }
+                }
 
                 // Colorise log lines
                 $lines      = explode("\n", $rawLogs);

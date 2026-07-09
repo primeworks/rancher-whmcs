@@ -320,6 +320,101 @@ class GitHubClient
     }
 
     /**
+     * Lists all files at the root of the template branch (odoo-0000).
+     * Public wrapper around listTemplateFiles() for callers that need to
+     * patch an existing client branch with newer template content.
+     *
+     * @return array  Array of file objects from GitHub contents API
+     */
+    public function getTemplateFileList()
+    {
+        return $this->listTemplateFiles();
+    }
+
+    /**
+     * Fetches the raw content of a file from the template branch.
+     *
+     * @param  string $path
+     * @return string
+     */
+    public function getTemplateFileContent($path)
+    {
+        return $this->getFileContent($path, $this->templateBranch);
+    }
+
+    /**
+     * Fetches the raw content of a file from a client's branch.
+     * Returns null (instead of throwing) if the file does not exist on
+     * that branch — used to detect newly-added template files that an
+     * older client branch has never had.
+     *
+     * @param  string $namespace
+     * @param  string $path
+     * @return string|null
+     */
+    public function getClientFileContent($namespace, $path)
+    {
+        $clientBranch = $this->clientBranch($namespace);
+        try {
+            return $this->getFileContent($path, $clientBranch);
+        } catch (GitHubApiException $e) {
+            if ($e->getHttpCode() === 404) {
+                return null;
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Lists all branches in the repository that match a pattern.
+     * Returns array of branch names (e.g., ['whmcs-client-123', 'whmcs-client-456', ...])
+     *
+     * @param  string $pattern  Optional glob pattern to filter branches (default: all)
+     * @return array            Array of matching branch names
+     */
+    public function listBranches($pattern = null)
+    {
+        $url = self::API_BASE . '/repos/' . $this->owner . '/' . $this->repo . '/branches?per_page=100';
+        $branches = array();
+        $page = 1;
+
+        while (true) {
+            $response = $this->request('GET', $url . '&page=' . $page);
+            if (empty($response)) {
+                break;
+            }
+
+            foreach ($response as $branch) {
+                $branchName = $branch['name'];
+                if ($pattern === null || strpos($branchName, $pattern) === 0) {
+                    $branches[] = $branchName;
+                }
+            }
+
+            if (count($response) < 100) {
+                break;
+            }
+            $page++;
+        }
+
+        return $branches;
+    }
+
+    /**
+     * Public wrapper around substituteNamespace() for callers outside the
+     * bootstrap flow that need the same 0000 -> orderNum substitution.
+     *
+     * @param  string $content
+     * @param  string $namespace
+     * @param  int    $serviceId
+     * @return string
+     */
+    public function applyNamespaceSubstitution($content, $namespace, $serviceId)
+    {
+        return $this->substituteNamespace($content, $namespace, $serviceId);
+    }
+
+    /**
      * Updates the storage size for a named PVC in the client's Git branch.
      *
      * Scans all files on the client branch, finds the one containing both
@@ -518,6 +613,7 @@ class GitHubClient
         curl_setopt($ch, CURLOPT_URL,            $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT,        $this->timeout);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST,  strtoupper($method));
         curl_setopt($ch, CURLOPT_HTTPHEADER,     $headers);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);

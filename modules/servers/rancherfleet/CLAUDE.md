@@ -50,6 +50,65 @@ Module Settings slots (`configoption1`–`24`) are product-specific and can drif
 - Longhorn API proxied via Rancher:
   `/k8s/clusters/{targetClusterId}/api/v1/namespaces/longhorn-system/services/longhorn-backend:9500/proxy/v1/...`
 
+### configoption access pattern is inconsistent (unresolved)
+Despite the confirmed rule above, several helper functions still read
+`$params['configoptions']['Friendly Name']` (the customer-facing Configurable
+Options array) instead of the numbered `configoptionN` slot — which the
+module's own code comments confirm is the wrong array for Module Settings:
+- Affected: `rancherfleet_isAutomatic()`, `rancherfleet_getGraceHours()`,
+  `rancherfleet_getContainerLimits()`, `rancherfleet_getCustomImage()`,
+  `rancherfleet_isDryRun()`, `rancherfleet_getUserCount()` — plus the first
+  fallback step of `rancherfleet_getOdooImageVersion()` / `rancherfleet_getDbServer()`.
+- Correctly-fixed examples use `configoptionN` directly:
+  `rancherfleet_buildDomainClients()` (configoption10-13),
+  `rancherfleet_getStorageConfig()` (configoption17-19),
+  `rancherfleet_createDbAdminSecret()` (configoption20-22), `rancherfleet_getConfig()`.
+- Practical effect: Automatic Provisioning, Suspend Grace Hours, Container
+  CPU/Memory overrides, Custom Image, Dry Run Mode, and User Count likely
+  always fall through to their hardcoded defaults from Module Settings —
+  they'd only pick up a value if the same friendly name also happens to be
+  set up as a WHMCS Configurable Option on the product.
+- If a Module Settings field doesn't seem to take effect, check whether the
+  reading function uses `configoptions[]` (probably broken) before assuming
+  it's a slot-drift issue.
+
+### configoption slots are nearly full
+`_ConfigOptions()` currently defines 22 fields (configoption1–22 in
+definition order) against a hard cap of 24 — only 2 slots remain for future
+Module Settings fields. `configoption22` = Backup Auth Secret.
+
+### Domain retry queue is defined but never runs
+`DomainRetryStore::getDueOrders()` and `DomainOrderManager::retryPendingOrder()`
+exist and are fully implemented, but nothing in the codebase calls them — no
+cron hook processes pending/failed domain registrations. The `CronJob` hook
+in `includes/hooks/rancherfleet.php` only drains `RancherFleet\RetryQueue`
+(infrastructure provisioning phases: TestConnection, CreateNamespace,
+BootstrapGithub, CreateGitRepo). The "Clear Retry Queue" admin button also
+only clears that infrastructure queue, not pending domain orders. A domain
+purchase that fails registration will sit in `pending_orders` (see table
+below) indefinitely unless something is added to process it.
+
+### Retry queue cron only loads configoption1-9
+`rancherfleet_loadParamsForService()` in `includes/hooks/rancherfleet.php`
+(used by the `CronJob` hook to rebuild `$params` for retried phases) only
+copies `configoption1`–`configoption9`. This happens to cover everything the
+four current retry phases need, but if a new phase is ever added to
+`RancherFleet\RetryQueue` that depends on a later slot (e.g. ResellersPanel
+or Backup Auth Secret settings), it silently won't see that value via cron —
+extend the loop range at the same time.
+
+### Migration hook depends on files outside this repo
+`includes/hooks/rancherfleet_migration.php` requires
+`modules/addons/rancherfleet_migration/RancherExec.php` and
+`MigrationSafetyChecker.php`, which are **not present in this repository**.
+The hook will fatal if that addon module isn't deployed separately on the
+server.
+
+### Stray duplicate file
+`modules/servers/rancherfleet/lib/DomainOrderManager.php` is an unused,
+byte-identical duplicate of `lib/Domains/DomainOrderManager.php`. The module
+only ever `require_once`s the one under `lib/Domains/`.
+
 ### ResellersPanel API
 - All responses are wrapped in a numbered envelope: `{"1": {...actual response...}}`
 - Use `unwrapResponse()` before calling `assertNoError()`
@@ -65,26 +124,72 @@ Module Settings slots (`configoption1`–`24`) are product-specific and can drif
 - Database name pattern: `odoo-{orderNum}` (same)
 - Filestore mount path: `/var/lib/odoo`
 
-## Client area panels (rendered in order)
+## Client area panels (rendered in order, each its own `.rfm-ca-card`)
 
 1. **Your Odoo Instance** — default URL + custom domain + login instructions
-2. **Instance Status** — pod status, Fleet sync, logs, restart button
-3. **Domain Name** — search/purchase via ResellersPanel, reconnect existing
-4. **Storage** — Longhorn usage bar, upgrade flow (charges credit balance)
-5. **Backups** — lists from cached manifest, signed download links
+2. **Instance Status** — badge (running/suspended/starting/offline), pod rows, image version
+3. **Configuration Sync** — Fleet GitRepo sync state, commit, last sync time (skipped silently on error)
+4. **Instance Log — Past Hour** — colourised last 200 lines from the first pod (skipped while suspended)
+5. **Actions** — restart button (scales to 0 then back to 1); hidden while suspended
+6. **Domain Name** — search/purchase via ResellersPanel, reconnect existing (`rancherfleet_domainPanelHtml()`)
+7. **Storage** — Longhorn usage bar, upgrade flow (`rancherfleet_storagePanelHtml()`)
+8. **Backups** — lists from cached manifest, signed download links (`rancherfleet_backupPanelHtml()`)
+
+Built by `rancherfleet_clientAreaHtml()`; panels 6-8 are each a separate function.
+
+## Admin custom buttons (`rancherfleet_AdminCustomButtonArray()`)
+
+| Button label | Handler function |
+|--------------|-------------------|
+| 1. Test Connection | `TestConnection` |
+| 2. Create Namespace | `CreateNamespace` |
+| 3. Bootstrap GitHub | `BootstrapGithub` |
+| 4. Create GitRepo | `CreateGitRepo` |
+| Repair GitOps Target | `RepairGitRepo` |
+| 5a. Test Suspend | `TestSuspend` |
+| 5b. Test Unsuspend | `TestUnsuspend` |
+| Rollback | `Rollback` |
+| Verify Termination | `VerifyTermination` |
+| Health Check | `HealthCheck` |
+| Apply Quota | `ApplyQuota` |
+| Inject Secrets | `InjectSecrets` |
+| Get Kubeconfig | `GetKubeconfig` |
+| Collect Usage | `CollectUsage` |
+| Execute Grace Suspend | `ExecuteGraceSuspend` |
+| Dry Run | `DryRunProvision` |
+| Clear Retry Queue | `ClearRetryQueue` (infrastructure queue only — see gotchas) |
+| Push Backup CronJob | `PushBackupCronJob` |
+| Patch Template Updates | `PatchTemplateUpdates` |
+
+The Admin Services tab also renders a live phase 1-5 dashboard
+(`rancherfleet_AdminServicesTabFields()`) with Rancher deep links per
+deployment — separate from the buttons above.
 
 ## Payment system
 
-All client-facing charges (domain purchase, storage upgrade) debit the client's
-WHMCS credit balance:
-1. Check balance ≥ amount
+**Two different flows are in use, per feature — this is not one unified system:**
+
+### Domain purchase / renewal — WHMCS credit balance
+Handled by `DomainOrderManager::capturePayment()` / `refundPayment()`
+(`lib/Domains/DomainOrderManager.php`):
+1. Check credit balance ≥ amount
 2. `CreateInvoice` (status: Unpaid)
 3. `ApplyCredit` (deducts balance + marks invoice Paid atomically)
-4. Proceed with action
-5. On failure: `AddCredit` (positive amount) to refund, cancel invoice
+4. Proceed with registration
+5. On exhausted retry: `AddCredit` (positive amount) to refund, cancel invoice
 
 **Never use `AddCredit` with a negative amount** — WHMCS rejects it.
-**Never use `CaptureRemoteCardPayment`** — replaced entirely by credit flow.
+
+### Storage upgrade — stored card capture
+Handled inline in `rancherfleet_handleStorageUpgrade()` (`rancherfleet.php`):
+1. `CreateInvoice` (status: Unpaid)
+2. `CaptureRemoteCardPayment` (charges the client's stored card on file)
+3. Proceed with Longhorn PVC expansion
+4. On failure after payment: look up the transaction ID from `tblaccounts`
+   and issue `RefundTransaction`
+
+These two flows are **not interchangeable** — don't assume a fix to one
+payment path applies to the other.
 
 ## Backup system
 
@@ -113,12 +218,42 @@ All database operations use Kubernetes Jobs (not exec):
 - Credentials from `rfm-db-admin-{orderNum}` Secret
 - Webhook config from `rfm-webhook-{orderNum}` Secret
 
+## Patching existing client branches with newer template improvements
+
+`rancherfleet_PatchTemplateUpdates()` (admin button "Patch Template Updates") lets
+an admin bring an older, already-provisioned client branch up to date with
+whatever has changed on `odoo-0000` since that client was bootstrapped —
+without upgrading the Postgres/Odoo version they're running in production or
+shrinking storage they've paid to upgrade.
+
+- Walks every file at the root of `odoo-0000`, fetches the client's current
+  version of the same filename (if any), and:
+  - **File doesn't exist on the client branch** → added as-is (namespace-substituted)
+    — there's nothing to preserve, so this is how new template files (like
+    `backup-cronjob.yaml` was for old clients) reach older instances.
+  - **File exists on both** → `rancherfleet_extractVersionMarkers()` pulls the
+    Postgres image tag, the `postgres{N}.default.svc.cluster.local` host
+    version, the Odoo image repo+tag, and the PVC `storage:` size out of the
+    client's *current* file, then `rancherfleet_preserveVersionMarkers()`
+    re-stamps those exact values into the new template content before it's
+    written back. Everything else in the file (resource blocks, new fields,
+    fixed bugs, etc.) comes from the template.
+  - Unchanged files (after marker preservation) are left alone — no commit.
+- No Fleet/GitRepo changes needed — Fleet auto-syncs on branch commit (same as
+  `PushBackupCronJob` and `updatePvcStorageInManifest`).
+- Does **not** delete files removed from the template, and does **not** touch
+  CPU/memory requests — use `ApplyQuota` for resource-tier changes.
+- If you add a *new* kind of version-locked value to the templates later
+  (e.g. a Redis version), extend both `rancherfleet_extractVersionMarkers()`
+  and `rancherfleet_preserveVersionMarkers()` with a matching regex pair —
+  otherwise a patch run will silently overwrite it with the template default.
+
 ## Persistent state (tbladdonmodules JSON blobs)
 
 | module | setting | purpose |
 |--------|---------|---------|
 | `rancherfleet_domains` | `domain_records` | DomainRecordStore — ownership/expiry/DNS |
-| `rancherfleet_domains` | `pending_orders` | DomainRetryStore — failed registration queue |
+| `rancherfleet_domains` | `pending_orders` | DomainRetryStore — failed registration queue (⚠ not currently drained by any cron — see gotchas) |
 | `rancherfleet_storage` | `storage_records` | StorageUpgradeStore — PVC size + history |
 | `rancherfleet_backups` | `manifest_{serviceId}` | cached backup file listing per service |
 
@@ -128,4 +263,5 @@ All database operations use Kubernetes Jobs (not exec):
 - [ ] Check brace balance if doing large edits
 - [ ] Verify configoption slots via SQL if any Module Settings fields were added/removed
 - [ ] Test against a service on the correct product (check `pid` in debug output)
-- [ ] Check Module Log after any client area action
+- [ ] Check Module Log after any client area action (`RancherFleet\Logger` also
+      writes to `modules/servers/rancherfleet/rancherfleet.log`)

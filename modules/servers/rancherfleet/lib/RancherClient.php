@@ -49,16 +49,15 @@ class RancherClient
         $response = $this->request('GET', $url);
         $name     = isset($response['name']) ? $response['name'] : $this->clusterId;
 
-        // Check if Fleet CRDs exist on this cluster
+        // Check if Fleet CRDs exist on the local cluster
         try {
-            $fleetUrl    = $this->k8sUrl('/apis/fleet.cattle.io/v1alpha1');
+            $fleetUrl    = $this->baseUrl . '/k8s/clusters/local/apis/fleet.cattle.io/v1alpha1';
             $fleetResp   = $this->request('GET', $fleetUrl);
             $resources   = isset($fleetResp['resources']) ? $fleetResp['resources'] : array();
             $kinds = array();
             foreach ($resources as $r) {
                 $kinds[] = isset($r['kind']) ? $r['kind'] : '?';
             }
-            Logger::info("Fleet CRDs on cluster: " . implode(', ', $kinds));
         } catch (\Exception $e) {
             Logger::info("Fleet CRDs not found on cluster c-bm96f: " . $e->getMessage());
         }
@@ -925,6 +924,7 @@ class RancherClient
         curl_setopt($ch, CURLOPT_URL,            $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT,        $this->timeout);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST,  strtoupper($method));
         curl_setopt($ch, CURLOPT_HTTPHEADER,     $headers);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
