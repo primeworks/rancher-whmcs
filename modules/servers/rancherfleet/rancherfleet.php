@@ -206,6 +206,20 @@ function rancherfleet_ConfigOptions()
                             . 'Must match the secret in backup-auth.php on your web server. '
                             . 'Generate one with: openssl rand -hex 32',
         ),
+        'Odoo Upgrade Versions' => array(
+            'FriendlyName' => 'Available Upgrade Versions',
+            'Type'         => 'text',
+            'Size'         => '100',
+            'Default'      => '20.0,21.0',
+            'Description'  => 'Comma-separated list of Odoo versions available for upgrade e.g. 20.0,21.0. Only versions higher than the current instance version will be offered to customers.',
+        ),
+        'Odoo Upgrade Fees' => array(
+            'FriendlyName' => 'Upgrade Fees per Version',
+            'Type'         => 'text',
+            'Size'         => '100',
+            'Default'      => '20.0:49.00,21.0:49.00',
+            'Description'  => 'Comma-separated version:fee pairs e.g. 20.0:49.00,21.0:79.00. Fee charged from customer credit balance.',
+        ),
     );
 }
 
@@ -2352,6 +2366,341 @@ PYTHON;
 
 
 /**
+ * Handles version upgrade request from client area.
+ * Validates input, checks credit, and stores pending request.
+ *
+ * @return string  'upgrade_success:{version}' or 'upgrade_error:{message}'
+ */
+function rancherfleet_handleUpgradeRequest(array $params, $namespace, $orderNum)
+{
+    $serviceId = (int)$params['serviceid'];
+    $targetVersion = isset($_POST['upgrade_version']) ? trim($_POST['upgrade_version']) : '';
+    $acknowledged = isset($_POST['upgrade_acknowledge']) ? (bool)$_POST['upgrade_acknowledge'] : false;
+
+    RancherFleet\Logger::info("handleUpgradeRequest: {$namespace} to version {$targetVersion}");
+
+    if (!$acknowledged) {
+        return 'upgrade_error:You must acknowledge the upgrade consequences.';
+    }
+
+    if (empty($targetVersion)) {
+        return 'upgrade_error:No version selected.';
+    }
+
+    try {
+        // Get current version from deployed image
+        list($rancher) = rancherfleet_buildClients($params);
+        $status = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
+        $currentVersion = null;
+
+        if ($status['image']) {
+            if (preg_match('/odoo:([0-9.]+)/', $status['image'], $m)) {
+                $currentVersion = $m[1];
+            }
+        }
+
+        if (!$currentVersion) {
+            return 'upgrade_error:Could not determine current Odoo version.';
+        }
+
+        if (!version_compare($targetVersion, $currentVersion, '>')) {
+            return 'upgrade_error:Target version must be higher than current version (' . $currentVersion . ').';
+        }
+
+        // Get upgrade config
+        $cfg = rancherfleet_getUpgradeConfig($params);
+
+        if (!in_array($targetVersion, $cfg['versions'])) {
+            return 'upgrade_error:Target version not available for upgrade.';
+        }
+
+        $fee = isset($cfg['fees'][$targetVersion]) ? $cfg['fees'][$targetVersion] : 0;
+
+        if ($fee <= 0) {
+            return 'upgrade_error:Fee not configured for this version.';
+        }
+
+        // Check credit balance
+        $clientId = (int)$params['userid'];
+        try {
+            $creditResult = localAPI('GetClientsDetails', array('clientid' => $clientId));
+            $credits = isset($creditResult['credit']) ? (float)$creditResult['credit'] : 0;
+
+            if ($credits < $fee) {
+                return 'upgrade_error:Insufficient credit balance. Required: $' . number_format($fee, 2) . ', Available: $' . number_format($credits, 2) . '. Use the Credit Top-Up button to add funds.';
+            }
+        } catch (\Exception $e) {
+            return 'upgrade_error:Could not verify credit balance: ' . $e->getMessage();
+        }
+
+        // Store upgrade request
+        rancherfleet_storeUpgradeRequest($serviceId, $targetVersion, $fee);
+
+        // Log activity
+        rancherfleet_logHistory($params, 'Upgrade Requested', 'Upgrade to Odoo ' . $targetVersion . ' ($' . number_format($fee, 2) . ') pending admin approval');
+
+        // Send admin notification
+        try {
+            $logActivity = logActivity(
+                'Module Output',
+                'Version upgrade requested for service ' . $serviceId . ' (Order #' . $orderNum . ') to Odoo ' . $targetVersion . ' - $' . number_format($fee, 2),
+                'Rancher Fleet Module'
+            );
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("handleUpgradeRequest: activity log error (non-fatal): " . $e->getMessage());
+        }
+
+        return 'upgrade_success:' . $targetVersion;
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("handleUpgradeRequest: " . $e->getMessage());
+        rancherfleet_logHistory($params, 'Upgrade Request Error', $e->getMessage());
+        return 'upgrade_error:' . $e->getMessage();
+    }
+}
+
+
+/**
+ * Cancels a pending upgrade request.
+ */
+function rancherfleet_handleCancelUpgrade(array $params, $orderNum)
+{
+    $serviceId = (int)$params['serviceid'];
+
+    RancherFleet\Logger::info("handleCancelUpgrade: {$serviceId}");
+
+    try {
+        \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade')
+            ->where('setting', 'request_' . $serviceId)
+            ->delete();
+
+        rancherfleet_logHistory($params, 'Upgrade Request Cancelled', 'Pending upgrade request cancelled by customer');
+        return 'upgrade_cancelled:Request cancelled.';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("handleCancelUpgrade: " . $e->getMessage());
+        return 'upgrade_error:' . $e->getMessage();
+    }
+}
+
+
+/**
+ * Parses upgrade versions from comma-separated string (e.g. "19,20.0,21.0")
+ * Returns array of version strings sorted highest first.
+ */
+function rancherfleet_parseUpgradeVersions($versionString)
+{
+    if (empty($versionString)) return array();
+    $versions = array_map('trim', explode(',', $versionString));
+    $versions = array_filter($versions);
+    usort($versions, function($a, $b) {
+        return version_compare($b, $a);
+    });
+    return $versions;
+}
+
+
+/**
+ * Parses upgrade fees from comma-separated "version:fee" pairs.
+ * Returns associative array: {version => fee}.
+ */
+function rancherfleet_parseUpgradeFees($feeString)
+{
+    $fees = array();
+    if (empty($feeString)) return $fees;
+
+    foreach (explode(',', $feeString) as $pair) {
+        $parts = array_map('trim', explode(':', $pair));
+        if (count($parts) === 2 && is_numeric($parts[1])) {
+            $fees[$parts[0]] = (float)$parts[1];
+        }
+    }
+    return $fees;
+}
+
+
+/**
+ * Gets available upgrade versions and fees for a product.
+ * Returns array: ['versions' => [...], 'fees' => {...}]
+ */
+function rancherfleet_getUpgradeConfig(array $params)
+{
+    $versionString = isset($params['configoption23']) ? trim($params['configoption23']) : '';
+    $feeString = isset($params['configoption24']) ? trim($params['configoption24']) : '';
+
+    return array(
+        'versions' => rancherfleet_parseUpgradeVersions($versionString),
+        'fees'     => rancherfleet_parseUpgradeFees($feeString),
+    );
+}
+
+
+/**
+ * Gets upgrade request from tbladdonmodules if one exists.
+ * Returns array with version, fee, requested_at, status, or empty.
+ */
+function rancherfleet_getUpgradeRequest($serviceId)
+{
+    try {
+        $record = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade')
+            ->where('setting', 'request_' . $serviceId)
+            ->first();
+
+        if ($record) {
+            $data = json_decode($record->value, true);
+            if (isset($data['status']) && $data['status'] !== 'completed') {
+                return $data;
+            }
+        }
+    } catch (\Exception $e) {
+        RancherFleet\Logger::info("getUpgradeRequest: " . $e->getMessage());
+    }
+
+    return array();
+}
+
+
+/**
+ * Stores upgrade request in tbladdonmodules.
+ */
+function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee)
+{
+    try {
+        $data = array(
+            'version'      => $version,
+            'fee'          => $fee,
+            'requested_at' => time(),
+            'status'       => 'pending',
+        );
+        \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+            array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
+            array('value' => json_encode($data))
+        );
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("storeUpgradeRequest: " . $e->getMessage());
+    }
+}
+
+
+/**
+ * Renders the Upgrade Odoo Version card for the client area.
+ */
+function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentVersion)
+{
+    $serviceUrl = htmlspecialchars($_SERVER['REQUEST_URI'] ?? '');
+    $serviceId = (int)$params['serviceid'];
+    $cfg = rancherfleet_getUpgradeConfig($params);
+
+    $html = '<div class="rfm-ca-card">';
+    $html .= '<h4>Upgrade Odoo Version</h4>';
+
+    $html .= '<div style="margin-bottom:12px;">';
+    $html .= '<p style="font-size:12px;color:#666;">Your instance is running Odoo <strong>' . htmlspecialchars($currentVersion) . '</strong></p>';
+
+    // Check for pending upgrade request
+    $existingRequest = rancherfleet_getUpgradeRequest($serviceId);
+    if (!empty($existingRequest)) {
+        $html .= '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:12px;">';
+        $html .= '<p style="margin:0;font-size:12px;color:#856404;">Your upgrade request to Odoo <strong>' . htmlspecialchars($existingRequest['version']) . '</strong> is pending admin approval.</p>';
+        $html .= '<form method="post" action="' . $serviceUrl . '" style="margin-top:10px;">';
+        $html .= '<input type="hidden" name="clientaction" value="cancel_version_upgrade">';
+        $html .= '<button type="submit" style="background:#dc3545;color:#fff;border:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:bold;cursor:pointer;">Cancel Request</button>';
+        $html .= '</form>';
+        $html .= '</div>';
+        $html .= '</div>';
+        $html .= '</div>';
+        return $html;
+    }
+
+    // Filter to only higher versions
+    $availableVersions = array();
+    foreach ($cfg['versions'] as $v) {
+        if (version_compare($v, $currentVersion, '>')) {
+            $availableVersions[] = $v;
+        }
+    }
+
+    if (empty($availableVersions)) {
+        $html .= '<p style="font-size:12px;color:#888;">Your instance is already at the latest available version.</p>';
+        $html .= '</div>';
+        return $html;
+    }
+
+    $html .= '<form method="post" action="' . $serviceUrl . '">';
+    $html .= '<div style="margin-bottom:12px;">';
+    $html .= '<label style="display:block;font-size:12px;font-weight:bold;margin-bottom:6px;color:#333;">Select target version:</label>';
+    $html .= '<select name="upgrade_version" id="upgrade_version" onchange="updateUpgradeFee()" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;box-sizing:border-box;margin-bottom:10px;">';
+    $html .= '<option value="">Choose a version...</option>';
+    foreach ($availableVersions as $v) {
+        $fee = isset($cfg['fees'][$v]) ? $cfg['fees'][$v] : 0;
+        $html .= '<option value="' . htmlspecialchars($v) . '" data-fee="' . htmlspecialchars($fee) . '">' . htmlspecialchars($v) . '</option>';
+    }
+    $html .= '</select>';
+    $html .= '</div>';
+
+    $html .= '<div id="fee-display" style="display:none;margin-bottom:12px;padding:10px;background:#f8f9fa;border-radius:6px;">';
+    $html .= '<div style="font-size:12px;color:#666;">Upgrade fee: <strong id="fee-amount">$0.00</strong> (charged from your credit balance)</div>';
+    $html .= '</div>';
+
+    $html .= '<div style="background:#ffe9e9;border:1px solid #ffcccc;border-radius:6px;padding:12px;margin-bottom:12px;">';
+    $html .= '<p style="margin:0 0 8px;font-size:12px;font-weight:bold;color:#d63031;">⚠ Before upgrading:</p>';
+    $html .= '<ul style="margin:0;padding:0 0 0 20px;font-size:12px;color:#d63031;">';
+    $html .= '<li>Ensure you have a recent backup</li>';
+    $html .= '<li>Your instance will be offline for 15-30 minutes</li>';
+    $html .= '<li>This action cannot be undone</li>';
+    $html .= '</ul>';
+    $html .= '</div>';
+
+    $html .= '<div style="margin-bottom:12px;">';
+    $html .= '<label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;">';
+    $html .= '<input type="checkbox" name="upgrade_acknowledge" id="upgrade_acknowledge" onchange="updateSubmitButton()" style="cursor:pointer;">';
+    $html .= '<span>I understand my instance will be offline during the upgrade</span>';
+    $html .= '</label>';
+    $html .= '</div>';
+
+    $html .= '<input type="hidden" name="clientaction" value="request_version_upgrade">';
+    $html .= '<button type="submit" id="upgrade-submit" disabled style="background:#e67e22;color:#fff;border:none;border-radius:4px;padding:8px 18px;font-size:13px;font-weight:bold;cursor:not-allowed;opacity:0.6;">Request Upgrade</button>';
+    $html .= '</form>';
+
+    $html .= '<script type="text/javascript">';
+    $html .= 'function updateUpgradeFee() {';
+    $html .= '  var select = document.getElementById("upgrade_version");';
+    $html .= '  var option = select.options[select.selectedIndex];';
+    $html .= '  var fee = parseFloat(option.getAttribute("data-fee")) || 0;';
+    $html .= '  var display = document.getElementById("fee-display");';
+    $html .= '  var amount = document.getElementById("fee-amount");';
+    $html .= '  if (select.value) {';
+    $html .= '    display.style.display = "block";';
+    $html .= '    amount.textContent = "$" + fee.toFixed(2);';
+    $html .= '  } else {';
+    $html .= '    display.style.display = "none";';
+    $html .= '  }';
+    $html .= '  updateSubmitButton();';
+    $html .= '}';
+    $html .= 'function updateSubmitButton() {';
+    $html .= '  var version = document.getElementById("upgrade_version").value;';
+    $html .= '  var ack = document.getElementById("upgrade_acknowledge").checked;';
+    $html .= '  var btn = document.getElementById("upgrade-submit");';
+    $html .= '  if (version && ack) {';
+    $html .= '    btn.disabled = false;';
+    $html .= '    btn.style.opacity = "1";';
+    $html .= '    btn.style.cursor = "pointer";';
+    $html .= '  } else {';
+    $html .= '    btn.disabled = true;';
+    $html .= '    btn.style.opacity = "0.6";';
+    $html .= '    btn.style.cursor = "not-allowed";';
+    $html .= '  }';
+    $html .= '}';
+    $html .= '</script>';
+
+    $html .= '</div>';
+    return $html;
+}
+
+
+/**
  * Renders the Install Apps card for the client area.
  */
 function rancherfleet_installAppCardHtml(array $params, $orderNum)
@@ -2560,6 +2909,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Refresh Webhook Secret' => 'RefreshWebhookSecret',
         'Remove Custom URL'      => 'RemoveCustomUrl',
         'Patch Template Updates' => 'PatchTemplateUpdates',
+        'Trigger Version Upgrade' => 'TriggerVersionUpgrade',
     );
 }
 
@@ -4635,6 +4985,10 @@ function rancherfleet_ClientArea(array $params)
         $message = rancherfleet_handleOdooPasswordReset($params, $namespace, $orderNum);
     } elseif ($action === 'install_module') {
         $message = rancherfleet_handleModuleInstall($params, $namespace, $orderNum);
+    } elseif ($action === 'request_version_upgrade') {
+        $message = rancherfleet_handleUpgradeRequest($params, $namespace, $orderNum);
+    } elseif ($action === 'cancel_version_upgrade') {
+        $message = rancherfleet_handleCancelUpgrade($params, $orderNum);
     }
 
     // Build the output
@@ -5704,6 +6058,13 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars($appName) . ' has been installed successfully. Your instance will be updated shortly.</div>';
     } elseif (strpos($message, 'module_install_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; App installation failed: ' . htmlspecialchars(substr($message, strlen('module_install_error:'))) . '</div>';
+    } elseif (strpos($message, 'upgrade_success:') === 0) {
+        $version = substr($message, strlen('upgrade_success:'));
+        $html .= '<div style="background:#d4edda;border:1px solid #c3e6cb;color:#155724;padding:12px 14px;border-radius:4px;margin-bottom:12px;font-size:13px;"><strong>&#10003; Upgrade requested</strong> — Your upgrade to Odoo ' . htmlspecialchars($version) . ' has been submitted. Our team will review and process it within 24 hours.</div>';
+    } elseif (strpos($message, 'upgrade_cancelled:') === 0) {
+        $html .= '<div class="rfm-alert-success">&#10003; Your upgrade request has been cancelled.</div>';
+    } elseif (strpos($message, 'upgrade_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; Upgrade request failed: ' . htmlspecialchars(substr($message, strlen('upgrade_error:'))) . '</div>';
     }
 
     try {
@@ -5784,6 +6145,17 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         // Install Apps Card
         // -----------------------------------------------------------------------
         $html .= rancherfleet_installAppCardHtml($params, $orderNum);
+
+        // -----------------------------------------------------------------------
+        // Upgrade Odoo Version Card
+        // -----------------------------------------------------------------------
+        $currentOdooVersion = null;
+        if ($status['image'] && preg_match('/odoo:([0-9.]+)/', $status['image'], $m)) {
+            $currentOdooVersion = $m[1];
+        }
+        if ($currentOdooVersion) {
+            $html .= rancherfleet_upgradeVersionCardHtml($params, $orderNum, $currentOdooVersion);
+        }
 
         // -----------------------------------------------------------------------
         // Custom Subdomain Ingress Card
@@ -6099,4 +6471,206 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
 
     $html .= '</div>'; // rfm-ca
     return $html;
+}
+
+
+/**
+ * Admin button handler to execute a pending version upgrade.
+ * Handles backup, scaling, image update, and credit charging.
+ */
+function rancherfleet_TriggerVersionUpgrade(array $params)
+{
+    RancherFleet\Logger::info("TriggerVersionUpgrade: starting");
+
+    try {
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        // Read pending upgrade request
+        $request = rancherfleet_getUpgradeRequest($serviceId);
+        if (empty($request)) {
+            return 'No pending upgrade request for this service.';
+        }
+
+        $targetVersion = $request['version'];
+        $fee = $request['fee'];
+
+        RancherFleet\Logger::info("TriggerVersionUpgrade: {$namespace} to version {$targetVersion}, fee: ${fee}");
+
+        // Execute the upgrade
+        $result = rancherfleet_executeVersionUpgrade($params, $namespace, $orderNum, $targetVersion, $fee);
+
+        if (strpos($result, 'Success:') === 0) {
+            // Mark request as completed
+            try {
+                $data = array(
+                    'version'      => $targetVersion,
+                    'fee'          => $fee,
+                    'requested_at' => $request['requested_at'],
+                    'completed_at' => time(),
+                    'status'       => 'completed',
+                );
+                \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+                    array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
+                    array('value' => json_encode($data))
+                );
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("TriggerVersionUpgrade: failed to mark completed: " . $e->getMessage());
+            }
+        }
+
+        return $result;
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("TriggerVersionUpgrade: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+
+/**
+ * Executes the actual version upgrade:
+ * 1. Charge credit
+ * 2. Take backup
+ * 3. Scale to 0
+ * 4. Update odoo.yml with new version
+ * 5. Scale to 1
+ * 6. Record history
+ *
+ * @return string  'Success:...' or 'Error:...'
+ */
+function rancherfleet_executeVersionUpgrade(array $params, $namespace, $orderNum, $targetVersion, $fee)
+{
+    try {
+        list($rancher, $github) = rancherfleet_buildClients($params);
+        $clientId = (int)$params['userid'];
+        $serviceId = (int)$params['serviceid'];
+
+        // Get current version
+        $status = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
+        $currentVersion = null;
+        if ($status['image'] && preg_match('/odoo:([0-9.]+)/', $status['image'], $m)) {
+            $currentVersion = $m[1];
+        }
+
+        if (!$currentVersion) {
+            return 'Error: Could not determine current Odoo version.';
+        }
+
+        RancherFleet\Logger::info("executeVersionUpgrade: from {$currentVersion} to {$targetVersion}");
+
+        // 1. Charge credit
+        RancherFleet\Logger::info("executeVersionUpgrade: charging ${fee}");
+        try {
+            $invoiceResult = localAPI('CreateInvoice', array(
+                'userid'           => $clientId,
+                'status'           => 'Unpaid',
+                'itemdescription1' => "Odoo version upgrade from {$currentVersion} to {$targetVersion}",
+                'itemamount1'      => $fee,
+                'itemtaxed1'       => false,
+                'paymentmethod'    => '',
+            ));
+
+            if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
+                $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
+                return 'Error: Could not create invoice: ' . $err;
+            }
+
+            $invoiceId = (int)$invoiceResult['invoiceid'];
+
+            $creditResult = localAPI('ApplyCredit', array(
+                'clientid' => $clientId,
+                'amount'   => $fee,
+            ));
+
+            if (!isset($creditResult['result']) || $creditResult['result'] !== 'success') {
+                $err = isset($creditResult['message']) ? $creditResult['message'] : json_encode($creditResult);
+                return 'Error: Could not apply credit: ' . $err;
+            }
+
+            RancherFleet\Logger::info("executeVersionUpgrade: credit charged, invoice {$invoiceId}");
+        } catch (\Exception $payEx) {
+            RancherFleet\Logger::error("executeVersionUpgrade: payment error: " . $payEx->getMessage());
+            return 'Error: Payment processing failed: ' . $payEx->getMessage();
+        }
+
+        // 2. Take backup
+        RancherFleet\Logger::info("executeVersionUpgrade: taking pre-upgrade backup");
+        try {
+            $backupResult = rancherfleet_handleBackupRestore($params, $namespace, $orderNum, '', 'db', true);
+            if (strpos($backupResult, 'error') !== false) {
+                RancherFleet\Logger::error("executeVersionUpgrade: backup failed, refunding");
+                localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+                return 'Error: Backup failed during pre-upgrade snapshot. Credit refunded.';
+            }
+        } catch (\Exception $backEx) {
+            RancherFleet\Logger::error("executeVersionUpgrade: backup exception: " . $backEx->getMessage());
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: ' . $backEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 3. Scale deployment to 0
+        RancherFleet\Logger::info("executeVersionUpgrade: scaling to 0");
+        try {
+            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 0);
+            sleep(3);
+        } catch (\Exception $scaleEx) {
+            RancherFleet\Logger::error("executeVersionUpgrade: scale error: " . $scaleEx->getMessage());
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: Failed to scale deployment down. ' . $scaleEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 4. Update odoo.yml with new version
+        RancherFleet\Logger::info("executeVersionUpgrade: updating odoo.yml");
+        try {
+            $branch = 'whmcs-client-' . $orderNum;
+            $content = $github->getFileContent($branch, 'odoo.yml');
+
+            $oldImage = 'image: odoo:' . preg_quote($currentVersion);
+            $newImage = 'image: odoo:' . $targetVersion;
+
+            if (!preg_match('/' . $oldImage . '/', $content)) {
+                throw new \Exception('Current image tag not found in odoo.yml');
+            }
+
+            $updated = preg_replace('/' . $oldImage . '/', $newImage, $content);
+
+            $github->createOrUpdateFile(
+                $branch,
+                'odoo.yml',
+                $updated,
+                'Upgrade Odoo from ' . $currentVersion . ' to ' . $targetVersion
+            );
+
+            RancherFleet\Logger::info("executeVersionUpgrade: odoo.yml updated");
+            sleep(5);
+        } catch (\Exception $updateEx) {
+            RancherFleet\Logger::error("executeVersionUpgrade: update error: " . $updateEx->getMessage());
+            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 1);
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: Failed to update deployment. ' . $updateEx->getMessage() . ' Credit refunded and deployment restored.';
+        }
+
+        // 5. Scale deployment back to 1
+        RancherFleet\Logger::info("executeVersionUpgrade: scaling back to 1");
+        try {
+            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 1);
+            sleep(3);
+        } catch (\Exception $scaleBackEx) {
+            RancherFleet\Logger::error("executeVersionUpgrade: scale back error: " . $scaleBackEx->getMessage());
+            return 'Warning: Deployment scaled back but may need manual intervention. ' . $scaleBackEx->getMessage();
+        }
+
+        // 6. Record in history
+        $invoiceId = isset($invoiceId) ? $invoiceId : 0;
+        rancherfleet_logHistory($params, 'Odoo Upgraded', 'Upgraded from ' . $currentVersion . ' to ' . $targetVersion . ' (Invoice #' . $invoiceId . ', $' . number_format($fee, 2) . ')');
+
+        RancherFleet\Logger::info("executeVersionUpgrade: SUCCESS");
+        return 'Success: Odoo upgraded from ' . $currentVersion . ' to ' . $targetVersion . '. Invoice #' . $invoiceId . ' charged $' . number_format($fee, 2) . ' from credit balance.';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("executeVersionUpgrade: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
 }
