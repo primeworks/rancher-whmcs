@@ -1580,214 +1580,10 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
     }
 }
 
-/**
- * Reads the master password (admin_passwd) from the odoo-{orderNum} Kubernetes Secret.
- * The Secret is created during provisioning and contains DB_PASSWORD which is the Odoo master password.
- *
- * @param  \RancherFleet\RancherClient $rancher
- * @param  string $namespace
- * @param  string $orderNum
- * @return string|null  Master password, or null on error
- */
-function rancherfleet_readOdooMasterPassword($rancher, $namespace, $orderNum)
-{
-    try {
-        $secretName = 'odoo-' . $orderNum;
-        $secret = $rancher->rawRequest('GET',
-            '/api/v1/namespaces/' . rawurlencode($namespace) . '/secrets/' . rawurlencode($secretName)
-        );
-
-        if (isset($secret['data']['DB_PASSWORD'])) {
-            // Kubernetes Secrets store data as base64
-            $masterPassword = base64_decode($secret['data']['DB_PASSWORD']);
-            return $masterPassword;
-        }
-    } catch (\Exception $e) {
-        RancherFleet\Logger::info("readOdooMasterPassword: could not read Secret: " . $e->getMessage());
-    }
-    return null;
-}
-
-/**
- * Calls Odoo XML-RPC API to update admin password via passlib hashing.
- * Uses raw curl + SimpleXML to avoid depending on xmlrpc PHP extension.
- *
- * @param  string $orderNum       Order number (used to determine Odoo hostname)
- * @param  string $masterPassword Master password (admin_passwd from Odoo config)
- * @param  string $newPassword    New password to set
- * @return array                  ['success' => bool, 'message' => string]
- */
-function rancherfleet_callOdooXmlRpc($orderNum, $masterPassword, $newPassword)
-{
-    $odooUrl = 'https://' . $orderNum . '.webdiscode.com';
-    $dbName  = 'odoo-' . $orderNum;
-
-    try {
-        // Step 1: Authenticate as admin using the master password
-        $commonUrl = $odooUrl . '/xmlrpc/2/common';
-        $uid = rancherfleet_xmlRpcAuthenticate($commonUrl, $dbName, $masterPassword);
-
-        if (!$uid) {
-            return array('success' => false, 'message' => 'Authentication failed: invalid uid returned');
-        }
-
-        // Step 2: Update the password for the admin user
-        $objectUrl = $odooUrl . '/xmlrpc/2/object';
-        $writeResult = rancherfleet_xmlRpcExecuteKw($objectUrl, $dbName, $uid, $masterPassword, $newPassword);
-
-        if ($writeResult) {
-            return array('success' => true, 'message' => 'Password updated successfully via XML-RPC');
-        } else {
-            return array('success' => false, 'message' => 'Password update failed');
-        }
-    } catch (\Exception $e) {
-        return array('success' => false, 'message' => 'XML-RPC error: ' . $e->getMessage());
-    }
-}
-
-/**
- * XML-RPC authenticate call to Odoo.
- * Returns the user ID (uid) on success.
- *
- * @param  string $url            Odoo common endpoint URL
- * @param  string $db             Database name (odoo-{orderNum})
- * @param  string $masterPassword Master password
- * @return int|false              User ID on success, false on failure
- * @throws \Exception
- */
-function rancherfleet_xmlRpcAuthenticate($url, $db, $masterPassword)
-{
-    $request = '<?xml version="1.0"?>
-<methodCall>
-  <methodName>authenticate</methodName>
-  <params>
-    <param><value><string>' . htmlspecialchars($db, ENT_XML1) . '</string></value></param>
-    <param><value><string>admin</string></value></param>
-    <param><value><string>' . htmlspecialchars($masterPassword, ENT_XML1) . '</string></value></param>
-    <param><value><struct></struct></value></param>
-  </params>
-</methodCall>';
-
-    $response = rancherfleet_xmlRpcCurlPost($url, $request);
-    $xml = @simplexml_load_string($response);
-
-    if (!$xml) {
-        throw new \Exception('Invalid XML response from authenticate');
-    }
-
-    // Check for fault
-    if (isset($xml->fault)) {
-        $faultString = (string)$xml->fault->value->struct->member[1]->value->string;
-        throw new \Exception('Authenticate fault: ' . $faultString);
-    }
-
-    // Extract int uid from response
-    if (isset($xml->params->param->value->int)) {
-        $uid = (int)$xml->params->param->value->int;
-        return ($uid > 0) ? $uid : false;
-    }
-
-    return false;
-}
-
-/**
- * XML-RPC execute_kw call to update res.users password.
- *
- * @param  string $url            Odoo object endpoint URL
- * @param  string $db             Database name
- * @param  int    $uid            User ID
- * @param  string $masterPassword Master password
- * @param  string $newPassword    New password to set
- * @return bool                   True on success
- * @throws \Exception
- */
-function rancherfleet_xmlRpcExecuteKw($url, $db, $uid, $masterPassword, $newPassword)
-{
-    $request = '<?xml version="1.0"?>
-<methodCall>
-  <methodName>execute_kw</methodName>
-  <params>
-    <param><value><string>' . htmlspecialchars($db, ENT_XML1) . '</string></value></param>
-    <param><value><int>' . (int)$uid . '</int></value></param>
-    <param><value><string>' . htmlspecialchars($masterPassword, ENT_XML1) . '</string></value></param>
-    <param><value><string>res.users</string></value></param>
-    <param><value><string>write</string></value></param>
-    <param><value><array><data>
-      <value><array><data>
-        <value><int>' . (int)$uid . '</int></value>
-      </data></array></value>
-    </data></array></value></param>
-    <param><value><struct>
-      <member>
-        <name>password</name>
-        <value><string>' . htmlspecialchars($newPassword, ENT_XML1) . '</string></value>
-      </member>
-    </struct></value></param>
-    <param><value><struct></struct></value></param>
-  </params>
-</methodCall>';
-
-    $response = rancherfleet_xmlRpcCurlPost($url, $request);
-    $xml = @simplexml_load_string($response);
-
-    if (!$xml) {
-        throw new \Exception('Invalid XML response from execute_kw');
-    }
-
-    // Check for fault
-    if (isset($xml->fault)) {
-        $faultString = (string)$xml->fault->value->struct->member[1]->value->string;
-        throw new \Exception('Execute fault: ' . $faultString);
-    }
-
-    // Response should be True (boolean) or 1 (int)
-    if (isset($xml->params->param->value->boolean)) {
-        return (bool)(int)$xml->params->param->value->boolean;
-    } elseif (isset($xml->params->param->value->int)) {
-        return (int)$xml->params->param->value->int > 0;
-    }
-
-    return false;
-}
-
-/**
- * Posts XML-RPC request via cURL and returns raw response.
- *
- * @param  string $url     Endpoint URL
- * @param  string $request XML-RPC request body
- * @return string          Response body
- * @throws \Exception
- */
-function rancherfleet_xmlRpcCurlPost($url, $request)
-{
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: text/xml'));
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $request);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    curl_close($ch);
-
-    if ($httpCode !== 200) {
-        throw new \Exception("HTTP {$httpCode}: {$curlError}");
-    }
-
-    if (!$response) {
-        throw new \Exception("Empty response from Odoo");
-    }
-
-    return $response;
-}
 
 /**
  * Handles Odoo admin password reset from client area.
- * Updates password via Odoo XML-RPC API using the master password.
+ * Creates a Kubernetes Job with the Odoo container to update the password directly.
  *
  * @param  array  $params
  * @param  string $namespace
@@ -1804,25 +1600,126 @@ function rancherfleet_handleOdooPasswordReset(array $params, $namespace, $orderN
         // Generate random 16-character password
         $newPassword = bin2hex(random_bytes(8));
 
-        // Read master password from Odoo Secret
-        $masterPassword = rancherfleet_readOdooMasterPassword($rancher, $namespace, $orderNum);
-        if (!$masterPassword) {
-            RancherFleet\Logger::error("odooPasswordReset: could not read master password from Secret");
-            return 'odoo_password_reset_error:Could not read Odoo configuration';
+        $dbName = 'odoo-' . $orderNum;
+
+        // Python script to reset password via Odoo's internal API
+        // User ID 2 is always the admin user in a standard Odoo installation
+        $pythonScript = <<<'PYTHON'
+import odoo
+import sys
+try:
+    odoo.tools.config.parse_config(['--config=/etc/odoo/odoo.conf', '--no-http', '--without-demo=all'])
+    from odoo.api import Environment
+    from odoo import registry
+
+    db = sys.argv[1]
+    new_pwd = sys.argv[2]
+
+    reg = registry(db)
+    with reg.cursor() as cr:
+        env = Environment(cr, 2, {})
+        env['res.users'].browse(2).write({'password': new_pwd})
+        cr.commit()
+    sys.exit(0)
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(1)
+PYTHON;
+
+        $jobName = 'rfm-reset-pwd-' . time() . '-' . substr(md5($orderNum), 0, 4);
+        $jobName = substr($jobName, 0, 52) . '-' . substr(md5($orderNum), 0, 8);
+
+        $jobManifest = array(
+            'apiVersion' => 'batch/v1',
+            'kind'       => 'Job',
+            'metadata'   => array(
+                'name'      => $jobName,
+                'namespace' => $namespace,
+                'labels'    => array('app' => 'rfm-reset-pwd'),
+            ),
+            'spec' => array(
+                'ttlSecondsAfterFinished' => 120,
+                'backoffLimit'            => 0,
+                'template'               => array(
+                    'spec' => array(
+                        'restartPolicy' => 'Never',
+                        'containers'    => array(array(
+                            'name'    => 'resetpwd',
+                            'image'   => 'odoo:19',
+                            'command' => array('python3', '-c', $pythonScript),
+                            'args'    => array($dbName, $newPassword),
+                            'volumeMounts' => array(
+                                array(
+                                    'name'      => 'odoo-config',
+                                    'mountPath' => '/etc/odoo',
+                                ),
+                            ),
+                        )),
+                        'volumes' => array(
+                            array(
+                                'name'      => 'odoo-config',
+                                'configMap' => array(
+                                    'name' => 'odoo-' . $orderNum . '.conf',
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        RancherFleet\Logger::info("odooPasswordReset: creating Job {$jobName}");
+
+        // Create the Job
+        $rancher->rawRequest('POST',
+            '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
+            $jobManifest
+        );
+
+        // Poll for completion — up to 60 seconds
+        $succeeded = false;
+        $failed    = false;
+        $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
+
+        for ($i = 0; $i < 12; $i++) {
+            sleep(5);
+            try {
+                $job        = $rancher->rawRequest('GET', $jobPath);
+                $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                foreach ($conditions as $cond) {
+                    if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                        $succeeded = true; break 2;
+                    }
+                    if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                        $failed = true; break 2;
+                    }
+                }
+                RancherFleet\Logger::info("odooPasswordReset: waiting for Job... " . (($i + 1) * 5) . "s elapsed");
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("odooPasswordReset: error polling Job: " . $e->getMessage());
+                break;
+            }
         }
 
-        // Call Odoo XML-RPC to update password
-        RancherFleet\Logger::info("odooPasswordReset: calling Odoo XML-RPC API");
-        $xmlRpcResult = rancherfleet_callOdooXmlRpc($orderNum, $masterPassword, $newPassword);
+        // Clean up the Job
+        try {
+            $rancher->rawRequest('DELETE', $jobPath);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("odooPasswordReset: Job cleanup note: " . $e->getMessage());
+        }
 
-        if ($xmlRpcResult['success']) {
+        if ($succeeded) {
             RancherFleet\Logger::info("odooPasswordReset: SUCCESS");
-            rancherfleet_logHistory($params, 'Odoo Password Reset', 'Password updated via XML-RPC');
+            rancherfleet_logHistory($params, 'Odoo Password Reset', 'Password reset via Odoo Job');
             return 'odoo_password_reset_success:' . $newPassword;
+        } elseif ($failed) {
+            RancherFleet\Logger::error("odooPasswordReset: Job failed");
+            rancherfleet_logHistory($params, 'Password Reset Failed', 'Job failed');
+            return 'odoo_password_reset_error:Password reset job failed. Check admin logs for details.';
         } else {
-            RancherFleet\Logger::error("odooPasswordReset: failed — " . $xmlRpcResult['message']);
-            rancherfleet_logHistory($params, 'Password Reset Failed', $xmlRpcResult['message']);
-            return 'odoo_password_reset_error:' . $xmlRpcResult['message'];
+            RancherFleet\Logger::error("odooPasswordReset: Job timed out after 60s");
+            rancherfleet_logHistory($params, 'Password Reset Timeout', 'Job timeout');
+            return 'odoo_password_reset_error:Password reset job timed out. Please try again.';
         }
 
     } catch (\Exception $e) {
