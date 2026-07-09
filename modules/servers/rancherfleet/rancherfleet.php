@@ -1414,47 +1414,45 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
             return 'backup_restore_error:Invalid filestore backup filename format';
         }
 
+        // Scale deployment to 0 via Rancher API BEFORE creating restore Job
+        RancherFleet\Logger::info("backupRestore: scaling deployment to 0 replicas");
+        try {
+            $rancher->scaleDeployment($namespace, $deploymentName, 0);
+            sleep(5);
+            RancherFleet\Logger::info("backupRestore: deployment scaled to 0 replicas");
+        } catch (\Exception $scaleEx) {
+            throw new \Exception("Failed to scale deployment to 0: " . $scaleEx->getMessage());
+        }
+
         // Generate unique job name
         $timestamp = time();
         $jobName = 'rfm-restore-' . $backupType . '-' . $timestamp . '-' . substr(md5($orderNum), 0, 4);
         $jobName = substr($jobName, 0, 60); // Keep under 63 char DNS limit
 
-        // Build restore shell script
-        // The script will:
-        // 1. Scale deployment to 0
-        // 2. Create pre-restore snapshots
-        // 3. Restore from backup
-        // 4. Scale back to original replicas
+        // Build restore shell script (no kubectl scaling — Rancher API handles it)
+        // NFS path structure: /backups/odoo-{orderNum}/{filename}
         if ($backupType === 'db') {
-            $preRestoreDbFile = 'pre-restore-db-' . date('Y-m-d-H-i-s') . '.dump';
+            $nfsBackupDir = '/backups/odoo-' . $orderNum;
+            $preRestoreDbFile = 'pre-restore-' . date('Y-m-d-H-i-s') . '.dump';
             $restoreCmd = 'set -e && '
-                . 'echo "Scaling deployment to 0..." && '
-                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=0 -n ' . escapeshellarg($namespace) . ' && '
-                . 'sleep 5 && '
                 . 'echo "Creating pre-restore database snapshot..." && '
-                . 'pg_dump -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -Fc > /backups/' . escapeshellarg($preRestoreDbFile) . ' 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
+                . 'pg_dump -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -Fc > ' . escapeshellarg($nfsBackupDir . '/' . $preRestoreDbFile) . ' 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
                 . 'echo "Restoring database from backup..." && '
-                . 'pg_restore -h $PGHOST -p $PGPORT -U $PGUSER --clean --if-exists -d $PGDATABASE /backups/' . escapeshellarg($filename) . ' 2>&1 && '
-                . 'echo "Scaling deployment back to ' . $originalReplicas . ' replicas..." && '
-                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=' . (int)$originalReplicas . ' -n ' . escapeshellarg($namespace) . ' && '
+                . 'pg_restore -h $PGHOST -p $PGPORT -U $PGUSER --clean --if-exists -d $PGDATABASE ' . escapeshellarg($nfsBackupDir . '/' . $filename) . ' 2>&1 && '
                 . 'echo "Restore complete"';
         } else {
             // filestore restore
-            $preRestoreFilestore = 'pre-restore-filestore-' . date('Y-m-d-H-i-s') . '.tar.gz';
+            $nfsBackupDir = '/backups/odoo-' . $orderNum;
+            $preRestoreFilestore = 'pre-restore-' . date('Y-m-d-H-i-s') . '.tar.gz';
             $restoreCmd = 'set -e && '
-                . 'echo "Scaling deployment to 0..." && '
-                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=0 -n ' . escapeshellarg($namespace) . ' && '
-                . 'sleep 5 && '
                 . 'echo "Creating pre-restore filestore snapshot..." && '
-                . 'tar -czf /backups/' . escapeshellarg($preRestoreFilestore) . ' -C /var/lib/odoo . 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
+                . 'tar -czf ' . escapeshellarg($nfsBackupDir . '/' . $preRestoreFilestore) . ' -C /var/lib/odoo . 2>&1 || echo "Pre-restore snapshot failed, continuing anyway..." && '
                 . 'echo "Restoring filestore from backup..." && '
-                . 'tar -xzf /backups/' . escapeshellarg($filename) . ' -C /var/lib/odoo && '
-                . 'echo "Scaling deployment back to ' . $originalReplicas . ' replicas..." && '
-                . 'kubectl scale deployment ' . escapeshellarg($deploymentName) . ' --replicas=' . (int)$originalReplicas . ' -n ' . escapeshellarg($namespace) . ' && '
+                . 'tar -xzf ' . escapeshellarg($nfsBackupDir . '/' . $filename) . ' -C /var/lib/odoo && '
                 . 'echo "Restore complete"';
         }
 
-        // Build Job manifest
+        // Build Job manifest with NFS volume (not PVC subPath)
         $jobManifest = array(
             'apiVersion' => 'batch/v1',
             'kind'       => 'Job',
@@ -1487,9 +1485,8 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
                                     'subPath'   => 'filestore',
                                 ),
                                 array(
-                                    'name'      => 'odoo-pvc',
+                                    'name'      => 'nfs-backups',
                                     'mountPath' => '/backups',
-                                    'subPath'   => 'backups',
                                 ),
                             ),
                         )),
@@ -1498,6 +1495,13 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
                                 'name'         => 'odoo-pvc',
                                 'persistentVolumeClaim' => array(
                                     'claimName' => 'odoo-' . $orderNum,
+                                ),
+                            ),
+                            array(
+                                'name' => 'nfs-backups',
+                                'nfs' => array(
+                                    'server' => '162.35.166.55',
+                                    'path'   => '/export/share1',
                                 ),
                             ),
                         ),
@@ -1544,6 +1548,15 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
             $rancher->rawRequest('DELETE', $jobPath);
         } catch (\Exception $e) {
             RancherFleet\Logger::info("backupRestore: Job cleanup note: " . $e->getMessage());
+        }
+
+        // Scale deployment back to original replicas via Rancher API
+        RancherFleet\Logger::info("backupRestore: scaling deployment back to {$originalReplicas} replicas");
+        try {
+            $rancher->scaleDeployment($namespace, $deploymentName, $originalReplicas);
+            RancherFleet\Logger::info("backupRestore: deployment scaled back to {$originalReplicas} replicas");
+        } catch (\Exception $scaleEx) {
+            RancherFleet\Logger::error("backupRestore: warning - failed to scale deployment back: " . $scaleEx->getMessage());
         }
 
         if ($succeeded) {
