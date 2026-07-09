@@ -2202,6 +2202,7 @@ function rancherfleet_queryModuleStatus(array $params, $namespace, $orderNum)
 
                 $podSelector = 'job-name=' . $jobName;
                 $podsPath = '/api/v1/namespaces/' . rawurlencode($namespace) . '/pods?labelSelector=' . rawurlencode($podSelector);
+                RancherFleet\Logger::info("queryModuleStatus: calling GET {$podsPath} via RancherClient");
                 $pods = $rancher->rawRequest('GET', $podsPath);
                 $podItems = isset($pods['items']) ? $pods['items'] : array();
 
@@ -2213,6 +2214,7 @@ function rancherfleet_queryModuleStatus(array $params, $namespace, $orderNum)
                         RancherFleet\Logger::info("queryModuleStatus: found pod {$podName}, reading logs");
 
                         $logsPath = '/api/v1/namespaces/' . rawurlencode($namespace) . '/pods/' . rawurlencode($podName) . '/log';
+                        RancherFleet\Logger::info("queryModuleStatus: calling GET {$logsPath} via RancherClient");
                         $logs = $rancher->rawRequest('GET', $logsPath);
 
                         // logs can be string or array depending on Rancher version
