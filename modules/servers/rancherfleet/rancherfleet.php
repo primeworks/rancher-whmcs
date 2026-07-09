@@ -2459,178 +2459,86 @@ function rancherfleet_PushBackupSidecar(array $params)
 function rancherfleet_PatchBackupStorage(array $params)
 {
     try {
+        $orderNum  = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+
         list($rancher, $github) = rancherfleet_buildClients($params);
 
-        // Check if we're in step 2 (confirmation/apply mode)
-        $pending = \WHMCS\Database\Capsule::table('tbladdonmodules')
-            ->where('module', 'rancherfleet_patch')
-            ->where('setting', 'pending_backup_storage_patch')
-            ->first();
+        RancherFleet\Logger::info("PatchBackupStorage: patching instance {$namespace}");
 
-        if ($pending) {
-            // Step 2: Check timestamp and apply patches
-            $pendingData = @json_decode($pending->value, true);
-            if (!$pendingData || !isset($pendingData['branches']) || !isset($pendingData['timestamp'])) {
-                throw new \Exception("Invalid pending patch data");
+        // Read odoo.yml from the client branch
+        try {
+            $odooYaml = $github->getClientFileContent($namespace, 'odoo.yml');
+            if (!$odooYaml) {
+                throw new \Exception("odoo.yml not found on client branch");
             }
-
-            $elapsedSeconds = time() - $pendingData['timestamp'];
-            if ($elapsedSeconds > 60) {
-                // Confirmation expired, delete and restart
-                \WHMCS\Database\Capsule::table('tbladdonmodules')
-                    ->where('module', 'rancherfleet_patch')
-                    ->where('setting', 'pending_backup_storage_patch')
-                    ->delete();
-                RancherFleet\Logger::info("PatchBackupStorage: confirmation expired, restarting scan");
-                return "Confirmation expired. Run 'Patch Backup Storage' again to re-scan.";
-            }
-
-            // Apply patches to each branch
-            $patchedCount = 0;
-            $patchedList = array();
-            $totalBranches = count($pendingData['branches']);
-            RancherFleet\Logger::info("PatchBackupStorage: starting to apply patches to {$totalBranches} branches");
-
-            foreach ($pendingData['branches'] as $branch) {
-                try {
-                    $orderNum = str_replace('whmcs-client-', '', $branch);
-                    RancherFleet\Logger::info("PatchBackupStorage: [{$patchedCount}/{$totalBranches}] patching branch {$branch} (orderNum={$orderNum})");
-
-                    RancherFleet\Logger::info("PatchBackupStorage: reading odoo.yml from {$branch}");
-                    $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
-                    RancherFleet\Logger::info("PatchBackupStorage: read complete for {$branch}, size=" . strlen((string)$odooYaml) . " bytes");
-                    if (!$odooYaml) {
-                        RancherFleet\Logger::error("PatchBackupStorage: could not read odoo.yml from {$branch}");
-                        continue;
-                    }
-
-                    // Check if this branch needs patching: detect old PVC mount with subPath
-                    $detectString = "mountPath: /backups\n            subPath: backups";
-                    $needsPatching = strpos($odooYaml, $detectString) !== false;
-                    RancherFleet\Logger::info("PatchBackupStorage: detection for {$branch}: needsPatching=" . ($needsPatching ? 'true' : 'false'));
-
-                    if (!$needsPatching) {
-                        RancherFleet\Logger::info("PatchBackupStorage: {$branch} does not need patching (old mount not found)");
-                        continue;
-                    }
-
-                    $updated = $odooYaml;
-
-                    // Step 1: Replace old PVC volumeMount with NFS volumeMount
-                    $oldMount = "          - name: odoo-data\n            mountPath: /backups\n            subPath: backups\n";
-                    $newMount = "          - name: nfs-backups\n            mountPath: /backups\n";
-                    $updated = str_replace($oldMount, $newMount, $updated);
-                    RancherFleet\Logger::info("PatchBackupStorage: replaced volumeMount (PVC→NFS) in {$branch}");
-
-                    // Step 2: Add NFS volume if not present
-                    if (strpos($updated, 'name: nfs-backups') === false) {
-                        $nfsVolume = "      - name: nfs-backups\n        nfs:\n          server: 162.35.166.55\n          path: /export/share1\n";
-                        // Insert before "      - name: rfm-db-admin"
-                        $updated = str_replace("      - name: rfm-db-admin", $nfsVolume . "      - name: rfm-db-admin", $updated);
-                        RancherFleet\Logger::info("PatchBackupStorage: added nfs-backups volume to {$branch}");
-                    } else {
-                        RancherFleet\Logger::info("PatchBackupStorage: nfs-backups volume already present in {$branch}");
-                    }
-
-                    // Step 3: Update BACKUP_DIR in the backup script to use odoo-{ORDER_NUM} directory
-                    $oldBackupDir = "          BACKUP_DIR=/backups";
-                    $newBackupDir = "          BACKUP_DIR=\"/backups/odoo-${ORDER_NUM}\"";
-                    $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
-                    RancherFleet\Logger::info("PatchBackupStorage: updated BACKUP_DIR in {$branch}");
-
-                    // Verify changes were made
-                    if ($updated === $odooYaml) {
-                        RancherFleet\Logger::error("PatchBackupStorage: changes failed to apply to {$branch}");
-                        continue;
-                    }
-                    RancherFleet\Logger::info("PatchBackupStorage: changes applied to {$branch}, size=" . strlen($updated) . " bytes");
-
-                    // Write back to branch with detailed logging
-                    RancherFleet\Logger::info("PatchBackupStorage: about to write odoo.yml to {$branch}");
-                    $github->writeFileToBranch(
-                        'odoo.yml',
-                        $updated,
-                        $branch,
-                        'chore: patch backup storage to use NFS'
-                    );
-                    RancherFleet\Logger::info("PatchBackupStorage: writeFileToBranch completed for {$branch}");
-
-                    $patchedCount++;
-                    $patchedList[] = $branch;
-                    RancherFleet\Logger::info("PatchBackupStorage: successfully patched {$branch} ({$patchedCount}/{$totalBranches} complete)");
-
-                } catch (\Exception $e) {
-                    RancherFleet\Logger::error("PatchBackupStorage: failed to patch {$branch}: " . $e->getMessage());
-                    continue;
-                }
-            }
-
-            // Delete the pending record
-            \WHMCS\Database\Capsule::table('tbladdonmodules')
-                ->where('module', 'rancherfleet_patch')
-                ->where('setting', 'pending_backup_storage_patch')
-                ->delete();
-
-            $branchList = implode(', ', $patchedList);
-            RancherFleet\Logger::info("PatchBackupStorage: complete - patched {$patchedCount} instances");
-            return "Success: Patched {$patchedCount} instances ({$branchList}). Fleet will auto-sync within ~15s.";
-
-        } else {
-            // Step 1: Scan for branches needing patch
-            RancherFleet\Logger::info("PatchBackupStorage: scanning for instances needing patch");
-
-            $branchesToPatch = array();
-            try {
-                $branches = $github->listBranches('whmcs-client-');
-                foreach ($branches as $branch) {
-                    try {
-                        $odooYaml = $github->getClientFileContent($branch, 'odoo.yml');
-                        if (!$odooYaml) {
-                            continue;
-                        }
-
-                        // Check if sidecar exists and uses old PVC mount (subPath: backups)
-                        $hasSidecar = strpos($odooYaml, '- name: backup') !== false;
-                        $hasOldMount = strpos($odooYaml, 'subPath: backups') !== false;
-
-                        if ($hasSidecar && $hasOldMount) {
-                            $branchesToPatch[] = $branch;
-                            RancherFleet\Logger::info("PatchBackupStorage: found branch needing patch: {$branch}");
-                        }
-                    } catch (\Exception $e) {
-                        RancherFleet\Logger::info("PatchBackupStorage: could not check branch {$branch}: " . $e->getMessage());
-                        continue;
-                    }
-                }
-            } catch (\Exception $e) {
-                throw new \Exception("Failed to list branches: " . $e->getMessage());
-            }
-
-            if (empty($branchesToPatch)) {
-                RancherFleet\Logger::info("PatchBackupStorage: all instances already up to date");
-                return "All instances already up to date. No backup storage patches needed.";
-            }
-
-            // Store pending patches with timestamp
-            $pendingData = array(
-                'branches' => $branchesToPatch,
-                'timestamp' => time(),
-            );
-
-            \WHMCS\Database\Capsule::table('tbladdonmodules')->insert([
-                'module'  => 'rancherfleet_patch',
-                'setting' => 'pending_backup_storage_patch',
-                'value'   => json_encode($pendingData),
-            ]);
-
-            $branchList = implode(', ', $branchesToPatch);
-            RancherFleet\Logger::info("PatchBackupStorage: found " . count($branchesToPatch) . " instances needing patch");
-            return "Found " . count($branchesToPatch) . " instances needing patch:\n{$branchList}\n\nRun 'Patch Backup Storage' again within 60 seconds to apply patches.";
+        } catch (\Exception $readEx) {
+            throw new \Exception("Failed to read odoo.yml: " . $readEx->getMessage());
         }
+
+        RancherFleet\Logger::info("PatchBackupStorage: read odoo.yml for {$namespace}, size=" . strlen((string)$odooYaml) . " bytes");
+
+        // Check if this instance needs patching: detect old PVC mount with subPath
+        $detectString = "mountPath: /backups\n            subPath: backups";
+        $needsPatching = strpos($odooYaml, $detectString) !== false;
+        RancherFleet\Logger::info("PatchBackupStorage: detection for {$namespace}: needsPatching=" . ($needsPatching ? 'true' : 'false'));
+
+        if (!$needsPatching) {
+            RancherFleet\Logger::info("PatchBackupStorage: {$namespace} does not need patching (old mount not found)");
+            return "Instance already uses NFS backup storage. No patch needed.";
+        }
+
+        $updated = $odooYaml;
+
+        // Step 1: Replace old PVC volumeMount with NFS volumeMount
+        $oldMount = "          - name: odoo-data\n            mountPath: /backups\n            subPath: backups\n";
+        $newMount = "          - name: nfs-backups\n            mountPath: /backups\n";
+        $updated = str_replace($oldMount, $newMount, $updated);
+        RancherFleet\Logger::info("PatchBackupStorage: replaced volumeMount (PVC→NFS) in {$namespace}");
+
+        // Step 2: Add NFS volume if not present
+        if (strpos($updated, 'name: nfs-backups') === false) {
+            $nfsVolume = "      - name: nfs-backups\n        nfs:\n          server: 162.35.166.55\n          path: /export/share1\n";
+            $updated = str_replace("      - name: rfm-db-admin", $nfsVolume . "      - name: rfm-db-admin", $updated);
+            RancherFleet\Logger::info("PatchBackupStorage: added nfs-backups volume to {$namespace}");
+        } else {
+            RancherFleet\Logger::info("PatchBackupStorage: nfs-backups volume already present in {$namespace}");
+        }
+
+        // Step 3: Update BACKUP_DIR in the backup script to use odoo-{ORDER_NUM} directory
+        $oldBackupDir = "          BACKUP_DIR=/backups";
+        $newBackupDir = "          BACKUP_DIR=\"/backups/odoo-${ORDER_NUM}\"";
+        $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
+        RancherFleet\Logger::info("PatchBackupStorage: updated BACKUP_DIR in {$namespace}");
+
+        // Verify changes were made
+        if ($updated === $odooYaml) {
+            RancherFleet\Logger::error("PatchBackupStorage: changes failed to apply to {$namespace}");
+            throw new \Exception("Failed to apply backup storage patch");
+        }
+
+        RancherFleet\Logger::info("PatchBackupStorage: changes applied to {$namespace}, size=" . strlen($updated) . " bytes");
+
+        // Write back to branch
+        try {
+            RancherFleet\Logger::info("PatchBackupStorage: writing patched odoo.yml to {$namespace}");
+            $github->writeFileToBranch(
+                'odoo.yml',
+                $updated,
+                $namespace,
+                'chore: patch backup storage to use NFS'
+            );
+            RancherFleet\Logger::info("PatchBackupStorage: writeFileToBranch completed for {$namespace}");
+        } catch (\Exception $writeEx) {
+            throw new \Exception("Failed to write patched odoo.yml: " . $writeEx->getMessage());
+        }
+
+        RancherFleet\Logger::info("PatchBackupStorage: SUCCESS - patched {$namespace}");
+        return "Success: Backup storage patched to use NFS. Fleet will auto-sync within ~15s.";
 
     } catch (\Exception $e) {
         $detail = rancherfleet_exceptionDetail($e);
-        RancherFleet\Logger::error("PatchBackupStorage FAILED:\n" . $detail);
+        RancherFleet\Logger::error("PatchBackupStorage FAILED: " . $detail);
         return 'Error: ' . $e->getMessage();
     }
 }
