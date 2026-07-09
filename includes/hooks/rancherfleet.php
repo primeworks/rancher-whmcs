@@ -79,6 +79,35 @@ add_hook('CronJob', 1, function($vars) {
             RancherFleet\RetryQueue::enqueue($serviceId, $phase, $namespace, $e->getMessage());
         }
     }
+
+    // Process staging cleanup jobs (after 48 hours)
+    RancherFleet\Logger::info("Cleanup cron: checking for expired staging cleanup jobs");
+
+    try {
+        $cleanupJobs = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade_cleanup')
+            ->get();
+
+        foreach ($cleanupJobs as $job) {
+            $cleanup = json_decode($job->value, true);
+            $cleanupAt = isset($cleanup['cleanup_at']) ? $cleanup['cleanup_at'] : 0;
+
+            if ($cleanupAt > 0 && $cleanupAt < time()) {
+                $setting = $job->setting;
+                if (preg_match('/^cleanup_(\d+)$/', $setting, $m)) {
+                    $serviceId = (int)$m[1];
+                    RancherFleet\Logger::info("Cleanup cron: auto-cleaning up staging for service={$serviceId}");
+
+                    $params = rancherfleet_loadParamsForService($serviceId);
+                    if (!empty($params)) {
+                        rancherfleet_CleanupStaging($params);
+                    }
+                }
+            }
+        }
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("Cleanup cron: error: " . $e->getMessage());
+    }
 });
 
 // ---------------------------------------------------------------------------

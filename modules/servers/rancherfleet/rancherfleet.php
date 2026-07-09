@@ -2563,16 +2563,20 @@ function rancherfleet_getUpgradeRequest($serviceId)
 
 
 /**
- * Stores upgrade request in tbladdonmodules.
+ * Stores upgrade request in tbladdonmodules with staging support.
  */
 function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee)
 {
     try {
         $data = array(
-            'version'      => $version,
-            'fee'          => $fee,
-            'requested_at' => time(),
-            'status'       => 'pending',
+            'version'           => $version,
+            'fee'               => $fee,
+            'requested_at'      => time(),
+            'status'            => 'pending',
+            'staging_url'       => null,
+            'staging_shared'    => false,
+            'invoiceId'         => null,
+            'staging_created_at' => null,
         );
         \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
             array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
@@ -2585,7 +2589,7 @@ function rancherfleet_storeUpgradeRequest($serviceId, $version, $fee)
 
 
 /**
- * Renders the Upgrade Odoo Version card for the client area.
+ * Renders the Upgrade Odoo Version card for the client area with staging support.
  */
 function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentVersion)
 {
@@ -2599,16 +2603,36 @@ function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentV
     $html .= '<div style="margin-bottom:12px;">';
     $html .= '<p style="font-size:12px;color:#666;">Your instance is running Odoo <strong>' . htmlspecialchars($currentVersion) . '</strong></p>';
 
-    // Check for pending upgrade request
+    // Check for existing upgrade request
     $existingRequest = rancherfleet_getUpgradeRequest($serviceId);
     if (!empty($existingRequest)) {
-        $html .= '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:12px;">';
-        $html .= '<p style="margin:0;font-size:12px;color:#856404;">Your upgrade request to Odoo <strong>' . htmlspecialchars($existingRequest['version']) . '</strong> is pending admin approval.</p>';
-        $html .= '<form method="post" action="' . $serviceUrl . '" style="margin-top:10px;">';
-        $html .= '<input type="hidden" name="clientaction" value="cancel_version_upgrade">';
-        $html .= '<button type="submit" style="background:#dc3545;color:#fff;border:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:bold;cursor:pointer;">Cancel Request</button>';
-        $html .= '</form>';
-        $html .= '</div>';
+        $status = isset($existingRequest['status']) ? $existingRequest['status'] : 'pending';
+
+        if ($status === 'pending') {
+            // Pending staging creation
+            $html .= '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0;font-size:12px;color:#856404;">Your upgrade request to Odoo <strong>' . htmlspecialchars($existingRequest['version']) . '</strong> is pending. Our team is preparing your staging environment.</p>';
+            $html .= '<form method="post" action="' . $serviceUrl . '" style="margin-top:10px;">';
+            $html .= '<input type="hidden" name="clientaction" value="cancel_version_upgrade">';
+            $html .= '<button type="submit" style="background:#dc3545;color:#fff;border:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:bold;cursor:pointer;">Cancel Request</button>';
+            $html .= '</form>';
+            $html .= '</div>';
+        } elseif ($status === 'staging') {
+            // Staging is ready
+            $stagingUrl = isset($existingRequest['staging_url']) ? $existingRequest['staging_url'] : null;
+            $stagingShared = isset($existingRequest['staging_shared']) ? $existingRequest['staging_shared'] : false;
+
+            if ($stagingShared) {
+                $html .= '<div style="background:#d4edda;border:1px solid #28a745;border-radius:6px;padding:12px;margin-bottom:12px;">';
+                $html .= '<p style="margin:0;font-size:12px;color:#155724;">Your staging environment is ready at <strong>' . htmlspecialchars($stagingUrl) . '</strong>. Review it and contact support to proceed with the live upgrade.</p>';
+                $html .= '</div>';
+            } else {
+                $html .= '<div style="background:#cfe2ff;border:1px solid #0d6efd;border-radius:6px;padding:12px;margin-bottom:12px;">';
+                $html .= '<p style="margin:0;font-size:12px;color:#004085;">Your staging environment is being prepared. Please wait for admin confirmation.</p>';
+                $html .= '</div>';
+            }
+        }
+
         $html .= '</div>';
         $html .= '</div>';
         return $html;
@@ -2645,18 +2669,19 @@ function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentV
     $html .= '</div>';
 
     $html .= '<div style="background:#ffe9e9;border:1px solid #ffcccc;border-radius:6px;padding:12px;margin-bottom:12px;">';
-    $html .= '<p style="margin:0 0 8px;font-size:12px;font-weight:bold;color:#d63031;">⚠ Before upgrading:</p>';
+    $html .= '<p style="margin:0 0 8px;font-size:12px;font-weight:bold;color:#d63031;">⚠ Upgrade Process:</p>';
     $html .= '<ul style="margin:0;padding:0 0 0 20px;font-size:12px;color:#d63031;">';
-    $html .= '<li>Ensure you have a recent backup</li>';
-    $html .= '<li>Your instance will be offline for 15-30 minutes</li>';
-    $html .= '<li>This action cannot be undone</li>';
+    $html .= '<li>We will create a staging environment for you to review first</li>';
+    $html .= '<li>Once approved by our team, you can test the staging instance</li>';
+    $html .= '<li>Live upgrade will take 15-30 minutes of downtime</li>';
+    $html .= '<li>A backup will be taken before upgrading</li>';
     $html .= '</ul>';
     $html .= '</div>';
 
     $html .= '<div style="margin-bottom:12px;">';
     $html .= '<label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;">';
     $html .= '<input type="checkbox" name="upgrade_acknowledge" id="upgrade_acknowledge" onchange="updateSubmitButton()" style="cursor:pointer;">';
-    $html .= '<span>I understand my instance will be offline during the upgrade</span>';
+    $html .= '<span>I understand the upgrade will require downtime and cannot be undone</span>';
     $html .= '</label>';
     $html .= '</div>';
 
@@ -2909,7 +2934,10 @@ function rancherfleet_AdminCustomButtonArray()
         'Refresh Webhook Secret' => 'RefreshWebhookSecret',
         'Remove Custom URL'      => 'RemoveCustomUrl',
         'Patch Template Updates' => 'PatchTemplateUpdates',
-        'Trigger Version Upgrade' => 'TriggerVersionUpgrade',
+        'Create Staging Upgrade' => 'CreateStagingUpgrade',
+        'Share Staging URL'      => 'ShareStagingUrl',
+        'Trigger Live Upgrade'   => 'TriggerLiveUpgrade',
+        'Cleanup Staging'        => 'CleanupStaging',
     );
 }
 
@@ -6475,17 +6503,19 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
 
 
 /**
- * Admin button handler to execute a pending version upgrade.
- * Handles backup, scaling, image update, and credit charging.
+ * Admin button handler to create a staging environment for version upgrade.
+ * Creates staging namespace, database, branch, and GitRepo.
  */
-function rancherfleet_TriggerVersionUpgrade(array $params)
+function rancherfleet_CreateStagingUpgrade(array $params)
 {
-    RancherFleet\Logger::info("TriggerVersionUpgrade: starting");
+    RancherFleet\Logger::info("CreateStagingUpgrade: starting");
 
     try {
         $orderNum = rancherfleet_getOrderNumber($params);
         $namespace = 'whmcs-client-' . $orderNum;
+        $stagingNamespace = $namespace . '-staging';
         $serviceId = (int)$params['serviceid'];
+        $clientId = (int)$params['userid'];
 
         // Read pending upgrade request
         $request = rancherfleet_getUpgradeRequest($serviceId);
@@ -6494,36 +6524,254 @@ function rancherfleet_TriggerVersionUpgrade(array $params)
         }
 
         $targetVersion = $request['version'];
+        $currentVersion = null;
         $fee = $request['fee'];
 
-        RancherFleet\Logger::info("TriggerVersionUpgrade: {$namespace} to version {$targetVersion}, fee: ${fee}");
+        RancherFleet\Logger::info("CreateStagingUpgrade: {$namespace} to version {$targetVersion}");
 
-        // Execute the upgrade
-        $result = rancherfleet_executeVersionUpgrade($params, $namespace, $orderNum, $targetVersion, $fee);
+        list($rancher, $github) = rancherfleet_buildClients($params);
 
-        if (strpos($result, 'Success:') === 0) {
-            // Mark request as completed
-            try {
-                $data = array(
-                    'version'      => $targetVersion,
-                    'fee'          => $fee,
-                    'requested_at' => $request['requested_at'],
-                    'completed_at' => time(),
-                    'status'       => 'completed',
-                );
-                \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
-                    array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
-                    array('value' => json_encode($data))
-                );
-            } catch (\Exception $e) {
-                RancherFleet\Logger::error("TriggerVersionUpgrade: failed to mark completed: " . $e->getMessage());
-            }
+        // Get current version
+        $status = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
+        if ($status['image'] && preg_match('/odoo:([0-9.]+)/', $status['image'], $m)) {
+            $currentVersion = $m[1];
         }
 
-        return $result;
+        if (!$currentVersion) {
+            return 'Error: Could not determine current Odoo version.';
+        }
+
+        // 1. Charge credit
+        RancherFleet\Logger::info("CreateStagingUpgrade: charging ${fee}");
+        try {
+            $invoiceResult = localAPI('CreateInvoice', array(
+                'userid'           => $clientId,
+                'status'           => 'Unpaid',
+                'itemdescription1' => "Odoo version upgrade from {$currentVersion} to {$targetVersion} (staging)",
+                'itemamount1'      => $fee,
+                'itemtaxed1'       => false,
+                'paymentmethod'    => '',
+            ));
+
+            if (!isset($invoiceResult['result']) || $invoiceResult['result'] !== 'success') {
+                $err = isset($invoiceResult['message']) ? $invoiceResult['message'] : json_encode($invoiceResult);
+                return 'Error: Could not create invoice: ' . $err;
+            }
+
+            $invoiceId = (int)$invoiceResult['invoiceid'];
+
+            $creditResult = localAPI('ApplyCredit', array(
+                'clientid' => $clientId,
+                'amount'   => $fee,
+            ));
+
+            if (!isset($creditResult['result']) || $creditResult['result'] !== 'success') {
+                $err = isset($creditResult['message']) ? $creditResult['message'] : json_encode($creditResult);
+                return 'Error: Could not apply credit: ' . $err;
+            }
+
+            RancherFleet\Logger::info("CreateStagingUpgrade: credit charged, invoice {$invoiceId}");
+        } catch (\Exception $payEx) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: payment error: " . $payEx->getMessage());
+            return 'Error: Payment processing failed: ' . $payEx->getMessage();
+        }
+
+        // 2. Take backup before staging
+        RancherFleet\Logger::info("CreateStagingUpgrade: taking backup");
+        try {
+            $backupResult = rancherfleet_handleBackupRestore($params, $namespace, $orderNum, '', 'db', true);
+            if (strpos($backupResult, 'error') !== false) {
+                RancherFleet\Logger::error("CreateStagingUpgrade: backup failed, refunding");
+                localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+                return 'Error: Backup failed. Credit refunded.';
+            }
+        } catch (\Exception $backEx) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: backup exception: " . $backEx->getMessage());
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: ' . $backEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 3. Create staging namespace
+        RancherFleet\Logger::info("CreateStagingUpgrade: creating staging namespace");
+        try {
+            $rancher->createNamespace($stagingNamespace);
+            sleep(2);
+        } catch (\Exception $nsEx) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: namespace creation failed: " . $nsEx->getMessage());
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 4. Create staging database (clone of production)
+        RancherFleet\Logger::info("CreateStagingUpgrade: creating staging database");
+        try {
+            $dbName = 'odoo-' . $orderNum;
+            $stagingDbName = $dbName . '-staging';
+
+            $jobSpec = array(
+                'apiVersion' => 'batch/v1',
+                'kind'       => 'Job',
+                'metadata'   => array('name' => 'createdb-' . $orderNum . '-staging', 'namespace' => $stagingNamespace),
+                'spec'       => array(
+                    'template' => array(
+                        'spec' => array(
+                            'containers' => array(
+                                array(
+                                    'name'  => 'postgres',
+                                    'image' => 'postgres:16-alpine',
+                                    'env'   => array(
+                                        array('name' => 'PGPASSWORD', 'value' => getenv('DB_PASSWORD')),
+                                    ),
+                                    'command' => array('/bin/sh', '-c'),
+                                    'args'    => array(
+                                        'pg_terminate_backend(pid) from pg_stat_activity where datname=\'' . $dbName . '\'; ' .
+                                        'createdb -h postgres16.default.svc.cluster.local -U postgres --template "' . $dbName . '" "' . $stagingDbName . '"'
+                                    ),
+                                ),
+                            ),
+                            'restartPolicy' => 'Never',
+                        ),
+                    ),
+                    'backoffLimit' => 3,
+                ),
+            );
+
+            $rancher->createJob($stagingNamespace, $jobSpec);
+            sleep(5);
+        } catch (\Exception $dbEx) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: database creation failed: " . $dbEx->getMessage());
+            $rancher->deleteNamespace($stagingNamespace);
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: Failed to create staging database: ' . $dbEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 5. Clone client branch to staging branch
+        RancherFleet\Logger::info("CreateStagingUpgrade: cloning branch");
+        try {
+            $clientBranch = 'whmcs-client-' . $orderNum;
+            $stagingBranch = $clientBranch . '-staging';
+            $github->createOrUpdateBranch($stagingBranch, $clientBranch);
+        } catch (\Exception $branchEx) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: branch clone failed: " . $branchEx->getMessage());
+            $rancher->deleteNamespace($stagingNamespace);
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: Failed to clone branch: ' . $branchEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 6. Update staging branch manifests
+        RancherFleet\Logger::info("CreateStagingUpgrade: updating staging manifests");
+        try {
+            $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
+
+            // Get current odoo.yml
+            $content = $github->getFileContent($stagingBranch, 'odoo.yml');
+
+            // Replace namespace references
+            $updated = str_replace('whmcs-client-' . $orderNum, $stagingNamespace, $content);
+
+            // Replace image version
+            $updated = str_replace('image: odoo:' . $currentVersion, 'image: odoo:' . $targetVersion, $updated);
+
+            // Replace database name
+            $updated = str_replace('odoo-' . $orderNum, 'odoo-' . $orderNum . '-staging', $updated);
+
+            // Replace ingress hostname
+            $updated = str_replace(
+                'whmcs-client-' . $orderNum . '.webdiscode.com',
+                'staging-' . $orderNum . '.webdiscode.com',
+                $updated
+            );
+
+            $github->createOrUpdateFile(
+                $stagingBranch,
+                'odoo.yml',
+                $updated,
+                'Staging environment for Odoo upgrade to ' . $targetVersion
+            );
+
+            RancherFleet\Logger::info("CreateStagingUpgrade: manifests updated");
+        } catch (\Exception $manifestEx) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: manifest update failed: " . $manifestEx->getMessage());
+            $rancher->deleteNamespace($stagingNamespace);
+            $github->deleteBranch($stagingBranch);
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: Failed to update staging manifests: ' . $manifestEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 7. Create staging Fleet GitRepo
+        RancherFleet\Logger::info("CreateStagingUpgrade: creating staging GitRepo");
+        try {
+            $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
+            $gitRepo = array(
+                'apiVersion' => 'fleet.cattle.io/v1alpha1',
+                'kind'       => 'GitRepo',
+                'metadata'   => array('name' => 'gitrepo-' . $stagingNamespace, 'namespace' => 'fleet-default'),
+                'spec'       => array(
+                    'repo'         => 'https://github.com/primeworks/rancher',
+                    'branch'       => $stagingBranch,
+                    'paths'        => array($stagingNamespace),
+                    'targets'      => array(
+                        array('name' => getenv('TARGET_CLUSTER_ID')),
+                    ),
+                ),
+            );
+
+            $rancher->createFleetGitRepo('fleet-default', $gitRepo);
+            sleep(5);
+
+            RancherFleet\Logger::info("CreateStagingUpgrade: staging GitRepo created");
+        } catch (\Exception $gitRepoEx) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: GitRepo creation failed: " . $gitRepoEx->getMessage());
+            $rancher->deleteNamespace($stagingNamespace);
+            $github->deleteBranch('whmcs-client-' . $orderNum . '-staging');
+            localAPI('AddCredit', array('clientid' => $clientId, 'amount' => $fee));
+            return 'Error: Failed to create staging GitRepo: ' . $gitRepoEx->getMessage() . ' Credit refunded.';
+        }
+
+        // 8. Update request record
+        $stagingUrl = 'https://staging-' . $orderNum . '.webdiscode.com';
+        try {
+            $data = array(
+                'version'            => $targetVersion,
+                'fee'                => $fee,
+                'requested_at'       => $request['requested_at'],
+                'status'             => 'staging',
+                'staging_url'        => $stagingUrl,
+                'staging_shared'     => false,
+                'invoiceId'          => $invoiceId,
+                'staging_created_at' => time(),
+            );
+            \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+                array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
+                array('value' => json_encode($data))
+            );
+        } catch (\Exception $e) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: failed to update request: " . $e->getMessage());
+        }
+
+        // 9. Store cleanup job
+        try {
+            $cleanupData = array(
+                'namespace'      => $stagingNamespace,
+                'branch'         => 'whmcs-client-' . $orderNum . '-staging',
+                'gitrepo'        => 'gitrepo-' . $stagingNamespace,
+                'db'             => 'odoo-' . $orderNum . '-staging',
+                'cleanup_at'     => time() + 172800,  // 48 hours
+            );
+            \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+                array('module' => 'rancherfleet_upgrade_cleanup', 'setting' => 'cleanup_' . $serviceId),
+                array('value' => json_encode($cleanupData))
+            );
+        } catch (\Exception $e) {
+            RancherFleet\Logger::error("CreateStagingUpgrade: failed to store cleanup job: " . $e->getMessage());
+        }
+
+        rancherfleet_logHistory($params, 'Staging Upgrade Created', 'Staging environment created for Odoo upgrade to ' . $targetVersion . ' at ' . $stagingUrl);
+
+        return 'Success: Staging instance created at ' . $stagingUrl . '. Review it and click "Share Staging URL" to notify client, or "Trigger Live Upgrade" when ready.';
 
     } catch (\Exception $e) {
-        RancherFleet\Logger::error("TriggerVersionUpgrade: " . $e->getMessage());
+        RancherFleet\Logger::error("CreateStagingUpgrade: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -6671,6 +6919,274 @@ function rancherfleet_executeVersionUpgrade(array $params, $namespace, $orderNum
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("executeVersionUpgrade: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+
+/**
+ * Admin button handler to share staging URL with client.
+ */
+function rancherfleet_ShareStagingUrl(array $params)
+{
+    RancherFleet\Logger::info("ShareStagingUrl: starting");
+
+    try {
+        $serviceId = (int)$params['serviceid'];
+        $clientId = (int)$params['userid'];
+
+        // Read upgrade request
+        $request = rancherfleet_getUpgradeRequest($serviceId);
+        if (empty($request) || $request['status'] !== 'staging') {
+            return 'No staging upgrade in progress for this service.';
+        }
+
+        $stagingUrl = isset($request['staging_url']) ? $request['staging_url'] : null;
+        if (!$stagingUrl) {
+            return 'Error: Staging URL not found in request.';
+        }
+
+        // Send email to client
+        try {
+            sendEmail('client_upgrade_staging_ready', $clientId, array(
+                'staging_url' => $stagingUrl,
+            ));
+        } catch (\Exception $emailEx) {
+            RancherFleet\Logger::error("ShareStagingUrl: email error: " . $emailEx->getMessage());
+        }
+
+        // Update request
+        $request['staging_shared'] = true;
+        \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+            array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
+            array('value' => json_encode($request))
+        );
+
+        rancherfleet_logHistory($params, 'Staging URL Shared', 'Staging URL ' . $stagingUrl . ' shared with client');
+
+        return 'Success: Staging URL shared with client at ' . $stagingUrl;
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("ShareStagingUrl: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+
+/**
+ * Admin button handler to trigger live upgrade from staging.
+ * Scales production down, updates image, scales back up.
+ */
+function rancherfleet_TriggerLiveUpgrade(array $params)
+{
+    RancherFleet\Logger::info("TriggerLiveUpgrade: starting");
+
+    try {
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        // Read upgrade request
+        $request = rancherfleet_getUpgradeRequest($serviceId);
+        if (empty($request) || $request['status'] !== 'staging') {
+            return 'No staging upgrade ready for this service.';
+        }
+
+        $targetVersion = $request['version'];
+        $invoiceId = isset($request['invoiceId']) ? $request['invoiceId'] : 0;
+
+        RancherFleet\Logger::info("TriggerLiveUpgrade: {$namespace} to version {$targetVersion}");
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // Get current version
+        $status = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
+        $currentVersion = null;
+        if ($status['image'] && preg_match('/odoo:([0-9.]+)/', $status['image'], $m)) {
+            $currentVersion = $m[1];
+        }
+
+        // 1. Scale deployment to 0
+        RancherFleet\Logger::info("TriggerLiveUpgrade: scaling to 0");
+        try {
+            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 0);
+            sleep(3);
+        } catch (\Exception $scaleEx) {
+            RancherFleet\Logger::error("TriggerLiveUpgrade: scale error: " . $scaleEx->getMessage());
+            return 'Error: Failed to scale deployment down. ' . $scaleEx->getMessage();
+        }
+
+        // 2. Update odoo.yml with new version
+        RancherFleet\Logger::info("TriggerLiveUpgrade: updating odoo.yml");
+        try {
+            $branch = 'whmcs-client-' . $orderNum;
+            $content = $github->getFileContent($branch, 'odoo.yml');
+
+            $updated = str_replace('image: odoo:' . $currentVersion, 'image: odoo:' . $targetVersion, $content);
+
+            if ($updated === $content) {
+                throw new \Exception('Image tag replacement failed - pattern not found');
+            }
+
+            $github->createOrUpdateFile(
+                $branch,
+                'odoo.yml',
+                $updated,
+                'Upgrade Odoo from ' . $currentVersion . ' to ' . $targetVersion
+            );
+
+            RancherFleet\Logger::info("TriggerLiveUpgrade: odoo.yml updated");
+            sleep(5);
+        } catch (\Exception $updateEx) {
+            RancherFleet\Logger::error("TriggerLiveUpgrade: update error: " . $updateEx->getMessage());
+            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 1);
+            return 'Error: Failed to update deployment. ' . $updateEx->getMessage();
+        }
+
+        // 3. Scale deployment back to 1
+        RancherFleet\Logger::info("TriggerLiveUpgrade: scaling back to 1");
+        try {
+            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 1);
+            sleep(3);
+        } catch (\Exception $scaleBackEx) {
+            RancherFleet\Logger::error("TriggerLiveUpgrade: scale back error: " . $scaleBackEx->getMessage());
+            return 'Warning: Deployment scaled back but may need manual intervention. ' . $scaleBackEx->getMessage();
+        }
+
+        // 4. Update request to completed
+        try {
+            $request['status'] = 'completed';
+            $request['completed_at'] = time();
+            \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+                array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
+                array('value' => json_encode($request))
+            );
+        } catch (\Exception $e) {
+            RancherFleet\Logger::error("TriggerLiveUpgrade: failed to update request: " . $e->getMessage());
+        }
+
+        // 5. Trigger cleanup
+        rancherfleet_CleanupStaging($params);
+
+        // 6. Record in history
+        rancherfleet_logHistory($params, 'Odoo Upgraded', 'Upgraded from ' . $currentVersion . ' to ' . $targetVersion . ' (Invoice #' . $invoiceId . ')');
+
+        RancherFleet\Logger::info("TriggerLiveUpgrade: SUCCESS");
+        return 'Success: Odoo upgraded from ' . $currentVersion . ' to ' . $targetVersion . '. Staging environment cleanup initiated.';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("TriggerLiveUpgrade: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+
+/**
+ * Admin button handler to cleanup staging environment.
+ * Deletes namespace, branch, GitRepo, and database.
+ */
+function rancherfleet_CleanupStaging(array $params)
+{
+    RancherFleet\Logger::info("CleanupStaging: starting");
+
+    try {
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $serviceId = (int)$params['serviceid'];
+
+        // Read cleanup record
+        $record = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade_cleanup')
+            ->where('setting', 'cleanup_' . $serviceId)
+            ->first();
+
+        if (!$record) {
+            return 'No staging cleanup job found for this service.';
+        }
+
+        $cleanup = json_decode($record->value, true);
+        $stagingNamespace = $cleanup['namespace'];
+        $stagingBranch = $cleanup['branch'];
+        $gitrepo = $cleanup['gitrepo'];
+        $stagingDb = $cleanup['db'];
+
+        RancherFleet\Logger::info("CleanupStaging: removing {$stagingNamespace}");
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // 1. Delete staging namespace
+        try {
+            $rancher->deleteNamespace($stagingNamespace);
+            RancherFleet\Logger::info("CleanupStaging: namespace deleted");
+        } catch (\Exception $nsEx) {
+            RancherFleet\Logger::error("CleanupStaging: namespace deletion error (non-fatal): " . $nsEx->getMessage());
+        }
+
+        // 2. Delete staging branch
+        try {
+            $github->deleteBranch($stagingBranch);
+            RancherFleet\Logger::info("CleanupStaging: branch deleted");
+        } catch (\Exception $branchEx) {
+            RancherFleet\Logger::error("CleanupStaging: branch deletion error (non-fatal): " . $branchEx->getMessage());
+        }
+
+        // 3. Delete Fleet GitRepo
+        try {
+            $rancher->deleteFleetGitRepo('fleet-default', $gitrepo);
+            RancherFleet\Logger::info("CleanupStaging: GitRepo deleted");
+        } catch (\Exception $gitrepoEx) {
+            RancherFleet\Logger::error("CleanupStaging: GitRepo deletion error (non-fatal): " . $gitrepoEx->getMessage());
+        }
+
+        // 4. Drop staging database via Job
+        try {
+            $jobSpec = array(
+                'apiVersion' => 'batch/v1',
+                'kind'       => 'Job',
+                'metadata'   => array('name' => 'dropdb-' . $orderNum . '-staging', 'namespace' => 'default'),
+                'spec'       => array(
+                    'template' => array(
+                        'spec' => array(
+                            'containers' => array(
+                                array(
+                                    'name'  => 'postgres',
+                                    'image' => 'postgres:16-alpine',
+                                    'env'   => array(
+                                        array('name' => 'PGPASSWORD', 'value' => getenv('DB_PASSWORD')),
+                                    ),
+                                    'command' => array('/bin/sh', '-c'),
+                                    'args'    => array('dropdb -h postgres16.default.svc.cluster.local -U postgres --if-exists "' . $stagingDb . '"'),
+                                ),
+                            ),
+                            'restartPolicy' => 'Never',
+                        ),
+                    ),
+                    'backoffLimit' => 3,
+                ),
+            );
+
+            $rancher->createJob('default', $jobSpec);
+            RancherFleet\Logger::info("CleanupStaging: database drop job created");
+        } catch (\Exception $dbEx) {
+            RancherFleet\Logger::error("CleanupStaging: database drop error (non-fatal): " . $dbEx->getMessage());
+        }
+
+        // 5. Delete cleanup record
+        try {
+            \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_upgrade_cleanup')
+                ->where('setting', 'cleanup_' . $serviceId)
+                ->delete();
+        } catch (\Exception $e) {
+            RancherFleet\Logger::error("CleanupStaging: failed to delete cleanup record: " . $e->getMessage());
+        }
+
+        rancherfleet_logHistory($params, 'Staging Cleanup', 'Staging environment cleaned up');
+
+        RancherFleet\Logger::info("CleanupStaging: SUCCESS");
+        return 'Success: Staging environment cleaned up.';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("CleanupStaging: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
