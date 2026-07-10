@@ -7570,42 +7570,56 @@ function rancherfleet_CreateStagingOverride(array $params)
 
 
 /**
- * Admin button handler to trigger live upgrade from staging.
- * Scales production down, updates image, scales back up.
+ * Trigger live upgrade using Option D maintenance window approach.
+ * Scales down, takes fresh dump, runs OpenUpgrade, atomically switches DB.
  */
 function rancherfleet_TriggerLiveUpgrade(array $params)
 {
-    RancherFleet\Logger::info("TriggerLiveUpgrade: starting");
+    RancherFleet\Logger::info("TriggerLiveUpgrade: starting Option D maintenance window");
 
     try {
         $orderNum = rancherfleet_getOrderNumber($params);
         $namespace = 'whmcs-client-' . $orderNum;
         $serviceId = (int)$params['serviceid'];
 
-        // Read upgrade request
         $request = rancherfleet_getUpgradeRequest($serviceId);
         if (empty($request) || $request['status'] !== 'staging') {
             return 'No staging upgrade ready for this service.';
         }
 
         $targetVersion = $request['version'];
-        $invoiceId = isset($request['invoiceId']) ? $request['invoiceId'] : 0;
+        $targetMajor = (int)explode('.', $targetVersion)[0];
+        $currentVersion = $request['fromVersion'] ?? '16.0';
+        $currentMajor = (int)explode('.', $currentVersion)[0];
 
-        RancherFleet\Logger::info("TriggerLiveUpgrade: {$namespace} to version {$targetVersion}");
+        RancherFleet\Logger::info("TriggerLiveUpgrade: {$namespace} {$currentMajor} -> {$targetMajor} (Option D)");
 
         list($rancher, $github) = rancherfleet_buildClients($params);
 
-        // Verify staging database exists before proceeding
-        RancherFleet\Logger::info("TriggerLiveUpgrade: verifying staging database exists");
-        try {
-            $dbSecretName = 'rfm-db-admin-' . $orderNum;
-            $stagingDbName = 'odoo-' . $orderNum . '-staging';
+        // 1. Scale production to 0 (start maintenance window)
+        RancherFleet\Logger::info("TriggerLiveUpgrade: entering maintenance window, scaling production to 0");
+        rancherfleet_updateUpgradeStatus($serviceId, 'maintenance_window', array('maintenance_started_at' => time()));
 
-            // Create a verification Job to check if the staging database exists
-            $verifyJobSpec = array(
+        try {
+            $rancher->scaleDeployment($namespace, 'odoo', 0);
+            sleep(10);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::error("TriggerLiveUpgrade: scale down failed: " . $e->getMessage());
+            return 'Error: Failed to scale down production. ' . $e->getMessage();
+        }
+
+        $dbSecretName = 'rfm-db-admin-' . $orderNum;
+        $prodDbName = 'odoo-' . $orderNum;
+        $preUpgradeDb = 'odoo-' . $orderNum . '-pre-upgrade';
+        $upgradedDbName = 'odoo-' . $orderNum . '_' . $targetMajor;
+
+        // 2. Take fresh pg_dump of production database and backup current DB
+        RancherFleet\Logger::info("TriggerLiveUpgrade: backing up production database");
+        try {
+            $backupJobSpec = array(
                 'apiVersion' => 'batch/v1',
                 'kind'       => 'Job',
-                'metadata'   => array('name' => 'verify-db-' . $orderNum . '-' . time(), 'namespace' => 'default'),
+                'metadata'   => array('name' => 'backupdb-' . $orderNum . '-upgrade', 'namespace' => 'default'),
                 'spec'       => array(
                     'ttlSecondsAfterFinished' => 60,
                     'backoffLimit'            => 0,
@@ -7615,7 +7629,7 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
                             'volumes' => array(
                                 array(
                                     'name' => 'db-credentials',
-                                    'secret' => array('secretName' => $dbSecretName, 'defaultMode' => 0400),
+                                    'secret' => array('secretName' => $dbSecretName),
                                 ),
                             ),
                             'containers' => array(
@@ -7635,17 +7649,18 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
                                         "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
                                         "export PGPASSWORD=\"\$DB_PASS\"\n" .
                                         "\n" .
-                                        "psql -h postgres16.default.svc.cluster.local \\\n" .
-                                        "  -U \"\$DB_USER\" -d postgres \\\n" .
-                                        "  -tc \"SELECT 1 FROM pg_database WHERE datname='" . $stagingDbName . "';\" | grep -q 1\n" .
+                                        "# Terminate active connections\n" .
+                                        "psql -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='" . $prodDbName . "' AND pid<>pg_backend_pid();\" 2>/dev/null || true\n" .
                                         "\n" .
-                                        "if [ \$? -eq 0 ]; then\n" .
-                                        "  echo \"Staging database exists\"\n" .
-                                        "  exit 0\n" .
-                                        "else\n" .
-                                        "  echo \"Staging database not found\"\n" .
-                                        "  exit 1\n" .
-                                        "fi"
+                                        "# Delete old pre-upgrade backup if exists\n" .
+                                        "dropdb -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" --if-exists \"" . $preUpgradeDb . "\" 2>/dev/null || true\n" .
+                                        "\n" .
+                                        "# Clone current database as backup (safe atomic copy)\n" .
+                                        "createdb -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" \\\n" .
+                                        "  --template \"" . $prodDbName . "\" \"" . $preUpgradeDb . "\"\n" .
+                                        "\n" .
+                                        "echo \"Database backup complete\""
                                     ),
                                 ),
                             ),
@@ -7654,80 +7669,258 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
                 ),
             );
 
-            $verifyJobName = 'verify-db-' . $orderNum . '-' . time();
-            $response = $rancher->rawRequest('POST',
-                '/apis/batch/v1/namespaces/default/jobs',
-                $verifyJobSpec
-            );
+            $rancher->rawRequest('POST', '/apis/batch/v1/namespaces/default/jobs', $backupJobSpec);
 
-            RancherFleet\Logger::info("TriggerLiveUpgrade: verification Job created: {$verifyJobName}");
+            $backupJobName = 'backupdb-' . $orderNum . '-upgrade';
+            $backupJobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($backupJobName);
+            $backupSucceeded = false;
 
-            // Poll for completion
-            $jobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($verifyJobName);
-            $verified = false;
-            $failed = false;
-
-            for ($i = 0; $i < 12; $i++) {
+            for ($i = 0; $i < 24; $i++) {
                 sleep(5);
                 try {
-                    $job = $rancher->rawRequest('GET', $jobPath);
+                    $job = $rancher->rawRequest('GET', $backupJobPath);
                     $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
                     foreach ($conditions as $cond) {
                         if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
-                            $verified = true; break 2;
-                        }
-                        if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
-                            $failed = true; break 2;
+                            $backupSucceeded = true; break 2;
                         }
                     }
-                } catch (\Exception $pollEx) {
-                    RancherFleet\Logger::error("TriggerLiveUpgrade: error polling verification Job: " . $pollEx->getMessage());
-                    break;
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::error("TriggerLiveUpgrade: error polling backup Job: " . $e->getMessage());
                 }
             }
 
-            // Clean up
             try {
-                $rancher->rawRequest('DELETE', $jobPath);
+                $rancher->rawRequest('DELETE', $backupJobPath);
             } catch (\Exception $e) {
-                RancherFleet\Logger::info("TriggerLiveUpgrade: verification Job cleanup note: " . $e->getMessage());
+                RancherFleet\Logger::info("TriggerLiveUpgrade: backup Job cleanup note: " . $e->getMessage());
             }
 
-            if ($failed) {
-                RancherFleet\Logger::error("TriggerLiveUpgrade: staging database verification failed");
-                return 'Staging database not found. Complete the manual OpenUpgrade steps before triggering the live upgrade.';
+            if (!$backupSucceeded) {
+                $rancher->scaleDeployment($namespace, 'odoo', 1);
+                return 'Error: Failed to backup production database.';
             }
-
-            if (!$verified) {
-                RancherFleet\Logger::error("TriggerLiveUpgrade: staging database verification timed out");
-                return 'Database verification timed out. Please try again later.';
-            }
-
-            RancherFleet\Logger::info("TriggerLiveUpgrade: staging database verified successfully");
-        } catch (\Exception $verifyEx) {
-            RancherFleet\Logger::error("TriggerLiveUpgrade: database verification error: " . $verifyEx->getMessage());
-            return 'Error verifying staging database: ' . $verifyEx->getMessage();
+        } catch (\Exception $backupEx) {
+            $rancher->scaleDeployment($namespace, 'odoo', 1);
+            return 'Error: Database backup failed: ' . $backupEx->getMessage();
         }
 
-        // Get current version
-        $status = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
-        $currentVersion = null;
-        if ($status['image'] && preg_match('/odoo:([0-9.]+)/', $status['image'], $m)) {
-            $currentVersion = $m[1];
-        }
-
-        // 1. Scale deployment to 0
-        RancherFleet\Logger::info("TriggerLiveUpgrade: scaling to 0");
+        // 3. Run OpenUpgrade on production database (creates odoo-{orderNum}_{targetVersion})
+        RancherFleet\Logger::info("TriggerLiveUpgrade: running OpenUpgrade on production database");
         try {
-            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 0);
-            sleep(3);
-        } catch (\Exception $scaleEx) {
-            RancherFleet\Logger::error("TriggerLiveUpgrade: scale error: " . $scaleEx->getMessage());
-            return 'Error: Failed to scale deployment down. ' . $scaleEx->getMessage();
+            $upgradeJobSpec = array(
+                'apiVersion' => 'batch/v1',
+                'kind'       => 'Job',
+                'metadata'   => array('name' => 'upgrade-live-' . $orderNum, 'namespace' => 'rfm-upgrade'),
+                'spec'       => array(
+                    'ttlSecondsAfterFinished' => 3600,
+                    'backoffLimit'            => 0,
+                    'template' => array(
+                        'spec' => array(
+                            'restartPolicy' => 'Never',
+                            'serviceAccountName' => 'openupgrade-runner',
+                            'volumes' => array(
+                                array(
+                                    'name' => 'odoo-data',
+                                    'persistentVolumeClaim' => array(
+                                        'claimName' => 'odoo-' . $orderNum,
+                                        'readOnly'  => false,
+                                    ),
+                                ),
+                            ),
+                            'containers' => array(
+                                array(
+                                    'name'  => 'openupgrade',
+                                    'image' => 'ikus060/openupgrade:' . $targetMajor,
+                                    'command' => array('odoo-openupgrade'),
+                                    'args' => array('--db-name', $prodDbName, '--neutralize'),
+                                    'env' => array(
+                                        array('name' => 'HOST', 'value' => 'postgres16.default.svc.cluster.local'),
+                                        array(
+                                            'name' => 'USER',
+                                            'valueFrom' => array(
+                                                'secretKeyRef' => array(
+                                                    'name' => $dbSecretName,
+                                                    'namespace' => 'default',
+                                                    'key' => 'username',
+                                                    'optional' => true,
+                                                ),
+                                            ),
+                                        ),
+                                        array(
+                                            'name' => 'PASSWORD',
+                                            'valueFrom' => array(
+                                                'secretKeyRef' => array(
+                                                    'name' => $dbSecretName,
+                                                    'namespace' => 'default',
+                                                    'key' => 'password',
+                                                    'optional' => true,
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                    'volumeMounts' => array(
+                                        array(
+                                            'name'      => 'odoo-data',
+                                            'mountPath' => '/var/lib/odoo',
+                                            'subPath'   => 'odoo',
+                                        ),
+                                    ),
+                                    'resources' => array(
+                                        'requests' => array(
+                                            'cpu'    => '500m',
+                                            'memory' => '1Gi',
+                                        ),
+                                        'limits' => array(
+                                            'cpu'    => '2',
+                                            'memory' => '4Gi',
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            );
+
+            $rancher->rawRequest('POST', '/apis/batch/v1/namespaces/rfm-upgrade/jobs', $upgradeJobSpec);
+
+            $upgradeJobName = 'upgrade-live-' . $orderNum;
+            $upgradeJobPath = '/apis/batch/v1/namespaces/rfm-upgrade/jobs/' . rawurlencode($upgradeJobName);
+            $upgradeSucceeded = false;
+            $lastLogTime = time();
+            $pollCount = 0;
+
+            for ($i = 0; $i < 720; $i++) {  // 3600 seconds
+                sleep(5);
+                $pollCount++;
+
+                if (time() - $lastLogTime >= 60) {
+                    $elapsedMin = ($pollCount * 5) / 60;
+                    RancherFleet\Logger::info("TriggerLiveUpgrade: OpenUpgrade running... {$elapsedMin} minutes elapsed");
+                    $lastLogTime = time();
+                }
+
+                try {
+                    $job = $rancher->rawRequest('GET', $upgradeJobPath);
+                    $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                    foreach ($conditions as $cond) {
+                        if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                            $upgradeSucceeded = true; break 2;
+                        }
+                    }
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::error("TriggerLiveUpgrade: error polling upgrade Job: " . $e->getMessage());
+                }
+            }
+
+            try {
+                $rancher->rawRequest('DELETE', $upgradeJobPath);
+            } catch (\Exception $e) {
+                RancherFleet\Logger::info("TriggerLiveUpgrade: upgrade Job cleanup note: " . $e->getMessage());
+            }
+
+            if (!$upgradeSucceeded) {
+                $rancher->scaleDeployment($namespace, 'odoo', 1);
+                return 'Error: OpenUpgrade Job failed or timed out during maintenance window.';
+            }
+        } catch (\Exception $upgradeEx) {
+            $rancher->scaleDeployment($namespace, 'odoo', 1);
+            return 'Error: OpenUpgrade failed: ' . $upgradeEx->getMessage();
         }
 
-        // 2. Update odoo.yml with new version
-        RancherFleet\Logger::info("TriggerLiveUpgrade: updating odoo.yml");
+        // 4. Rename upgraded database to production
+        RancherFleet\Logger::info("TriggerLiveUpgrade: renaming upgraded database to production");
+        try {
+            $renameJobSpec = array(
+                'apiVersion' => 'batch/v1',
+                'kind'       => 'Job',
+                'metadata'   => array('name' => 'renamedb-live-' . $orderNum, 'namespace' => 'default'),
+                'spec'       => array(
+                    'ttlSecondsAfterFinished' => 60,
+                    'backoffLimit'            => 0,
+                    'template' => array(
+                        'spec' => array(
+                            'restartPolicy' => 'Never',
+                            'volumes' => array(
+                                array(
+                                    'name' => 'db-credentials',
+                                    'secret' => array('secretName' => $dbSecretName),
+                                ),
+                            ),
+                            'containers' => array(
+                                array(
+                                    'name'  => 'postgres',
+                                    'image' => 'postgres:16-alpine',
+                                    'volumeMounts' => array(
+                                        array(
+                                            'name'      => 'db-credentials',
+                                            'mountPath' => '/etc/rfm-db',
+                                            'readOnly'  => true,
+                                        ),
+                                    ),
+                                    'command' => array('sh', '-c'),
+                                    'args'    => array(
+                                        "DB_USER=\$(cat /etc/rfm-db/username)\n" .
+                                        "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
+                                        "export PGPASSWORD=\"\$DB_PASS\"\n" .
+                                        "\n" .
+                                        "# Atomic swap: old prod -> deleted, upgraded -> prod\n" .
+                                        "psql -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='" . $prodDbName . "' AND pid<>pg_backend_pid();\" 2>/dev/null || true\n" .
+                                        "\n" .
+                                        "dropdb -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" --if-exists \"" . $prodDbName . "\" 2>/dev/null || true\n" .
+                                        "\n" .
+                                        "psql -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -c \"ALTER DATABASE \\\"" . $upgradedDbName . "\\\" RENAME TO \\\"" . $prodDbName . "\\\";\"\n" .
+                                        "\n" .
+                                        "echo \"Database switch complete\""
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            );
+
+            $rancher->rawRequest('POST', '/apis/batch/v1/namespaces/default/jobs', $renameJobSpec);
+
+            $renameJobName = 'renamedb-live-' . $orderNum;
+            $renameJobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($renameJobName);
+            $renameSucceeded = false;
+
+            for ($i = 0; $i < 24; $i++) {
+                sleep(5);
+                try {
+                    $job = $rancher->rawRequest('GET', $renameJobPath);
+                    $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                    foreach ($conditions as $cond) {
+                        if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                            $renameSucceeded = true; break 2;
+                        }
+                    }
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::error("TriggerLiveUpgrade: error polling rename Job: " . $e->getMessage());
+                }
+            }
+
+            try {
+                $rancher->rawRequest('DELETE', $renameJobPath);
+            } catch (\Exception $e) {
+                RancherFleet\Logger::info("TriggerLiveUpgrade: rename Job cleanup note: " . $e->getMessage());
+            }
+
+            if (!$renameSucceeded) {
+                $rancher->scaleDeployment($namespace, 'odoo', 1);
+                return 'Error: Failed to switch production database to upgraded version.';
+            }
+        } catch (\Exception $renameEx) {
+            $rancher->scaleDeployment($namespace, 'odoo', 1);
+            return 'Error: Database rename failed: ' . $renameEx->getMessage();
+        }
+
+        // 5. Update image tag
+        RancherFleet\Logger::info("TriggerLiveUpgrade: updating image tag to {$targetVersion}");
         try {
             $branch = 'whmcs-client-' . $orderNum;
             $content = $github->getFileContent($branch, 'odoo.yml');
@@ -7735,7 +7928,8 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
             $updated = str_replace('image: odoo:' . $currentVersion, 'image: odoo:' . $targetVersion, $content);
 
             if ($updated === $content) {
-                throw new \Exception('Image tag replacement failed - pattern not found');
+                RancherFleet\Logger::warn("TriggerLiveUpgrade: image tag replacement not found, attempting odoo:{currentVersion} pattern");
+                $updated = preg_replace('/image:\s*odoo:[0-9.]+/', 'image: odoo:' . $targetVersion, $content);
             }
 
             $github->createOrUpdateFile(
@@ -7745,45 +7939,39 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
                 'Upgrade Odoo from ' . $currentVersion . ' to ' . $targetVersion
             );
 
-            RancherFleet\Logger::info("TriggerLiveUpgrade: odoo.yml updated");
+            RancherFleet\Logger::info("TriggerLiveUpgrade: image tag updated");
             sleep(5);
         } catch (\Exception $updateEx) {
-            RancherFleet\Logger::error("TriggerLiveUpgrade: update error: " . $updateEx->getMessage());
-            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 1);
-            return 'Error: Failed to update deployment. ' . $updateEx->getMessage();
+            $rancher->scaleDeployment($namespace, 'odoo', 1);
+            return 'Error: Failed to update image tag. Database upgrade succeeded but deployment may need manual correction. ' . $updateEx->getMessage();
         }
 
-        // 3. Scale deployment back to 1
-        RancherFleet\Logger::info("TriggerLiveUpgrade: scaling back to 1");
+        // 6. Scale production back to 1 (end maintenance window)
+        RancherFleet\Logger::info("TriggerLiveUpgrade: scaling production back to 1, ending maintenance window");
         try {
-            $rancher->scaleDeployment($namespace, 'odoo-' . $orderNum, 1);
-            sleep(3);
-        } catch (\Exception $scaleBackEx) {
-            RancherFleet\Logger::error("TriggerLiveUpgrade: scale back error: " . $scaleBackEx->getMessage());
-            return 'Warning: Deployment scaled back but may need manual intervention. ' . $scaleBackEx->getMessage();
+            $rancher->scaleDeployment($namespace, 'odoo', 1);
+            sleep(15);
+        } catch (\Exception $scaleEx) {
+            RancherFleet\Logger::error("TriggerLiveUpgrade: scale up failed: " . $scaleEx->getMessage());
+            return 'Warning: Database upgraded but failed to scale production back up. ' . $scaleEx->getMessage();
         }
 
-        // 4. Update request to completed
-        try {
-            $request['status'] = 'completed';
-            $request['completed_at'] = time();
-            RancherFleet\Logger::info("TriggerLiveUpgrade: writing request record, status=completed");
-            \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
-                array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
-                array('value' => json_encode($request))
-            );
-        } catch (\Exception $e) {
-            RancherFleet\Logger::error("TriggerLiveUpgrade: failed to update request: " . $e->getMessage());
+        // 7. Schedule 7-day cleanup
+        rancherfleet_updateUpgradeStatus($serviceId, 'live_upgraded', array(
+            'live_upgraded_at' => time(),
+            'cleanup_at'        => time() + 604800,  // 7 days
+        ));
+
+        // 8. Send client notification
+        $user = \WHMCS\Database\Capsule::table('tblhosting')->where('id', $serviceId)->value('userid');
+        if ($user) {
+            rancherfleet_sendUpgradeEmail($user, 'upgrade_complete', array(
+                'targetVersion' => $targetVersion,
+            ));
         }
 
-        // 5. Trigger cleanup
-        rancherfleet_CleanupStaging($params);
-
-        // 6. Record in history
-        rancherfleet_logHistory($params, 'Odoo Upgraded', 'Upgraded from ' . $currentVersion . ' to ' . $targetVersion . ' (Invoice #' . $invoiceId . ')');
-
-        RancherFleet\Logger::info("TriggerLiveUpgrade: SUCCESS");
-        return 'Success: Odoo upgraded from ' . $currentVersion . ' to ' . $targetVersion . '. Staging environment cleanup initiated.';
+        RancherFleet\Logger::info("TriggerLiveUpgrade: SUCCESS - maintenance window complete");
+        return 'Success: Odoo upgraded from ' . $currentVersion . ' to ' . $targetVersion . '. Production is back online. Staging environment retained for 7 days.';
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("TriggerLiveUpgrade: " . $e->getMessage());
