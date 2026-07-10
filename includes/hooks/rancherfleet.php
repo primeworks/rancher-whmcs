@@ -108,6 +108,31 @@ add_hook('CronJob', 1, function($vars) {
     } catch (\Exception $e) {
         RancherFleet\Logger::error("Cleanup cron: error: " . $e->getMessage());
     }
+
+    // Process upgrade cleanup reminders (7 days after live upgrade)
+    RancherFleet\Logger::info("Upgrade cleanup cron: checking for expired records");
+
+    try {
+        $expiredRecords = \WHMCS\Database\Capsule::table('tbladdonmodules')
+            ->where('module', 'rancherfleet_upgrade')
+            ->where('setting', 'like', 'request_%')
+            ->get();
+
+        foreach ($expiredRecords as $rec) {
+            $data = json_decode($rec->value, true);
+            if (($data['status'] ?? '') === 'live_upgraded' && ($data['live_upgraded_at'] ?? 0) + 604800 < time()) {
+                $serviceId = (int)str_replace('request_', '', $rec->setting);
+                RancherFleet\Logger::info("Upgrade cleanup: sending reminder for service={$serviceId}");
+
+                $params = rancherfleet_loadParamsForService($serviceId);
+                if (!empty($params)) {
+                    logActivity("RancherFleet: Staging environment eligible for cleanup (7 days after upgrade). Click 'Cleanup Upgrade' button to delete staging resources.", $serviceId);
+                }
+            }
+        }
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("Upgrade cleanup cron error: " . $e->getMessage());
+    }
 });
 
 // ---------------------------------------------------------------------------
