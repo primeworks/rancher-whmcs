@@ -6830,23 +6830,22 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                                     ),
                                     'command' => array('sh', '-c'),
                                     'args'    => array(
-                                        'DB_USER=$(cat /etc/rfm-db/username)' . "\n" .
-                                        'DB_PASS=$(cat /etc/rfm-db/password)' . "\n" .
-                                        'export PGPASSWORD="$DB_PASS"' . "\n" .
+                                        "DB_USER=\$(cat /etc/rfm-db/username)\n" .
+                                        "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
+                                        "export PGPASSWORD=\"\$DB_PASS\"\n" .
                                         "\n" .
-                                        '# Terminate active connections to source database' . "\n" .
-                                        'psql -h postgres16.default.svc.cluster.local \' . "\n" .
-                                        '  -U "$DB_USER" -d postgres \' . "\n" .
-                                        '  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity ' . "\n" .
-                                        '      WHERE datname=\'' . $dbName . '\' AND pid<>pg_backend_pid();"' . "\n" .
+                                        "# Terminate active connections to source database\n" .
+                                        "psql -h postgres16.default.svc.cluster.local \\\n" .
+                                        "  -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='" . $dbName . "' AND pid<>pg_backend_pid();\"\n" .
                                         "\n" .
-                                        '# Clone database' . "\n" .
-                                        'createdb -h postgres16.default.svc.cluster.local \' . "\n" .
-                                        '  -U "$DB_USER" \' . "\n" .
-                                        '  --template "' . $dbName . '" \' . "\n" .
-                                        '  "' . $stagingDbName . '"' . "\n" .
+                                        "# Clone database\n" .
+                                        "createdb -h postgres16.default.svc.cluster.local \\\n" .
+                                        "  -U \"\$DB_USER\" \\\n" .
+                                        "  --template \"" . $dbName . "\" \\\n" .
+                                        "  \"" . $stagingDbName . "\"\n" .
                                         "\n" .
-                                        'echo "Database cloned successfully"'
+                                        "echo \"Database cloned successfully\""
                                     ),
                                 ),
                             ),
