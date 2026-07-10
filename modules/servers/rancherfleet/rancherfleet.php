@@ -2809,13 +2809,8 @@ function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentV
     $html .= '</div>';
 
     $html .= '<div style="background:#ffe9e9;border:1px solid #ffcccc;border-radius:6px;padding:12px;margin-bottom:12px;">';
-    $html .= '<p style="margin:0 0 8px;font-size:12px;font-weight:bold;color:#d63031;">⚠ Upgrade Process:</p>';
-    $html .= '<ul style="margin:0;padding:0 0 0 20px;font-size:12px;color:#d63031;">';
-    $html .= '<li>We will create a staging environment for you to review first</li>';
-    $html .= '<li>Once approved by our team, you can test the staging instance</li>';
-    $html .= '<li>Live upgrade will take 15-30 minutes of downtime</li>';
-    $html .= '<li>A backup will be taken before upgrading</li>';
-    $html .= '</ul>';
+    $html .= '<p style="margin:0 0 8px;font-size:12px;font-weight:bold;color:#d63031;">ℹ Version Upgrades are a Managed Service</p>';
+    $html .= '<p style="margin:0;font-size:12px;color:#333;">Our team will personally oversee your upgrade to ensure your data is preserved. Once you submit your request and complete payment, we will contact you to schedule a maintenance window (typically 2-4 hours). Your instance will remain online until the cutover date.</p>';
     $html .= '</div>';
 
     $html .= '<div style="margin-bottom:12px;">';
@@ -6803,21 +6798,22 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage();
         }
 
-        // 3. Create staging database (clone of production)
-        RancherFleet\Logger::info("CreateStagingUpgrade: creating staging database");
+        // 3. Dump production database to NFS backup share
+        // The database migration requires OpenUpgrade — simply cloning the database and changing
+        // the image tag does not work for version upgrades. We dump the production database to
+        // the NFS share so admins can run OpenUpgrade manually on a local machine.
+        RancherFleet\Logger::info("CreateStagingUpgrade: dumping production database to NFS");
         try {
             $dbName = 'odoo-' . $orderNum;
-            $stagingDbName = $dbName . '-staging';
             $dbSecretName = 'rfm-db-admin-' . $orderNum;
-
-            // Create DB admin Secret in staging namespace (required for Job to mount)
-            RancherFleet\Logger::info("CreateStagingUpgrade: creating db-admin Secret in staging namespace");
-            rancherfleet_createDbAdminSecret($params, $rancher, $stagingNamespace, $orderNum);
+            $dumpDate = date('Y-m-d-His');
+            $dumpFilename = 'upgrade-' . $orderNum . '-' . $dumpDate . '.dump';
+            $nfsBackupPath = '/backups/odoo-' . $orderNum;
 
             $jobSpec = array(
                 'apiVersion' => 'batch/v1',
                 'kind'       => 'Job',
-                'metadata'   => array('name' => 'createdb-' . $orderNum . '-staging', 'namespace' => $stagingNamespace),
+                'metadata'   => array('name' => 'dump-db-' . $orderNum . '-upgrade', 'namespace' => 'default'),
                 'spec'       => array(
                     'ttlSecondsAfterFinished' => 120,
                     'backoffLimit'            => 0,
@@ -6827,7 +6823,14 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                             'volumes' => array(
                                 array(
                                     'name' => 'db-credentials',
-                                    'secret' => array('secretName' => $dbSecretName),
+                                    'secret' => array('secretName' => $dbSecretName, 'defaultMode' => 0400),
+                                ),
+                                array(
+                                    'name' => 'nfs-backup',
+                                    'nfs'  => array(
+                                        'server' => '162.35.166.55',
+                                        'path'   => '/export/share1',
+                                    ),
                                 ),
                             ),
                             'containers' => array(
@@ -6840,6 +6843,10 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                                             'mountPath' => '/etc/rfm-db',
                                             'readOnly'  => true,
                                         ),
+                                        array(
+                                            'name'      => 'nfs-backup',
+                                            'mountPath' => '/backups',
+                                        ),
                                     ),
                                     'command' => array('sh', '-c'),
                                     'args'    => array(
@@ -6847,18 +6854,16 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                                         "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
                                         "export PGPASSWORD=\"\$DB_PASS\"\n" .
                                         "\n" .
-                                        "# Terminate active connections to source database\n" .
-                                        "psql -h postgres16.default.svc.cluster.local \\\n" .
-                                        "  -U \"\$DB_USER\" -d postgres \\\n" .
-                                        "  -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='" . $dbName . "' AND pid<>pg_backend_pid();\"\n" .
+                                        "# Create backup directory if needed\n" .
+                                        "mkdir -p " . $nfsBackupPath . "\n" .
                                         "\n" .
-                                        "# Clone database\n" .
-                                        "createdb -h postgres16.default.svc.cluster.local \\\n" .
+                                        "# Dump production database\n" .
+                                        "pg_dump -h postgres16.default.svc.cluster.local \\\n" .
                                         "  -U \"\$DB_USER\" \\\n" .
-                                        "  --template \"" . $dbName . "\" \\\n" .
-                                        "  \"" . $stagingDbName . "\"\n" .
+                                        "  -F c \\\n" .
+                                        "  \"" . $dbName . "\" > " . $nfsBackupPath . "/" . $dumpFilename . "\n" .
                                         "\n" .
-                                        "echo \"Database cloned successfully\""
+                                        "echo \"Database dump saved to " . $nfsBackupPath . "/" . $dumpFilename . "\""
                                     ),
                                 ),
                             ),
@@ -6867,19 +6872,20 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                 ),
             );
 
-            RancherFleet\Logger::info("CreateStagingUpgrade: creating Job to clone database {$dbName} -> {$stagingDbName}");
+            RancherFleet\Logger::info("CreateStagingUpgrade: creating Job to dump database {$dbName} to NFS");
+            RancherFleet\Logger::info("CreateStagingUpgrade: dump path = " . $nfsBackupPath . "/" . $dumpFilename);
             RancherFleet\Logger::info("CreateStagingUpgrade: Job spec = " . json_encode($jobSpec));
 
             $response = $rancher->rawRequest('POST',
-                '/apis/batch/v1/namespaces/' . rawurlencode($stagingNamespace) . '/jobs',
+                '/apis/batch/v1/namespaces/default/jobs',
                 $jobSpec
             );
 
             RancherFleet\Logger::info("CreateStagingUpgrade: Job creation response = " . json_encode($response));
 
             // Poll for completion — up to 120 seconds
-            $jobName = 'createdb-' . $orderNum . '-staging';
-            $jobPath = '/apis/batch/v1/namespaces/' . rawurlencode($stagingNamespace) . '/jobs/' . rawurlencode($jobName);
+            $jobName = 'dump-db-' . $orderNum . '-upgrade';
+            $jobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($jobName);
             $succeeded = false;
             $failed = false;
 
@@ -6896,9 +6902,9 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                             $failed = true; break 2;
                         }
                     }
-                    RancherFleet\Logger::info("CreateStagingUpgrade: waiting for database Job... " . (($i + 1) * 5) . "s elapsed");
+                    RancherFleet\Logger::info("CreateStagingUpgrade: waiting for dump Job... " . (($i + 1) * 5) . "s elapsed");
                 } catch (\Exception $pollEx) {
-                    RancherFleet\Logger::error("CreateStagingUpgrade: error polling database Job: " . $pollEx->getMessage());
+                    RancherFleet\Logger::error("CreateStagingUpgrade: error polling dump Job: " . $pollEx->getMessage());
                     break;
                 }
             }
@@ -6913,15 +6919,15 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             if (!$succeeded) {
                 $rancher->deleteNamespace($stagingNamespace);
                 $errMsg = $failed ? 'Job failed' : 'Job timed out after 120s';
-                RancherFleet\Logger::error("CreateStagingUpgrade: database cloning failed — {$errMsg}");
-                return 'Error: Failed to create staging database: ' . $errMsg;
+                RancherFleet\Logger::error("CreateStagingUpgrade: database dump failed — {$errMsg}");
+                return 'Error: Failed to dump production database: ' . $errMsg;
             }
 
-            RancherFleet\Logger::info("CreateStagingUpgrade: database cloned successfully");
+            RancherFleet\Logger::info("CreateStagingUpgrade: database dumped successfully to {$nfsBackupPath}/{$dumpFilename}");
         } catch (\Exception $dbEx) {
-            RancherFleet\Logger::error("CreateStagingUpgrade: database creation failed: " . $dbEx->getMessage());
+            RancherFleet\Logger::error("CreateStagingUpgrade: database dump failed: " . $dbEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
-            return 'Error: Failed to create staging database: ' . $dbEx->getMessage();
+            return 'Error: Failed to dump production database: ' . $dbEx->getMessage();
         }
 
         // 4. Clone client branch to staging branch
@@ -7042,9 +7048,22 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             RancherFleet\Logger::error("CreateStagingUpgrade: failed to store cleanup job: " . $e->getMessage());
         }
 
+        $dumpDate = date('Y-m-d-His');
+        $dumpFilename = 'upgrade-' . $orderNum . '-' . $dumpDate . '.dump';
+        $nfsBackupPath = '/backups/odoo-' . $orderNum;
+
         rancherfleet_logHistory($params, 'Staging Upgrade Created', 'Staging environment created for Odoo upgrade to ' . $targetVersion . ' at ' . $stagingUrl);
 
-        return 'Success: Staging instance created at ' . $stagingUrl . '. Review it and click "Share Staging URL" to notify client, or "Trigger Live Upgrade" when ready.';
+        $successMsg = "Success: Staging namespace whmcs-client-{$orderNum}-staging created.\n\n" .
+                     "Database dump saved to NFS at:\n" .
+                     "{$nfsBackupPath}/{$dumpFilename}\n\n" .
+                     "Next steps (manual):\n" .
+                     "1. Run OpenUpgrade against the dump on a local machine\n" .
+                     "2. Restore the upgraded database as odoo-{$orderNum}-staging\n" .
+                     "   on postgres16.default.svc.cluster.local\n" .
+                     "3. Click 'Trigger Live Upgrade' once staging is verified";
+
+        return $successMsg;
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("CreateStagingUpgrade: " . $e->getMessage());
@@ -7275,6 +7294,120 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
         RancherFleet\Logger::info("TriggerLiveUpgrade: {$namespace} to version {$targetVersion}");
 
         list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // Verify staging database exists before proceeding
+        RancherFleet\Logger::info("TriggerLiveUpgrade: verifying staging database exists");
+        try {
+            $dbSecretName = 'rfm-db-admin-' . $orderNum;
+            $stagingDbName = 'odoo-' . $orderNum . '-staging';
+
+            // Create a verification Job to check if the staging database exists
+            $verifyJobSpec = array(
+                'apiVersion' => 'batch/v1',
+                'kind'       => 'Job',
+                'metadata'   => array('name' => 'verify-db-' . $orderNum . '-' . time(), 'namespace' => 'default'),
+                'spec'       => array(
+                    'ttlSecondsAfterFinished' => 60,
+                    'backoffLimit'            => 0,
+                    'template' => array(
+                        'spec' => array(
+                            'restartPolicy' => 'Never',
+                            'volumes' => array(
+                                array(
+                                    'name' => 'db-credentials',
+                                    'secret' => array('secretName' => $dbSecretName, 'defaultMode' => 0400),
+                                ),
+                            ),
+                            'containers' => array(
+                                array(
+                                    'name'  => 'postgres',
+                                    'image' => 'postgres:16-alpine',
+                                    'volumeMounts' => array(
+                                        array(
+                                            'name'      => 'db-credentials',
+                                            'mountPath' => '/etc/rfm-db',
+                                            'readOnly'  => true,
+                                        ),
+                                    ),
+                                    'command' => array('sh', '-c'),
+                                    'args'    => array(
+                                        "DB_USER=\$(cat /etc/rfm-db/username)\n" .
+                                        "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
+                                        "export PGPASSWORD=\"\$DB_PASS\"\n" .
+                                        "\n" .
+                                        "psql -h postgres16.default.svc.cluster.local \\\n" .
+                                        "  -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -tc \"SELECT 1 FROM pg_database WHERE datname='" . $stagingDbName . "';\" | grep -q 1\n" .
+                                        "\n" .
+                                        "if [ \$? -eq 0 ]; then\n" .
+                                        "  echo \"Staging database exists\"\n" .
+                                        "  exit 0\n" .
+                                        "else\n" .
+                                        "  echo \"Staging database not found\"\n" .
+                                        "  exit 1\n" .
+                                        "fi"
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            );
+
+            $verifyJobName = 'verify-db-' . $orderNum . '-' . time();
+            $response = $rancher->rawRequest('POST',
+                '/apis/batch/v1/namespaces/default/jobs',
+                $verifyJobSpec
+            );
+
+            RancherFleet\Logger::info("TriggerLiveUpgrade: verification Job created: {$verifyJobName}");
+
+            // Poll for completion
+            $jobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($verifyJobName);
+            $verified = false;
+            $failed = false;
+
+            for ($i = 0; $i < 12; $i++) {
+                sleep(5);
+                try {
+                    $job = $rancher->rawRequest('GET', $jobPath);
+                    $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                    foreach ($conditions as $cond) {
+                        if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                            $verified = true; break 2;
+                        }
+                        if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                            $failed = true; break 2;
+                        }
+                    }
+                } catch (\Exception $pollEx) {
+                    RancherFleet\Logger::error("TriggerLiveUpgrade: error polling verification Job: " . $pollEx->getMessage());
+                    break;
+                }
+            }
+
+            // Clean up
+            try {
+                $rancher->rawRequest('DELETE', $jobPath);
+            } catch (\Exception $e) {
+                RancherFleet\Logger::info("TriggerLiveUpgrade: verification Job cleanup note: " . $e->getMessage());
+            }
+
+            if ($failed) {
+                RancherFleet\Logger::error("TriggerLiveUpgrade: staging database verification failed");
+                return 'Staging database not found. Complete the manual OpenUpgrade steps before triggering the live upgrade.';
+            }
+
+            if (!$verified) {
+                RancherFleet\Logger::error("TriggerLiveUpgrade: staging database verification timed out");
+                return 'Database verification timed out. Please try again later.';
+            }
+
+            RancherFleet\Logger::info("TriggerLiveUpgrade: staging database verified successfully");
+        } catch (\Exception $verifyEx) {
+            RancherFleet\Logger::error("TriggerLiveUpgrade: database verification error: " . $verifyEx->getMessage());
+            return 'Error verifying staging database: ' . $verifyEx->getMessage();
+        }
 
         // Get current version
         $status = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);

@@ -218,6 +218,46 @@ All database operations use Kubernetes Jobs (not exec):
 - Credentials from `rfm-db-admin-{orderNum}` Secret
 - Webhook config from `rfm-webhook-{orderNum}` Secret
 
+## Version upgrade process
+
+Version upgrades are **semi-automated** because Odoo schema migrations require
+OpenUpgrade, which cannot be automated safely within WHMCS without access to
+the full Odoo application context.
+
+### Upgrade workflow
+
+1. **Client initiates upgrade** (`request_version_upgrade` client action)
+   - Creates an unpaid invoice for the upgrade fee
+   - Client is redirected to payment page
+
+2. **Admin creates staging environment** (`CreateStagingUpgrade` button)
+   - Creates staging namespace: `whmcs-client-{orderNum}-staging`
+   - Clones client Git branch: `whmcs-client-{orderNum}-staging`
+   - Dumps production database to NFS: `/backups/odoo-{orderNum}/upgrade-{orderNum}-{date}.dump`
+   - Creates staging Fleet GitRepo for the cloned branch
+   - Returns a message with the database dump location and manual next steps
+
+3. **Admin manually runs OpenUpgrade** (outside WHMCS)
+   - Download dump from `/backups/odoo-{orderNum}/upgrade-{orderNum}-{date}.dump`
+   - Run OpenUpgrade tool locally on the dump
+   - Restore upgraded database as `odoo-{orderNum}-staging` to `postgres16.default.svc.cluster.local`
+
+4. **Admin triggers live upgrade** (`TriggerLiveUpgrade` button)
+   - Verifies `odoo-{orderNum}-staging` database exists
+   - Scales production deployment to 0
+   - Updates `odoo.yml` with new Odoo image version
+   - Scales production deployment back to 1
+   - Marks upgrade request as 'completed'
+
+### Why manual OpenUpgrade?
+
+Simply cloning the production database and changing the Odoo image tag does not
+work because Odoo uses an extensible metadata layer with version-specific schema
+definitions. Upgrading requires running the `odoo-bin` tool with the `--upgrade`
+flag against the cloned database on a machine with the target Odoo version installed.
+This is why the staging database is manually prepared with OpenUpgrade before
+the live cutover.
+
 ## Patching existing client branches with newer template improvements
 
 `rancherfleet_PatchTemplateUpdates()` (admin button "Patch Template Updates") lets
