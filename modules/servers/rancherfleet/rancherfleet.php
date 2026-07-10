@@ -2757,6 +2757,11 @@ function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentV
             $html .= '<button type="submit" style="background:#dc3545;color:#fff;border:none;border-radius:4px;padding:6px 12px;font-size:11px;font-weight:bold;cursor:pointer;">Cancel Request</button>';
             $html .= '</form>';
             $html .= '</div>';
+        } elseif ($status === 'staging_in_progress') {
+            // Staging environment is being created
+            $html .= '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0;font-size:12px;color:#856404;">Staging environment is being created. Please wait...</p>';
+            $html .= '</div>';
         } elseif ($status === 'staging') {
             // Staging is ready
             $stagingUrl = isset($existingRequest['staging_url']) ? $existingRequest['staging_url'] : null;
@@ -2771,6 +2776,32 @@ function rancherfleet_upgradeVersionCardHtml(array $params, $orderNum, $currentV
                 $html .= '<p style="margin:0;font-size:12px;color:#004085;">Your staging environment is being prepared. Please wait for admin confirmation.</p>';
                 $html .= '</div>';
             }
+        } elseif ($status === 'staging_failed') {
+            // Staging creation failed
+            $html .= '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0;font-size:12px;color:#721c24;">Staging environment creation failed. Please contact support.</p>';
+            $html .= '</div>';
+        } elseif ($status === 'maintenance_window') {
+            // Upgrade in progress
+            $html .= '<div style="background:#cfe2ff;border:1px solid #0d6efd;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0;font-size:12px;color:#004085;">Upgrade in progress — your instance is temporarily offline for the final cutover. This typically takes 5-15 minutes.</p>';
+            $html .= '</div>';
+        } elseif ($status === 'live_upgraded') {
+            // Upgrade complete
+            $version = isset($existingRequest['version']) ? $existingRequest['version'] : 'N/A';
+            $html .= '<div style="background:#d4edda;border:1px solid #28a745;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0;font-size:12px;color:#155724;">Upgrade complete! &#10003; Running Odoo <strong>' . htmlspecialchars($version) . '</strong>. Staging environment retained for 7 days.</p>';
+            $html .= '</div>';
+        } elseif ($status === 'rolled_back') {
+            // Rollback occurred
+            $html .= '<div style="background:#f8d7da;border:1px solid #f5c6cb;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0;font-size:12px;color:#721c24;">An issue was detected with the upgrade and it was rolled back to your previous version. Our team will investigate.</p>';
+            $html .= '</div>';
+        } elseif ($status === 'archived') {
+            // Cleanup complete
+            $html .= '<div style="background:#d4edda;border:1px solid #28a745;border-radius:6px;padding:12px;margin-bottom:12px;">';
+            $html .= '<p style="margin:0;font-size:12px;color:#155724;">Staging environment cleaned up. Upgrade process complete.</p>';
+            $html .= '</div>';
         }
 
         $html .= '</div>';
