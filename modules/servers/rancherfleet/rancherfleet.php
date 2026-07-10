@@ -6798,72 +6798,120 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage();
         }
 
-        // 3. Dump production database to NFS backup share
-        // The database migration requires OpenUpgrade — simply cloning the database and changing
-        // the image tag does not work for version upgrades. We dump the production database to
-        // the NFS share so admins can run OpenUpgrade manually on a local machine.
-        RancherFleet\Logger::info("CreateStagingUpgrade: dumping production database to NFS");
+        // 3. Run OpenUpgrade Job to migrate database
+        // OpenUpgrade handles sequential version migrations: 16→17, 17→18, 18→19, etc.
+        // Job runs in rfm-upgrade namespace and creates odoo-{orderNum}-staging database
+        RancherFleet\Logger::info("CreateStagingUpgrade: running OpenUpgrade migration Job");
         try {
             $dbName = 'odoo-' . $orderNum;
             $dbSecretName = 'rfm-db-admin-' . $orderNum;
-            $dumpDate = date('Y-m-d-His');
-            $dumpFilename = 'upgrade-' . $orderNum . '-' . $dumpDate . '.dump';
-            $nfsBackupPath = '/backups/odoo-' . $orderNum;
+            $timestamp = time();
+            $jobName = 'openupgrade-' . $orderNum . '-' . $timestamp;
+
+            // Get current Odoo version from production deployment
+            $currentVersion = null;
+            $prodStatus = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
+            if ($prodStatus['image'] && preg_match('/odoo:([0-9.]+)/', $prodStatus['image'], $m)) {
+                $currentVersion = $m[1];
+            }
+
+            if (!$currentVersion) {
+                $rancher->deleteNamespace($stagingNamespace);
+                return 'Error: Could not determine current Odoo version from production deployment';
+            }
+
+            // Extract major version numbers for FROM and TO
+            $currentMajor = (int)explode('.', $currentVersion)[0];
+            $targetMajor = (int)explode('.', $targetVersion)[0];
+
+            if ($targetMajor <= $currentMajor) {
+                $rancher->deleteNamespace($stagingNamespace);
+                return 'Error: Target version must be higher than current version';
+            }
+
+            RancherFleet\Logger::info("CreateStagingUpgrade: OpenUpgrade from {$currentMajor} to {$targetMajor}");
 
             $jobSpec = array(
                 'apiVersion' => 'batch/v1',
                 'kind'       => 'Job',
-                'metadata'   => array('name' => 'dump-db-' . $orderNum . '-upgrade', 'namespace' => 'default'),
+                'metadata'   => array('name' => $jobName, 'namespace' => 'rfm-upgrade'),
                 'spec'       => array(
-                    'ttlSecondsAfterFinished' => 120,
+                    'ttlSecondsAfterFinished' => 3600,
                     'backoffLimit'            => 0,
                     'template' => array(
                         'spec' => array(
                             'restartPolicy' => 'Never',
+                            'serviceAccountName' => 'openupgrade-runner',
                             'volumes' => array(
                                 array(
-                                    'name' => 'db-credentials',
-                                    'secret' => array('secretName' => $dbSecretName, 'defaultMode' => 0400),
+                                    'name' => 'odoo-filestore',
+                                    'persistentVolumeClaim' => array(
+                                        'claimName' => 'odoo-' . $orderNum,
+                                        'readOnly'  => false,
+                                    ),
                                 ),
                                 array(
-                                    'name' => 'nfs-backup',
-                                    'nfs'  => array(
-                                        'server' => '162.35.166.55',
-                                        'path'   => '/export/share1',
+                                    'name' => 'upgrade-scripts',
+                                    'configMap' => array(
+                                        'name' => 'openupgrade-scripts',
+                                        'defaultMode' => 0755,
                                     ),
                                 ),
                             ),
                             'containers' => array(
                                 array(
-                                    'name'  => 'postgres',
-                                    'image' => 'postgres:16-alpine',
-                                    'volumeMounts' => array(
+                                    'name'  => 'openupgrade',
+                                    'image' => 'ikus060/openupgrade:' . $targetMajor,
+                                    'command' => array('/scripts/run-upgrade.sh'),
+                                    'env' => array(
+                                        array('name' => 'SOURCE_DB', 'value' => $dbName),
+                                        array('name' => 'TARGET_DB', 'value' => $dbName . '-staging'),
+                                        array('name' => 'FROM_VERSION', 'value' => (string)$currentMajor),
+                                        array('name' => 'TO_VERSION', 'value' => (string)$targetMajor),
+                                        array('name' => 'PG_HOST', 'value' => 'postgres16.default.svc.cluster.local'),
                                         array(
-                                            'name'      => 'db-credentials',
-                                            'mountPath' => '/etc/rfm-db',
-                                            'readOnly'  => true,
+                                            'name' => 'PG_USER',
+                                            'valueFrom' => array(
+                                                'secretKeyRef' => array(
+                                                    'name' => $dbSecretName,
+                                                    'namespace' => 'default',
+                                                    'key' => 'username',
+                                                    'optional' => true,
+                                                ),
+                                            ),
                                         ),
                                         array(
-                                            'name'      => 'nfs-backup',
-                                            'mountPath' => '/backups',
+                                            'name' => 'PGPASSWORD',
+                                            'valueFrom' => array(
+                                                'secretKeyRef' => array(
+                                                    'name' => $dbSecretName,
+                                                    'namespace' => 'default',
+                                                    'key' => 'password',
+                                                    'optional' => true,
+                                                ),
+                                            ),
                                         ),
                                     ),
-                                    'command' => array('sh', '-c'),
-                                    'args'    => array(
-                                        "DB_USER=\$(cat /etc/rfm-db/username)\n" .
-                                        "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
-                                        "export PGPASSWORD=\"\$DB_PASS\"\n" .
-                                        "\n" .
-                                        "# Create backup directory if needed\n" .
-                                        "mkdir -p " . $nfsBackupPath . "\n" .
-                                        "\n" .
-                                        "# Dump production database\n" .
-                                        "pg_dump -h postgres16.default.svc.cluster.local \\\n" .
-                                        "  -U \"\$DB_USER\" \\\n" .
-                                        "  -F c \\\n" .
-                                        "  \"" . $dbName . "\" > " . $nfsBackupPath . "/" . $dumpFilename . "\n" .
-                                        "\n" .
-                                        "echo \"Database dump saved to " . $nfsBackupPath . "/" . $dumpFilename . "\""
+                                    'volumeMounts' => array(
+                                        array(
+                                            'name'      => 'odoo-filestore',
+                                            'mountPath' => '/var/lib/odoo',
+                                            'subPath'   => 'odoo',
+                                        ),
+                                        array(
+                                            'name'      => 'upgrade-scripts',
+                                            'mountPath' => '/scripts',
+                                        ),
+                                    ),
+                                    'resources' => array(
+                                        'requests' => array(
+                                            'cpu'    => '500m',
+                                            'memory' => '1Gi',
+                                        ),
+                                        'limits' => array(
+                                            'cpu'    => '2',
+                                            'memory' => '4Gi',
+                                        ),
                                     ),
                                 ),
                             ),
@@ -6872,25 +6920,35 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                 ),
             );
 
-            RancherFleet\Logger::info("CreateStagingUpgrade: creating Job to dump database {$dbName} to NFS");
-            RancherFleet\Logger::info("CreateStagingUpgrade: dump path = " . $nfsBackupPath . "/" . $dumpFilename);
-            RancherFleet\Logger::info("CreateStagingUpgrade: Job spec = " . json_encode($jobSpec));
+            RancherFleet\Logger::info("CreateStagingUpgrade: OpenUpgrade Job spec = " . json_encode($jobSpec));
 
             $response = $rancher->rawRequest('POST',
-                '/apis/batch/v1/namespaces/default/jobs',
+                '/apis/batch/v1/namespaces/rfm-upgrade/jobs',
                 $jobSpec
             );
 
-            RancherFleet\Logger::info("CreateStagingUpgrade: Job creation response = " . json_encode($response));
+            RancherFleet\Logger::info("CreateStagingUpgrade: OpenUpgrade Job creation response = " . json_encode($response));
 
-            // Poll for completion — up to 120 seconds
-            $jobName = 'dump-db-' . $orderNum . '-upgrade';
-            $jobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($jobName);
+            // Poll for completion — up to 3600 seconds (1 hour)
+            // OpenUpgrade can take a long time, so log every 60 seconds
+            $jobPath = '/apis/batch/v1/namespaces/rfm-upgrade/jobs/' . rawurlencode($jobName);
             $succeeded = false;
             $failed = false;
+            $lastLogTime = time();
+            $pollCount = 0;
+            $maxPolls = 720;  // 3600 seconds / 5 second interval
 
-            for ($i = 0; $i < 24; $i++) {
+            for ($i = 0; $i < $maxPolls; $i++) {
                 sleep(5);
+                $pollCount++;
+
+                // Log progress every 60 seconds
+                if (time() - $lastLogTime >= 60) {
+                    $elapsedMin = ($pollCount * 5) / 60;
+                    RancherFleet\Logger::info("CreateStagingUpgrade: OpenUpgrade Job running... {$elapsedMin} minutes elapsed");
+                    $lastLogTime = time();
+                }
+
                 try {
                     $job = $rancher->rawRequest('GET', $jobPath);
                     $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
@@ -6902,9 +6960,8 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                             $failed = true; break 2;
                         }
                     }
-                    RancherFleet\Logger::info("CreateStagingUpgrade: waiting for dump Job... " . (($i + 1) * 5) . "s elapsed");
                 } catch (\Exception $pollEx) {
-                    RancherFleet\Logger::error("CreateStagingUpgrade: error polling dump Job: " . $pollEx->getMessage());
+                    RancherFleet\Logger::error("CreateStagingUpgrade: error polling OpenUpgrade Job: " . $pollEx->getMessage());
                     break;
                 }
             }
@@ -6913,21 +6970,21 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             try {
                 $rancher->rawRequest('DELETE', $jobPath);
             } catch (\Exception $e) {
-                RancherFleet\Logger::info("CreateStagingUpgrade: Job cleanup note: " . $e->getMessage());
+                RancherFleet\Logger::info("CreateStagingUpgrade: OpenUpgrade Job cleanup note: " . $e->getMessage());
             }
 
             if (!$succeeded) {
                 $rancher->deleteNamespace($stagingNamespace);
-                $errMsg = $failed ? 'Job failed' : 'Job timed out after 120s';
-                RancherFleet\Logger::error("CreateStagingUpgrade: database dump failed — {$errMsg}");
-                return 'Error: Failed to dump production database: ' . $errMsg;
+                $errMsg = $failed ? 'OpenUpgrade Job failed' : 'OpenUpgrade Job timed out after 3600s';
+                RancherFleet\Logger::error("CreateStagingUpgrade: OpenUpgrade migration failed — {$errMsg}");
+                return 'Error: Failed to migrate database with OpenUpgrade: ' . $errMsg;
             }
 
-            RancherFleet\Logger::info("CreateStagingUpgrade: database dumped successfully to {$nfsBackupPath}/{$dumpFilename}");
+            RancherFleet\Logger::info("CreateStagingUpgrade: OpenUpgrade migration completed successfully");
         } catch (\Exception $dbEx) {
-            RancherFleet\Logger::error("CreateStagingUpgrade: database dump failed: " . $dbEx->getMessage());
+            RancherFleet\Logger::error("CreateStagingUpgrade: OpenUpgrade migration failed: " . $dbEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
-            return 'Error: Failed to dump production database: ' . $dbEx->getMessage();
+            return 'Error: Failed to run OpenUpgrade migration: ' . $dbEx->getMessage();
         }
 
         // 4. Clone client branch to staging branch
@@ -7048,20 +7105,19 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             RancherFleet\Logger::error("CreateStagingUpgrade: failed to store cleanup job: " . $e->getMessage());
         }
 
-        $dumpDate = date('Y-m-d-His');
-        $dumpFilename = 'upgrade-' . $orderNum . '-' . $dumpDate . '.dump';
-        $nfsBackupPath = '/backups/odoo-' . $orderNum;
-
         rancherfleet_logHistory($params, 'Staging Upgrade Created', 'Staging environment created for Odoo upgrade to ' . $targetVersion . ' at ' . $stagingUrl);
 
-        $successMsg = "Success: Staging namespace whmcs-client-{$orderNum}-staging created.\n\n" .
-                     "Database dump saved to NFS at:\n" .
-                     "{$nfsBackupPath}/{$dumpFilename}\n\n" .
-                     "Next steps (manual):\n" .
-                     "1. Run OpenUpgrade against the dump on a local machine\n" .
-                     "2. Restore the upgraded database as odoo-{$orderNum}-staging\n" .
-                     "   on postgres16.default.svc.cluster.local\n" .
-                     "3. Click 'Trigger Live Upgrade' once staging is verified";
+        $successMsg = "Success: Staging environment created and database migrated to Odoo {$targetVersion}.\n\n" .
+                     "Staging namespace: whmcs-client-{$orderNum}-staging\n" .
+                     "Staging URL: {$stagingUrl}\n" .
+                     "Staging database: odoo-{$orderNum}-staging on postgres16.default.svc.cluster.local\n\n" .
+                     "The OpenUpgrade migration ran sequentially through each major version.\n" .
+                     "The staging deployment uses the production instance configuration.\n\n" .
+                     "Next steps:\n" .
+                     "1. Visit {$stagingUrl} and verify the migrated instance is accessible\n" .
+                     "2. Test functionality and data integrity\n" .
+                     "3. Click 'Trigger Live Upgrade' to cutover to production\n\n" .
+                     "Note: Live upgrade will scale production to 0, update the image tag, and scale back to 1.";
 
         return $successMsg;
 
