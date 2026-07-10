@@ -210,8 +210,8 @@ function rancherfleet_ConfigOptions()
             'FriendlyName' => 'Available Upgrade Versions',
             'Type'         => 'text',
             'Size'         => '100',
-            'Default'      => '20.0,21.0',
-            'Description'  => 'Comma-separated list of Odoo versions available for upgrade e.g. 20.0,21.0. Only versions higher than the current instance version will be offered to customers.',
+            'Default'      => '17,18',
+            'Description'  => 'Comma-separated list of Odoo major versions available for upgrade e.g. 17,18. Only versions higher than the current instance version will be offered to customers. Only versions with available OpenUpgrade Docker images can be used. Currently supported: 17, 18',
         ),
         'Odoo Upgrade Fees' => array(
             'FriendlyName' => 'Upgrade Fees per Version',
@@ -6710,6 +6710,54 @@ function rancherfleet_refundCredit($clientId, $fee, $invoiceId, $reason)
     }
 }
 
+/**
+ * Update upgrade request status with optional metadata
+ */
+function rancherfleet_updateUpgradeStatus($serviceId, $status, $metadata = array())
+{
+    $record = rancherfleet_getUpgradeRequest($serviceId) ?: array();
+    $record['status'] = $status;
+    foreach ($metadata as $k => $v) {
+        $record[$k] = $v;
+    }
+    \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+        array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
+        array('value' => json_encode($record))
+    );
+}
+
+/**
+ * Send upgrade notification emails
+ */
+function rancherfleet_sendUpgradeEmail($userId, $type, $data)
+{
+    $templates = array(
+        'staging_ready' => array(
+            'subject' => 'Your Odoo upgrade is in progress',
+            'body' => 'Your Odoo instance is being upgraded to version {targetVersion}. A staging environment is available at {stagingUrl} for your review. We will contact you to schedule the final maintenance window.',
+        ),
+        'upgrade_complete' => array(
+            'subject' => 'Your Odoo upgrade is complete',
+            'body' => 'Your Odoo instance has been successfully upgraded to version {targetVersion}. Please log in and verify your data. If you notice any issues, please contact support immediately.',
+        ),
+        'upgrade_rollback' => array(
+            'subject' => 'Your Odoo upgrade was rolled back',
+            'body' => 'An issue was detected with your Odoo {targetVersion} upgrade. We have rolled back to your previous version. Our support team will investigate and contact you shortly.',
+        ),
+    );
+
+    if (!isset($templates[$type])) return;
+
+    $tpl = $templates[$type];
+    $body = $tpl['body'];
+    foreach ($data as $k => $v) {
+        $body = str_replace('{' . $k . '}', $v, $body);
+    }
+
+    send_client_email($userId, $tpl['subject'], $body);
+    RancherFleet\Logger::info("Upgrade email sent: type={$type}, user={$userId}");
+}
+
 
 /**
  * Admin button handler to create a staging environment for version upgrade.
@@ -6982,6 +7030,125 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             }
 
             RancherFleet\Logger::info("CreateStagingUpgrade: OpenUpgrade migration completed successfully");
+
+            // 3b. Rename database from odoo-{orderNum}_{targetVersion} to odoo-{orderNum}-staging
+            $upgradedDbName = 'odoo-' . $orderNum . '_' . $targetMajor;
+            $stagingDbName = 'odoo-' . $orderNum . '-staging';
+
+            RancherFleet\Logger::info("CreateStagingUpgrade: renaming database from {$upgradedDbName} to {$stagingDbName}");
+
+            try {
+                $dbSecretName = 'rfm-db-admin-' . $orderNum;
+                $renameJobSpec = array(
+                    'apiVersion' => 'batch/v1',
+                    'kind'       => 'Job',
+                    'metadata'   => array('name' => 'renamedb-' . $orderNum . '-staging', 'namespace' => 'default'),
+                    'spec'       => array(
+                        'ttlSecondsAfterFinished' => 60,
+                        'backoffLimit'            => 0,
+                        'template' => array(
+                            'spec' => array(
+                                'restartPolicy' => 'Never',
+                                'volumes' => array(
+                                    array(
+                                        'name' => 'db-credentials',
+                                        'secret' => array('secretName' => $dbSecretName),
+                                    ),
+                                ),
+                                'containers' => array(
+                                    array(
+                                        'name'  => 'postgres',
+                                        'image' => 'postgres:16-alpine',
+                                        'volumeMounts' => array(
+                                            array(
+                                                'name'      => 'db-credentials',
+                                                'mountPath' => '/etc/rfm-db',
+                                                'readOnly'  => true,
+                                            ),
+                                        ),
+                                        'command' => array('sh', '-c'),
+                                        'args'    => array(
+                                            "DB_USER=\$(cat /etc/rfm-db/username)\n" .
+                                            "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
+                                            "export PGPASSWORD=\"\$DB_PASS\"\n" .
+                                            "\n" .
+                                            "# Terminate active connections to staging database\n" .
+                                            "psql -h postgres16.default.svc.cluster.local \\\n" .
+                                            "  -U \"\$DB_USER\" -d postgres \\\n" .
+                                            "  -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='" . $stagingDbName . "' AND pid<>pg_backend_pid();\" 2>/dev/null || true\n" .
+                                            "\n" .
+                                            "# Drop old staging database if it exists\n" .
+                                            "dropdb -h postgres16.default.svc.cluster.local \\\n" .
+                                            "  -U \"\$DB_USER\" \\\n" .
+                                            "  --if-exists \"" . $stagingDbName . "\" 2>/dev/null || true\n" .
+                                            "\n" .
+                                            "# Rename upgraded database to staging name\n" .
+                                            "psql -h postgres16.default.svc.cluster.local \\\n" .
+                                            "  -U \"\$DB_USER\" -d postgres \\\n" .
+                                            "  -c \"ALTER DATABASE \\\"" . $upgradedDbName . "\\\" RENAME TO \\\"" . $stagingDbName . "\\\";\"\n" .
+                                            "\n" .
+                                            "echo \"Database renamed successfully\""
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                );
+
+                RancherFleet\Logger::info("CreateStagingUpgrade: database rename Job spec = " . json_encode($renameJobSpec));
+
+                $renameJobPath = '/api/v1/namespaces/default/jobs';
+                $response = $rancher->rawRequest('POST', $renameJobPath, $renameJobSpec);
+
+                RancherFleet\Logger::info("CreateStagingUpgrade: database rename Job creation response = " . json_encode($response));
+
+                // Poll for rename completion — up to 120 seconds
+                $renameJobName = 'renamedb-' . $orderNum . '-staging';
+                $renameJobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($renameJobName);
+                $renameSucceeded = false;
+                $renameFailed = false;
+
+                for ($i = 0; $i < 24; $i++) {
+                    sleep(5);
+                    try {
+                        $job = $rancher->rawRequest('GET', $renameJobPath);
+                        $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                        foreach ($conditions as $cond) {
+                            if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                                $renameSucceeded = true; break 2;
+                            }
+                            if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                                $renameFailed = true; break 2;
+                            }
+                        }
+                        RancherFleet\Logger::info("CreateStagingUpgrade: waiting for database rename Job... " . (($i + 1) * 5) . "s elapsed");
+                    } catch (\Exception $pollEx) {
+                        RancherFleet\Logger::error("CreateStagingUpgrade: error polling rename Job: " . $pollEx->getMessage());
+                        break;
+                    }
+                }
+
+                // Clean up the rename Job
+                try {
+                    $rancher->rawRequest('DELETE', $renameJobPath);
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::info("CreateStagingUpgrade: rename Job cleanup note: " . $e->getMessage());
+                }
+
+                if (!$renameSucceeded) {
+                    $rancher->deleteNamespace($stagingNamespace);
+                    $errMsg = $renameFailed ? 'Rename Job failed' : 'Rename Job timed out after 120s';
+                    RancherFleet\Logger::error("CreateStagingUpgrade: database rename failed — {$errMsg}");
+                    return 'Error: Failed to rename staging database: ' . $errMsg;
+                }
+
+                RancherFleet\Logger::info("CreateStagingUpgrade: database renamed successfully to {$stagingDbName}");
+            } catch (\Exception $renameEx) {
+                RancherFleet\Logger::error("CreateStagingUpgrade: database rename failed: " . $renameEx->getMessage());
+                $rancher->deleteNamespace($stagingNamespace);
+                return 'Error: Failed to rename staging database: ' . $renameEx->getMessage();
+            }
         } catch (\Exception $dbEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: OpenUpgrade migration failed: " . $dbEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
