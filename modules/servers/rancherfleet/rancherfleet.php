@@ -6810,6 +6810,10 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             $stagingDbName = $dbName . '-staging';
             $dbSecretName = 'rfm-db-admin-' . $orderNum;
 
+            // Create DB admin Secret in staging namespace (required for Job to mount)
+            RancherFleet\Logger::info("CreateStagingUpgrade: creating db-admin Secret in staging namespace");
+            rancherfleet_createDbAdminSecret($params, $rancher, $stagingNamespace, $orderNum);
+
             $jobSpec = array(
                 'apiVersion' => 'batch/v1',
                 'kind'       => 'Job',
@@ -6864,18 +6868,22 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             );
 
             RancherFleet\Logger::info("CreateStagingUpgrade: creating Job to clone database {$dbName} -> {$stagingDbName}");
-            $rancher->rawRequest('POST',
+            RancherFleet\Logger::info("CreateStagingUpgrade: Job spec = " . json_encode($jobSpec));
+
+            $response = $rancher->rawRequest('POST',
                 '/apis/batch/v1/namespaces/' . rawurlencode($stagingNamespace) . '/jobs',
                 $jobSpec
             );
 
-            // Poll for completion — up to 60 seconds
+            RancherFleet\Logger::info("CreateStagingUpgrade: Job creation response = " . json_encode($response));
+
+            // Poll for completion — up to 120 seconds
             $jobName = 'createdb-' . $orderNum . '-staging';
             $jobPath = '/apis/batch/v1/namespaces/' . rawurlencode($stagingNamespace) . '/jobs/' . rawurlencode($jobName);
             $succeeded = false;
             $failed = false;
 
-            for ($i = 0; $i < 12; $i++) {
+            for ($i = 0; $i < 24; $i++) {
                 sleep(5);
                 try {
                     $job = $rancher->rawRequest('GET', $jobPath);
@@ -6904,7 +6912,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
 
             if (!$succeeded) {
                 $rancher->deleteNamespace($stagingNamespace);
-                $errMsg = $failed ? 'Job failed' : 'Job timed out after 60s';
+                $errMsg = $failed ? 'Job failed' : 'Job timed out after 120s';
                 RancherFleet\Logger::error("CreateStagingUpgrade: database cloning failed — {$errMsg}");
                 return 'Error: Failed to create staging database: ' . $errMsg;
             }
