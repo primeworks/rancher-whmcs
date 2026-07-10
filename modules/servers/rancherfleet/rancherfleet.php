@@ -3086,6 +3086,7 @@ function rancherfleet_AdminCustomButtonArray()
         'Share Staging URL'      => 'ShareStagingUrl',
         'Trigger Live Upgrade'   => 'TriggerLiveUpgrade',
         'Cleanup Staging'        => 'CleanupStaging',
+        'Reset Staging'          => 'ResetStaging',
     );
 }
 
@@ -6752,8 +6753,8 @@ function rancherfleet_CreateStagingUpgrade(array $params)
             return 'Error: Payment not yet received. Ask the client to pay invoice #' . $invoiceId . ' first.';
         }
 
-        if ($requestStatus !== 'pending') {
-            return 'Error: Request status is ' . $requestStatus . ', not pending. Please contact support.';
+        if (!in_array($requestStatus, array('pending', 'staging_in_progress'))) {
+            return 'Error: Request status is ' . $requestStatus . ', cannot proceed. Use "Reset Staging" button to retry or contact support.';
         }
 
         $targetVersion = $request['version'];
@@ -6785,10 +6786,18 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         RancherFleet\Logger::info("CreateStagingUpgrade: status updated to staging_in_progress");
 
         // 2. Create staging namespace (backup runs automatically via sidecar)
+        // On retry, namespace may already exist — silently ignore 409 Conflict
         RancherFleet\Logger::info("CreateStagingUpgrade: creating staging namespace");
         try {
             $rancher->createNamespace($stagingNamespace);
             sleep(2);
+        } catch (RancherFleet\RancherApiException $nsEx) {
+            if ($nsEx->getHttpCode() === 409) {
+                RancherFleet\Logger::info("CreateStagingUpgrade: namespace {$stagingNamespace} already exists, proceeding");
+            } else {
+                RancherFleet\Logger::error("CreateStagingUpgrade: namespace creation failed: " . $nsEx->getMessage());
+                return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage();
+            }
         } catch (\Exception $nsEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: namespace creation failed: " . $nsEx->getMessage());
             return 'Error: Failed to create staging namespace: ' . $nsEx->getMessage();
@@ -7439,6 +7448,132 @@ function rancherfleet_CleanupStaging(array $params)
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("CleanupStaging: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Admin button handler to reset/clean up a failed staging upgrade attempt.
+ * Deletes all staging resources and resets request status to 'pending'
+ * so the admin can retry CreateStagingUpgrade().
+ */
+function rancherfleet_ResetStaging(array $params)
+{
+    RancherFleet\Logger::info("ResetStaging: starting");
+
+    try {
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $serviceId = (int)$params['serviceid'];
+        $stagingNamespace = 'whmcs-client-' . $orderNum . '-staging';
+        $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
+        $stagingDbName = 'odoo-' . $orderNum . '-staging';
+        $gitrepoName = 'gitrepo-' . $stagingNamespace;
+
+        RancherFleet\Logger::info("ResetStaging: resetting staging for {$stagingNamespace}");
+
+        list($rancher, $github, $fleet) = rancherfleet_buildClients($params);
+
+        // 1. Delete staging namespace if exists
+        try {
+            $rancher->deleteNamespace($stagingNamespace);
+            RancherFleet\Logger::info("ResetStaging: namespace deleted");
+        } catch (\Exception $nsEx) {
+            RancherFleet\Logger::info("ResetStaging: namespace deletion (non-fatal): " . $nsEx->getMessage());
+        }
+
+        // 2. Delete staging branch if exists
+        try {
+            $github->deleteBranch($stagingBranch);
+            RancherFleet\Logger::info("ResetStaging: branch deleted");
+        } catch (\Exception $branchEx) {
+            RancherFleet\Logger::info("ResetStaging: branch deletion (non-fatal): " . $branchEx->getMessage());
+        }
+
+        // 3. Delete Fleet GitRepo if exists
+        try {
+            $fleet->deleteGitRepo($stagingNamespace);
+            RancherFleet\Logger::info("ResetStaging: GitRepo deleted");
+        } catch (\Exception $gitrepoEx) {
+            RancherFleet\Logger::info("ResetStaging: GitRepo deletion (non-fatal): " . $gitrepoEx->getMessage());
+        }
+
+        // 4. Drop staging database via Job if it might exist
+        try {
+            $dbUser = isset($params['configoption20']) ? trim($params['configoption20']) : 'postgres';
+            $dbPass = isset($params['configoption21']) ? trim($params['configoption21']) : '';
+
+            if (!empty($dbUser)) {
+                $jobName = 'dropdb-' . strtolower(preg_replace('/[^a-z0-9]/i', '-', $orderNum)) . '-staging';
+                $jobName = substr($jobName, 0, 48) . '-' . substr(md5($orderNum . '-s'), 0, 8);
+
+                $jobSpec = array(
+                    'apiVersion' => 'batch/v1',
+                    'kind'       => 'Job',
+                    'metadata'   => array(
+                        'name'      => $jobName,
+                        'namespace' => 'default',
+                        'labels'    => array('app' => 'rfm-dropdb'),
+                    ),
+                    'spec' => array(
+                        'ttlSecondsAfterFinished' => 120,
+                        'backoffLimit'            => 0,
+                        'template' => array(
+                            'spec' => array(
+                                'restartPolicy' => 'Never',
+                                'containers' => array(array(
+                                    'name'    => 'dropdb',
+                                    'image'   => 'postgres:16-alpine',
+                                    'command' => array('sh', '-c'),
+                                    'args'    => array(
+                                        'export PGPASSWORD="' . addslashes($dbPass) . '"' . "\n" .
+                                        'dropdb -h postgres16.default.svc.cluster.local -U "' . addslashes($dbUser) . '" --if-exists "' . $stagingDbName . '"'
+                                    ),
+                                )),
+                            ),
+                        ),
+                    ),
+                );
+
+                $rancher->rawRequest('POST',
+                    '/apis/batch/v1/namespaces/default/jobs',
+                    $jobSpec
+                );
+
+                RancherFleet\Logger::info("ResetStaging: database drop job created");
+            }
+        } catch (\Exception $dbEx) {
+            RancherFleet\Logger::info("ResetStaging: database drop (non-fatal): " . $dbEx->getMessage());
+        }
+
+        // 5. Reset request status to 'pending' (allow retry)
+        try {
+            $record = \WHMCS\Database\Capsule::table('tbladdonmodules')
+                ->where('module', 'rancherfleet_upgrade')
+                ->where('setting', 'request_' . $serviceId)
+                ->first();
+
+            if ($record) {
+                $request = json_decode($record->value, true);
+                if (is_array($request)) {
+                    $request['status'] = 'pending';
+                    \WHMCS\Database\Capsule::table('tbladdonmodules')
+                        ->where('module', 'rancherfleet_upgrade')
+                        ->where('setting', 'request_' . $serviceId)
+                        ->update(array('value' => json_encode($request)));
+                    RancherFleet\Logger::info("ResetStaging: request status reset to 'pending'");
+                }
+            }
+        } catch (\Exception $e) {
+            RancherFleet\Logger::error("ResetStaging: failed to reset request status: " . $e->getMessage());
+        }
+
+        rancherfleet_logHistory($params, 'Staging Reset', 'Failed staging upgrade environment reset. Ready to retry.');
+
+        RancherFleet\Logger::info("ResetStaging: SUCCESS");
+        return 'Success: Staging environment reset. You can now retry "Create Staging Upgrade".';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("ResetStaging: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
