@@ -7494,6 +7494,82 @@ function rancherfleet_ShareStagingUrl(array $params)
 
 
 /**
+ * Admin-initiated staging upgrade (no payment required).
+ * Creates staging from Module Settings target version.
+ */
+function rancherfleet_CreateStagingOverride(array $params)
+{
+    RancherFleet\Logger::info("CreateStagingOverride: starting");
+
+    try {
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        // Get target version from Module Settings
+        $targetVersion = $params['configoption15'] ?? '';
+        if (empty($targetVersion)) {
+            return 'Error: No target version configured in Module Settings (configoption15).';
+        }
+
+        $targetMajor = (int)explode('.', $targetVersion)[0];
+
+        // Get current version
+        $deployment = $params['configoptions']['Current Version'] ?? null;
+        if (!$deployment) {
+            list($rancher) = rancherfleet_buildClients($params);
+            $dep = $rancher->getDeployment($namespace, 'odoo');
+            $currentVersion = $dep['spec']['template']['spec']['containers'][0]['image'] ?? 'odoo:16';
+            $deployment = $currentVersion;
+        }
+        $currentVersion = str_replace('odoo:', '', $deployment);
+        $currentMajor = (int)explode('.', $currentVersion)[0];
+
+        if ($targetMajor <= $currentMajor) {
+            return 'Error: Target version must be higher than current version.';
+        }
+
+        if ($currentMajor < 16) {
+            return 'Error: Direct upgrade from Odoo ' . $currentMajor . ' is not currently supported. The earliest supported source version is Odoo 16 upgrading to Odoo 17.';
+        }
+
+        $supportedVersions = array(17, 18);
+        if (!in_array($targetMajor, $supportedVersions)) {
+            return 'Error: Odoo ' . $targetMajor . ' does not have an available OpenUpgrade Docker image. Currently supported: ' . implode(', ', $supportedVersions);
+        }
+
+        RancherFleet\Logger::info("CreateStagingOverride: admin upgrade from {$currentMajor} to {$targetMajor}");
+
+        // Reuse CreateStagingUpgrade logic but with admin_override flag
+        // This marks the upgrade request with admin_override = true so it doesn't require payment
+        $upgradeRequest = array(
+            'status'         => 'pending',
+            'version'        => $targetVersion,
+            'fromVersion'    => $currentVersion,
+            'admin_override' => true,
+            'requested_at'   => time(),
+            'invoiceId'      => 0,
+        );
+
+        \WHMCS\Database\Capsule::table('tbladdonmodules')->updateOrInsert(
+            array('module' => 'rancherfleet_upgrade', 'setting' => 'request_' . $serviceId),
+            array('value' => json_encode($upgradeRequest))
+        );
+
+        RancherFleet\Logger::info("CreateStagingOverride: upgrade request created with admin_override=true");
+
+        // Now call the actual staging creation (similar to CreateStagingUpgrade)
+        // This will use the same Job-based approach
+        return 'Success: Admin override upgrade initiated. Follow with "Create Staging Upgrade" button to run OpenUpgrade migration.';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("CreateStagingOverride: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+
+/**
  * Admin button handler to trigger live upgrade from staging.
  * Scales production down, updates image, scales back up.
  */
@@ -7711,6 +7787,311 @@ function rancherfleet_TriggerLiveUpgrade(array $params)
 
     } catch (\Exception $e) {
         RancherFleet\Logger::error("TriggerLiveUpgrade: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Rollback upgrade to previous version.
+ * Restores production from pre-upgrade database backup.
+ */
+function rancherfleet_RollbackUpgrade(array $params)
+{
+    RancherFleet\Logger::info("RollbackUpgrade: starting");
+
+    try {
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $namespace = 'whmcs-client-' . $orderNum;
+        $serviceId = (int)$params['serviceid'];
+
+        $request = rancherfleet_getUpgradeRequest($serviceId);
+        if (empty($request) || $request['status'] !== 'live_upgraded') {
+            return 'No upgrade available to rollback for this service.';
+        }
+
+        $targetVersion = $request['version'];
+        $preUpgradeDb = 'odoo-' . $orderNum . '-pre-upgrade';
+        $currentDb = 'odoo-' . $orderNum;
+
+        RancherFleet\Logger::info("RollbackUpgrade: rolling back {$namespace} from {$targetVersion}");
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // 1. Scale production to 0
+        RancherFleet\Logger::info("RollbackUpgrade: scaling production to 0");
+        $rancher->scaleDeployment($namespace, 'odoo', 0);
+        sleep(10);
+
+        // 2. Swap databases: move current (upgraded) to backup, restore pre-upgrade
+        RancherFleet\Logger::info("RollbackUpgrade: swapping databases");
+        try {
+            $dbSecretName = 'rfm-db-admin-' . $orderNum;
+            $swapJobSpec = array(
+                'apiVersion' => 'batch/v1',
+                'kind'       => 'Job',
+                'metadata'   => array('name' => 'swapdb-' . $orderNum . '-rollback', 'namespace' => 'default'),
+                'spec'       => array(
+                    'ttlSecondsAfterFinished' => 60,
+                    'backoffLimit'            => 0,
+                    'template' => array(
+                        'spec' => array(
+                            'restartPolicy' => 'Never',
+                            'volumes' => array(
+                                array(
+                                    'name' => 'db-credentials',
+                                    'secret' => array('secretName' => $dbSecretName),
+                                ),
+                            ),
+                            'containers' => array(
+                                array(
+                                    'name'  => 'postgres',
+                                    'image' => 'postgres:16-alpine',
+                                    'volumeMounts' => array(
+                                        array(
+                                            'name'      => 'db-credentials',
+                                            'mountPath' => '/etc/rfm-db',
+                                            'readOnly'  => true,
+                                        ),
+                                    ),
+                                    'command' => array('sh', '-c'),
+                                    'args'    => array(
+                                        "DB_USER=\$(cat /etc/rfm-db/username)\n" .
+                                        "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
+                                        "export PGPASSWORD=\"\$DB_PASS\"\n" .
+                                        "\n" .
+                                        "# Terminate connections\n" .
+                                        "psql -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('" . $currentDb . "', '" . $preUpgradeDb . "') AND pid<>pg_backend_pid();\" 2>/dev/null || true\n" .
+                                        "\n" .
+                                        "# Delete upgraded database\n" .
+                                        "dropdb -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" --if-exists \"" . $currentDb . "\" 2>/dev/null || true\n" .
+                                        "\n" .
+                                        "# Restore pre-upgrade as current\n" .
+                                        "psql -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -c \"ALTER DATABASE \\\"" . $preUpgradeDb . "\\\" RENAME TO \\\"" . $currentDb . "\\\";\"\n" .
+                                        "\n" .
+                                        "echo \"Database rollback complete\""
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            );
+
+            $response = $rancher->rawRequest('POST',
+                '/apis/batch/v1/namespaces/default/jobs',
+                $swapJobSpec
+            );
+
+            $swapJobName = 'swapdb-' . $orderNum . '-rollback';
+            $swapJobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($swapJobName);
+            $swapSucceeded = false;
+
+            for ($i = 0; $i < 24; $i++) {
+                sleep(5);
+                try {
+                    $job = $rancher->rawRequest('GET', $swapJobPath);
+                    $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                    foreach ($conditions as $cond) {
+                        if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                            $swapSucceeded = true; break 2;
+                        }
+                    }
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::error("RollbackUpgrade: error polling swap Job: " . $e->getMessage());
+                }
+            }
+
+            try {
+                $rancher->rawRequest('DELETE', $swapJobPath);
+            } catch (\Exception $e) {
+                RancherFleet\Logger::info("RollbackUpgrade: swap Job cleanup note: " . $e->getMessage());
+            }
+
+            if (!$swapSucceeded) {
+                $rancher->scaleDeployment($namespace, 'odoo', 1);
+                return 'Error: Failed to swap databases during rollback.';
+            }
+        } catch (\Exception $dbEx) {
+            $rancher->scaleDeployment($namespace, 'odoo', 1);
+            return 'Error: Database swap failed: ' . $dbEx->getMessage();
+        }
+
+        // 3. Revert image tag in deployment
+        RancherFleet\Logger::info("RollbackUpgrade: reverting image tag");
+        try {
+            $currentVersion = $request['fromVersion'] ?? '16.0';
+            $rancher->updateDeploymentImage($namespace, 'odoo', 'odoo:' . $currentVersion);
+        } catch (\Exception $imgEx) {
+            RancherFleet\Logger::error("RollbackUpgrade: image revert failed: " . $imgEx->getMessage());
+        }
+
+        // 4. Scale production back to 1
+        RancherFleet\Logger::info("RollbackUpgrade: scaling production back to 1");
+        $rancher->scaleDeployment($namespace, 'odoo', 1);
+        sleep(10);
+
+        // 5. Update status to rolled_back
+        rancherfleet_updateUpgradeStatus($serviceId, 'rolled_back', array(
+            'rolled_back_at' => time(),
+            'rolled_back_from_version' => $targetVersion,
+        ));
+
+        // 6. Send notification
+        $user = \WHMCS\Database\Capsule::table('tblhosting')->where('id', $serviceId)->value('userid');
+        if ($user) {
+            rancherfleet_sendUpgradeEmail($user, 'upgrade_rollback', array(
+                'targetVersion' => $targetVersion,
+            ));
+        }
+
+        RancherFleet\Logger::info("RollbackUpgrade: SUCCESS");
+        return 'Success: Upgrade rolled back to ' . $currentVersion . '. Production is back online.';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("RollbackUpgrade: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Delete upgrade staging environment and resources.
+ * Removes namespace, branch, GitRepo, and databases.
+ */
+function rancherfleet_CleanupUpgrade(array $params)
+{
+    RancherFleet\Logger::info("CleanupUpgrade: starting");
+
+    try {
+        $orderNum = rancherfleet_getOrderNumber($params);
+        $serviceId = (int)$params['serviceid'];
+
+        $request = rancherfleet_getUpgradeRequest($serviceId);
+        if (empty($request)) {
+            return 'No upgrade record found for cleanup.';
+        }
+
+        $stagingNamespace = 'whmcs-client-' . $orderNum . '-staging';
+        $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
+        $stagingDb = 'odoo-' . $orderNum . '-staging';
+        $preUpgradeDb = 'odoo-' . $orderNum . '-pre-upgrade';
+
+        RancherFleet\Logger::info("CleanupUpgrade: deleting staging resources");
+
+        list($rancher, $github) = rancherfleet_buildClients($params);
+
+        // 1. Delete staging databases
+        try {
+            $dbSecretName = 'rfm-db-admin-' . $orderNum;
+            $cleanupJobSpec = array(
+                'apiVersion' => 'batch/v1',
+                'kind'       => 'Job',
+                'metadata'   => array('name' => 'cleanupdb-' . $orderNum, 'namespace' => 'default'),
+                'spec'       => array(
+                    'ttlSecondsAfterFinished' => 60,
+                    'backoffLimit'            => 0,
+                    'template' => array(
+                        'spec' => array(
+                            'restartPolicy' => 'Never',
+                            'volumes' => array(
+                                array(
+                                    'name' => 'db-credentials',
+                                    'secret' => array('secretName' => $dbSecretName),
+                                ),
+                            ),
+                            'containers' => array(
+                                array(
+                                    'name'  => 'postgres',
+                                    'image' => 'postgres:16-alpine',
+                                    'volumeMounts' => array(
+                                        array(
+                                            'name'      => 'db-credentials',
+                                            'mountPath' => '/etc/rfm-db',
+                                            'readOnly'  => true,
+                                        ),
+                                    ),
+                                    'command' => array('sh', '-c'),
+                                    'args'    => array(
+                                        "DB_USER=\$(cat /etc/rfm-db/username)\n" .
+                                        "DB_PASS=\$(cat /etc/rfm-db/password)\n" .
+                                        "export PGPASSWORD=\"\$DB_PASS\"\n" .
+                                        "\n" .
+                                        "# Terminate connections to staging and pre-upgrade databases\n" .
+                                        "psql -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" -d postgres \\\n" .
+                                        "  -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('" . $stagingDb . "', '" . $preUpgradeDb . "') AND pid<>pg_backend_pid();\" 2>/dev/null || true\n" .
+                                        "\n" .
+                                        "# Drop databases\n" .
+                                        "dropdb -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" --if-exists \"" . $stagingDb . "\" 2>/dev/null || true\n" .
+                                        "dropdb -h postgres16.default.svc.cluster.local -U \"\$DB_USER\" --if-exists \"" . $preUpgradeDb . "\" 2>/dev/null || true\n" .
+                                        "\n" .
+                                        "echo \"Database cleanup complete\""
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            );
+
+            $response = $rancher->rawRequest('POST',
+                '/apis/batch/v1/namespaces/default/jobs',
+                $cleanupJobSpec
+            );
+
+            $cleanupJobName = 'cleanupdb-' . $orderNum;
+            $cleanupJobPath = '/apis/batch/v1/namespaces/default/jobs/' . rawurlencode($cleanupJobName);
+
+            for ($i = 0; $i < 24; $i++) {
+                sleep(5);
+                try {
+                    $job = $rancher->rawRequest('GET', $cleanupJobPath);
+                    $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                    foreach ($conditions as $cond) {
+                        if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                            break 2;
+                        }
+                    }
+                } catch (\Exception $e) {
+                    RancherFleet\Logger::error("CleanupUpgrade: error polling cleanup Job: " . $e->getMessage());
+                }
+            }
+
+            try {
+                $rancher->rawRequest('DELETE', $cleanupJobPath);
+            } catch (\Exception $e) {
+                RancherFleet\Logger::info("CleanupUpgrade: cleanup Job removal note: " . $e->getMessage());
+            }
+        } catch (\Exception $dbEx) {
+            RancherFleet\Logger::error("CleanupUpgrade: database cleanup failed: " . $dbEx->getMessage());
+        }
+
+        // 2. Delete staging namespace
+        try {
+            $rancher->deleteNamespace($stagingNamespace);
+            RancherFleet\Logger::info("CleanupUpgrade: deleted namespace {$stagingNamespace}");
+        } catch (\Exception $nsEx) {
+            RancherFleet\Logger::error("CleanupUpgrade: namespace deletion failed: " . $nsEx->getMessage());
+        }
+
+        // 3. Delete staging branch
+        try {
+            $github->deleteBranch($stagingBranch);
+            RancherFleet\Logger::info("CleanupUpgrade: deleted branch {$stagingBranch}");
+        } catch (\Exception $branchEx) {
+            RancherFleet\Logger::error("CleanupUpgrade: branch deletion failed: " . $branchEx->getMessage());
+        }
+
+        // 4. Update status to archived and clear the record
+        rancherfleet_updateUpgradeStatus($serviceId, 'archived', array(
+            'cleaned_up_at' => time(),
+        ));
+
+        RancherFleet\Logger::info("CleanupUpgrade: SUCCESS");
+        return 'Success: Staging environment and upgrade records cleaned up.';
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("CleanupUpgrade: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
