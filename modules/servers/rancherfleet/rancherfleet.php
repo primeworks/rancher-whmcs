@@ -6947,21 +6947,30 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                 throw new \Exception("odoo.yml not found in client branch {$clientBranch}");
             }
 
-            // Replace namespace references
-            $updated = str_replace('whmcs-client-' . $orderNum, $stagingNamespace, $content);
+            // Replacement order is critical to avoid corrupting values:
+            // 1. Image version first (safest, no overlap with other values)
+            // 2. Ingress hostname (before database name to avoid '0000' overlap)
+            // 3. Database name (orderNum appears in both DB names and hostnames)
+            // 4. Namespace references last
 
-            // Replace image version
+            $updated = $content;
+
+            // 1. Replace image version
             $updated = str_replace('image: odoo:' . $currentVersion, 'image: odoo:' . $targetVersion, $updated);
 
-            // Replace database name
-            $updated = str_replace('odoo-' . $orderNum, 'odoo-' . $orderNum . '-staging', $updated);
-
-            // Replace ingress hostname
+            // 2. Replace ingress hostname: {orderNum}.webdiscode.com -> staging-{orderNum}.webdiscode.com
+            // This matches HTTPS Ingress rules, TLS hosts, and HTTP redirect rules
             $updated = str_replace(
-                'whmcs-client-' . $orderNum . '.webdiscode.com',
+                $orderNum . '.webdiscode.com',
                 'staging-' . $orderNum . '.webdiscode.com',
                 $updated
             );
+
+            // 3. Replace database name: odoo-{orderNum} -> odoo-{orderNum}-staging
+            $updated = str_replace('odoo-' . $orderNum, 'odoo-' . $orderNum . '-staging', $updated);
+
+            // 4. Replace namespace references: whmcs-client-{orderNum} -> whmcs-client-{orderNum}-staging
+            $updated = str_replace('whmcs-client-' . $orderNum, $stagingNamespace, $updated);
 
             $github->writeFileToBranch(
                 'odoo.yml',
