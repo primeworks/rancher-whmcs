@@ -3075,13 +3075,14 @@ function rancherfleet_AdminCustomButtonArray()
         'Push Backup Sidecar'    => 'PushBackupSidecar',
         'Patch Backup Storage'   => 'PatchBackupStorage',
         'Refresh Webhook Secret' => 'RefreshWebhookSecret',
-        'Remove Custom URL'      => 'RemoveCustomUrl',
-        'Patch Template Updates' => 'PatchTemplateUpdates',
-        'Create Staging Upgrade' => 'CreateStagingUpgrade',
-        'Share Staging URL'      => 'ShareStagingUrl',
-        'Trigger Live Upgrade'   => 'TriggerLiveUpgrade',
-        'Cleanup Staging'        => 'CleanupStaging',
-        'Reset Staging'          => 'ResetStaging',
+        'Remove Custom URL'       => 'RemoveCustomUrl',
+        'Patch Template Updates'  => 'PatchTemplateUpdates',
+        'Create Staging Upgrade'  => 'CreateStagingUpgrade',
+        'Create Staging (Override)' => 'CreateStagingOverride',
+        'Trigger Live Upgrade'    => 'TriggerLiveUpgrade',
+        'Rollback Upgrade'        => 'RollbackUpgrade',
+        'Cleanup Upgrade'         => 'CleanupUpgrade',
+        'Reset Staging'           => 'ResetStaging',
     );
 }
 
