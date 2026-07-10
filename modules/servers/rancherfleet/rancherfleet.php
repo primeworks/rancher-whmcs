@@ -6765,7 +6765,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
 
         RancherFleet\Logger::info("CreateStagingUpgrade: proceeding with staging, version={$targetVersion}, fee={$fee}, invoice={$invoiceId} (already paid via invoice)");
 
-        list($rancher, $github) = rancherfleet_buildClients($params);
+        list($rancher, $github, $fleet, $cfg) = rancherfleet_buildClients($params);
 
         // Get current version
         $deploymentStatus = $rancher->getDeploymentStatus($namespace, 'odoo-' . $orderNum);
@@ -6799,37 +6799,109 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         try {
             $dbName = 'odoo-' . $orderNum;
             $stagingDbName = $dbName . '-staging';
+            $dbSecretName = 'rfm-db-admin-' . $orderNum;
 
             $jobSpec = array(
                 'apiVersion' => 'batch/v1',
                 'kind'       => 'Job',
                 'metadata'   => array('name' => 'createdb-' . $orderNum . '-staging', 'namespace' => $stagingNamespace),
                 'spec'       => array(
+                    'ttlSecondsAfterFinished' => 120,
+                    'backoffLimit'            => 0,
                     'template' => array(
                         'spec' => array(
+                            'restartPolicy' => 'Never',
+                            'volumes' => array(
+                                array(
+                                    'name' => 'db-credentials',
+                                    'secret' => array('secretName' => $dbSecretName),
+                                ),
+                            ),
                             'containers' => array(
                                 array(
                                     'name'  => 'postgres',
                                     'image' => 'postgres:16-alpine',
-                                    'env'   => array(
-                                        array('name' => 'PGPASSWORD', 'value' => getenv('DB_PASSWORD')),
+                                    'volumeMounts' => array(
+                                        array(
+                                            'name'      => 'db-credentials',
+                                            'mountPath' => '/etc/rfm-db',
+                                            'readOnly'  => true,
+                                        ),
                                     ),
-                                    'command' => array('/bin/sh', '-c'),
+                                    'command' => array('sh', '-c'),
                                     'args'    => array(
-                                        'pg_terminate_backend(pid) from pg_stat_activity where datname=\'' . $dbName . '\'; ' .
-                                        'createdb -h postgres16.default.svc.cluster.local -U postgres --template "' . $dbName . '" "' . $stagingDbName . '"'
+                                        'DB_USER=$(cat /etc/rfm-db/username)' . "\n" .
+                                        'DB_PASS=$(cat /etc/rfm-db/password)' . "\n" .
+                                        'export PGPASSWORD="$DB_PASS"' . "\n" .
+                                        "\n" .
+                                        '# Terminate active connections to source database' . "\n" .
+                                        'psql -h postgres16.default.svc.cluster.local \' . "\n" .
+                                        '  -U "$DB_USER" -d postgres \' . "\n" .
+                                        '  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity ' . "\n" .
+                                        '      WHERE datname=\'' . $dbName . '\' AND pid<>pg_backend_pid();"' . "\n" .
+                                        "\n" .
+                                        '# Clone database' . "\n" .
+                                        'createdb -h postgres16.default.svc.cluster.local \' . "\n" .
+                                        '  -U "$DB_USER" \' . "\n" .
+                                        '  --template "' . $dbName . '" \' . "\n" .
+                                        '  "' . $stagingDbName . '"' . "\n" .
+                                        "\n" .
+                                        'echo "Database cloned successfully"'
                                     ),
                                 ),
                             ),
-                            'restartPolicy' => 'Never',
                         ),
                     ),
-                    'backoffLimit' => 3,
                 ),
             );
 
-            $rancher->createJob($stagingNamespace, $jobSpec);
-            sleep(5);
+            RancherFleet\Logger::info("CreateStagingUpgrade: creating Job to clone database {$dbName} -> {$stagingDbName}");
+            $rancher->rawRequest('POST',
+                '/apis/batch/v1/namespaces/' . rawurlencode($stagingNamespace) . '/jobs',
+                $jobSpec
+            );
+
+            // Poll for completion — up to 60 seconds
+            $jobName = 'createdb-' . $orderNum . '-staging';
+            $jobPath = '/apis/batch/v1/namespaces/' . rawurlencode($stagingNamespace) . '/jobs/' . rawurlencode($jobName);
+            $succeeded = false;
+            $failed = false;
+
+            for ($i = 0; $i < 12; $i++) {
+                sleep(5);
+                try {
+                    $job = $rancher->rawRequest('GET', $jobPath);
+                    $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                    foreach ($conditions as $cond) {
+                        if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                            $succeeded = true; break 2;
+                        }
+                        if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                            $failed = true; break 2;
+                        }
+                    }
+                    RancherFleet\Logger::info("CreateStagingUpgrade: waiting for database Job... " . (($i + 1) * 5) . "s elapsed");
+                } catch (\Exception $pollEx) {
+                    RancherFleet\Logger::error("CreateStagingUpgrade: error polling database Job: " . $pollEx->getMessage());
+                    break;
+                }
+            }
+
+            // Clean up the Job
+            try {
+                $rancher->rawRequest('DELETE', $jobPath);
+            } catch (\Exception $e) {
+                RancherFleet\Logger::info("CreateStagingUpgrade: Job cleanup note: " . $e->getMessage());
+            }
+
+            if (!$succeeded) {
+                $rancher->deleteNamespace($stagingNamespace);
+                $errMsg = $failed ? 'Job failed' : 'Job timed out after 60s';
+                RancherFleet\Logger::error("CreateStagingUpgrade: database cloning failed — {$errMsg}");
+                return 'Error: Failed to create staging database: ' . $errMsg;
+            }
+
+            RancherFleet\Logger::info("CreateStagingUpgrade: database cloned successfully");
         } catch (\Exception $dbEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: database creation failed: " . $dbEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
@@ -6841,7 +6913,7 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         try {
             $clientBranch = 'whmcs-client-' . $orderNum;
             $stagingBranch = $clientBranch . '-staging';
-            $github->createOrUpdateBranch($stagingBranch, $clientBranch);
+            $github->createBranchFrom($stagingBranch, $clientBranch);
         } catch (\Exception $branchEx) {
             RancherFleet\Logger::error("CreateStagingUpgrade: branch clone failed: " . $branchEx->getMessage());
             $rancher->deleteNamespace($stagingNamespace);
@@ -6853,8 +6925,11 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         try {
             $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
 
-            // Get current odoo.yml
-            $content = $github->getFileContent($stagingBranch, 'odoo.yml');
+            // Get current odoo.yml from client branch
+            $content = $github->getClientFileContent($namespace, 'odoo.yml');
+            if (empty($content)) {
+                throw new \Exception("odoo.yml not found in client branch {$clientBranch}");
+            }
 
             // Replace namespace references
             $updated = str_replace('whmcs-client-' . $orderNum, $stagingNamespace, $content);
@@ -6872,10 +6947,10 @@ function rancherfleet_CreateStagingUpgrade(array $params)
                 $updated
             );
 
-            $github->createOrUpdateFile(
-                $stagingBranch,
+            $github->writeFileToBranch(
                 'odoo.yml',
                 $updated,
+                $stagingBranch,
                 'Staging environment for Odoo upgrade to ' . $targetVersion
             );
 
@@ -6890,22 +6965,9 @@ function rancherfleet_CreateStagingUpgrade(array $params)
         // 6. Create staging Fleet GitRepo
         RancherFleet\Logger::info("CreateStagingUpgrade: creating staging GitRepo");
         try {
-            $stagingBranch = 'whmcs-client-' . $orderNum . '-staging';
-            $gitRepo = array(
-                'apiVersion' => 'fleet.cattle.io/v1alpha1',
-                'kind'       => 'GitRepo',
-                'metadata'   => array('name' => 'gitrepo-' . $stagingNamespace, 'namespace' => 'fleet-default'),
-                'spec'       => array(
-                    'repo'         => 'https://github.com/primeworks/rancher',
-                    'branch'       => $stagingBranch,
-                    'paths'        => array($stagingNamespace),
-                    'targets'      => array(
-                        array('name' => getenv('TARGET_CLUSTER_ID')),
-                    ),
-                ),
-            );
-
-            $rancher->createFleetGitRepo('fleet-default', $gitRepo);
+            // FleetHelper.createGitRepo() automatically uses the correct cluster name
+            // and Fleet namespace configuration — we just pass the namespace name
+            $fleet->createGitRepo($stagingNamespace, $stagingNamespace);
             sleep(5);
 
             RancherFleet\Logger::info("CreateStagingUpgrade: staging GitRepo created");

@@ -222,7 +222,7 @@ class GitHubClient
      * @param string $newBranch      Branch to create
      * @param string $sourceBranch   Branch to branch from
      */
-    private function createBranchFrom($newBranch, $sourceBranch)
+    public function createBranchFrom($newBranch, $sourceBranch)
     {
         if ($this->branchExists($newBranch)) {
             Logger::info("createBranchFrom: {$newBranch} already exists, skipping.");
@@ -269,7 +269,7 @@ class GitHubClient
      * Deletes a branch from the repo.
      * Silently ignores 404 (already deleted).
      */
-    private function deleteBranch($branchName)
+    public function deleteBranch($branchName)
     {
         $url = self::API_BASE . '/repos/' . $this->owner . '/' . $this->repo
              . '/git/refs/heads/' . str_replace('%2F', '/', rawurlencode($branchName));
