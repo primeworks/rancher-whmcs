@@ -684,8 +684,18 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
     $html  = '<div class="rfm-ca-card">';
     $html .= '<h4>Backups</h4>';
 
+    // Add "Take Backup Now" button
+    $html .= '<div style="margin-bottom:14px;">';
+    $html .= '<form method="post" action="' . htmlspecialchars($serviceUrl) . '" '
+           . 'onsubmit="return confirm(\'This will back up your database and filestore. This may take a few minutes. Continue?\');">';
+    $html .= '<input type="hidden" name="clientaction" value="take_backup">';
+    $html .= '<button type="submit" style="background:#27ae60;color:#fff;border:none;border-radius:4px;'
+           . 'padding:8px 16px;font-size:12px;font-weight:bold;cursor:pointer;">⬇ Take Backup Now</button>';
+    $html .= '</form>';
+    $html .= '</div>';
+
     if (empty($files)) {
-        $html .= '<div style="font-size:12px;color:#888;">No backups available yet. Backups run automatically at 3am UTC daily and are retained for 3 days. Check back after the first scheduled run.</div>';
+        $html .= '<div style="font-size:12px;color:#888;">No backups available yet. Click "Take Backup Now" to create your first backup, or backups will be created when you manually trigger them. Backups are retained for 3 days.</div>';
         $html .= '</div>';
         return $html;
     }
@@ -757,7 +767,7 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
     }
 
     $html .= '<p style="font-size:11px;color:#aaa;margin-top:8px;">'
-           . 'Backups are retained for 3 days. Download links expire after 60 seconds.</p>';
+           . 'Backups are retained for 3 days. Backups older than 3 days are automatically removed when a new backup is taken. Download links expire after 60 seconds.</p>';
     $html .= '</div>';
     return $html;
 }
@@ -1591,6 +1601,250 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
         RancherFleet\Logger::error("backupRestore: exception — " . $e->getMessage());
         rancherfleet_logHistory($params, 'Restore Error', $e->getMessage());
         return 'backup_restore_error:' . $e->getMessage();
+    }
+}
+
+/**
+ * Handles manual backup request from client area.
+ * Creates a Kubernetes Job to run the backup script immediately.
+ *
+ * @param  array  $params
+ * @param  string $namespace
+ * @param  string $orderNum
+ * @return string  'backup_success:...' or 'backup_error:...'
+ */
+function rancherfleet_handleTakeBackup(array $params, $namespace, $orderNum)
+{
+    RancherFleet\Logger::info("takeBackup: starting for {$namespace}");
+
+    try {
+        list($rancher) = rancherfleet_buildClients($params);
+        $serviceId = (int)$params['serviceid'];
+
+        // DB credentials from Module Settings
+        $dbUser = isset($params['configoption20']) ? trim($params['configoption20']) : 'postgres';
+        $dbPass = isset($params['configoption21']) ? trim($params['configoption21']) : '';
+
+        if (empty($dbUser)) {
+            RancherFleet\Logger::error("takeBackup: DB credentials not configured");
+            return 'backup_error:Database credentials not configured';
+        }
+
+        // Generate unique job name
+        $timestamp = time();
+        $jobName = 'rfm-backup-' . $timestamp . '-' . substr(md5($orderNum), 0, 4);
+        $jobName = substr($jobName, 0, 60); // Keep under 63 char DNS limit
+
+        // Build backup shell script
+        $backupScript = "set -e\n"
+            . "DB_USER=$(cat /etc/rfm-db/username 2>/dev/null || echo \"\")\n"
+            . "DB_PASS=$(cat /etc/rfm-db/password 2>/dev/null || echo \"\")\n"
+            . "URL=$(cat /etc/rfm-webhook/url 2>/dev/null || echo \"\")\n"
+            . "SECRET=$(cat /etc/rfm-webhook/secret 2>/dev/null || echo \"\")\n"
+            . "SID=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo \"\")\n"
+            . "\n"
+            . "if [ -z \"\$DB_USER\" ] || [ -z \"\$DB_PASS\" ]; then\n"
+            . "  echo \"DB credentials not available\"\n"
+            . "  exit 1\n"
+            . "fi\n"
+            . "\n"
+            . "DATE=\$(date +%Y-%m-%d)\n"
+            . "ORDER_NUM=\"{$orderNum}\"\n"
+            . "DB_NAME=\"odoo-{$orderNum}\"\n"
+            . "BACKUP_DIR=\"/backups/odoo-{$orderNum}\"\n"
+            . "mkdir -p \"\$BACKUP_DIR\"\n"
+            . "\n"
+            . "# Database backup\n"
+            . "PGPASSWORD=\"\$DB_PASS\" pg_dump -Fc -d \"\$DB_NAME\" \\\n"
+            . "  -h postgres16.default.svc.cluster.local \\\n"
+            . "  -U \"\$DB_USER\" \\\n"
+            . "  -f \"\$BACKUP_DIR/db-\${ORDER_NUM}-\${DATE}.dump\"\n"
+            . "echo \"Database backup complete\"\n"
+            . "\n"
+            . "# Filestore backup\n"
+            . "tar -czf \"\$BACKUP_DIR/filestore-\${ORDER_NUM}-\${DATE}.tar.gz\" \\\n"
+            . "  -C /var/lib/odoo . 2>/dev/null || true\n"
+            . "echo \"Filestore backup complete\"\n"
+            . "\n"
+            . "# Delete files older than 3 days\n"
+            . "find \"\$BACKUP_DIR\" -maxdepth 1 \\\n"
+            . "  \\( -name \"db-\${ORDER_NUM}-*.dump\" \\\n"
+            . "  -o -name \"filestore-\${ORDER_NUM}-*.tar.gz\" \\) \\\n"
+            . "  -mtime +3 -delete\n"
+            . "\n"
+            . "# Write manifest.json\n"
+            . "MANIFEST=\"\$BACKUP_DIR/manifest.json\"\n"
+            . "printf '[\\n' > \"\$MANIFEST\"\n"
+            . "FIRST=1\n"
+            . "for FILE in \$(ls -t \\\n"
+            . "  \"\$BACKUP_DIR\"/db-\${ORDER_NUM}-*.dump \\\n"
+            . "  \"\$BACKUP_DIR\"/filestore-\${ORDER_NUM}-*.tar.gz 2>/dev/null); do\n"
+            . "  FNAME=\$(basename \"\$FILE\")\n"
+            . "  FSIZE=\$(stat -c%s \"\$FILE\" 2>/dev/null || echo 0)\n"
+            . "  FMTIME=\$(stat -c%Y \"\$FILE\" 2>/dev/null || echo 0)\n"
+            . "  TYPE=\"db\"\n"
+            . "  echo \"\$FNAME\" | grep -q \"^filestore-\" && TYPE=\"filestore\"\n"
+            . "  if [ \"\$FIRST\" = \"0\" ]; then printf ',\\n' >> \"\$MANIFEST\"; fi\n"
+            . "  printf '  {\"name\":\"%s\",\"size\":%s,\"mtime\":%s,\"type\":\"%s\"}' \\\n"
+            . "    \"\$FNAME\" \"\$FSIZE\" \"\$FMTIME\" \"\$TYPE\" >> \"\$MANIFEST\"\n"
+            . "  FIRST=0\n"
+            . "done\n"
+            . "printf ']\\n' >> \"\$MANIFEST\"\n"
+            . "\n"
+            . "# Notify WHMCS webhook\n"
+            . "if [ -n \"\$URL\" ] && [ -n \"\$SECRET\" ] && [ -n \"\$SID\" ]; then\n"
+            . "  apk add --no-cache curl >/dev/null 2>&1 || true\n"
+            . "  PAYLOAD=\$(printf \\\n"
+            . "    '{\"service_id\":%s,\"order_num\":\"%s\",\"secret\":\"%s\",\"files\":%s}' \\\n"
+            . "    \"\$SID\" \"\$ORDER_NUM\" \"\$SECRET\" \"\$(cat \$MANIFEST)\")\n"
+            . "  curl -sf -X POST -H \"Content-Type: application/json\" \\\n"
+            . "    -d \"\$PAYLOAD\" \"\$URL\" || true\n"
+            . "fi\n"
+            . "\n"
+            . "echo \"Backup complete\"\n";
+
+        // Build Job manifest
+        $jobManifest = array(
+            'apiVersion' => 'batch/v1',
+            'kind'       => 'Job',
+            'metadata'   => array(
+                'name'      => $jobName,
+                'namespace' => $namespace,
+                'labels'    => array('app' => 'rfm-backup'),
+            ),
+            'spec' => array(
+                'ttlSecondsAfterFinished' => 300,
+                'backoffLimit'            => 0,
+                'template'               => array(
+                    'spec' => array(
+                        'restartPolicy' => 'Never',
+                        'containers'    => array(array(
+                            'name'    => 'backup',
+                            'image'   => 'postgres:16-alpine',
+                            'command' => array('sh', '-c', $backupScript),
+                            'volumeMounts' => array(
+                                array(
+                                    'name'      => 'odoo-data',
+                                    'mountPath' => '/var/lib/odoo',
+                                    'subPath'   => 'odoo',
+                                ),
+                                array(
+                                    'name'      => 'nfs-backups',
+                                    'mountPath' => '/backups',
+                                ),
+                                array(
+                                    'name'      => 'rfm-db-admin',
+                                    'mountPath' => '/etc/rfm-db',
+                                    'readOnly'  => true,
+                                ),
+                                array(
+                                    'name'      => 'rfm-webhook-config',
+                                    'mountPath' => '/etc/rfm-webhook',
+                                    'readOnly'  => true,
+                                ),
+                            ),
+                        )),
+                        'volumes' => array(
+                            array(
+                                'name'         => 'odoo-data',
+                                'persistentVolumeClaim' => array(
+                                    'claimName' => 'odoo-' . $orderNum,
+                                ),
+                            ),
+                            array(
+                                'name' => 'nfs-backups',
+                                'nfs' => array(
+                                    'server' => '162.35.166.55',
+                                    'path'   => '/export/share1',
+                                ),
+                            ),
+                            array(
+                                'name' => 'rfm-db-admin',
+                                'secret' => array(
+                                    'secretName' => 'rfm-db-admin-' . $orderNum,
+                                ),
+                            ),
+                            array(
+                                'name' => 'rfm-webhook-config',
+                                'secret' => array(
+                                    'secretName' => 'rfm-webhook-' . $orderNum,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        RancherFleet\Logger::info("takeBackup: creating Job {$jobName}");
+
+        // Create the Job
+        $rancher->rawRequest('POST',
+            '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs',
+            $jobManifest
+        );
+
+        // Poll for completion — up to 300 seconds (5 minutes)
+        $succeeded = false;
+        $failed    = false;
+        $jobPath   = '/apis/batch/v1/namespaces/' . rawurlencode($namespace) . '/jobs/' . rawurlencode($jobName);
+
+        for ($i = 0; $i < 60; $i++) {  // 60 * 5 = 300 seconds
+            sleep(5);
+            try {
+                $job        = $rancher->rawRequest('GET', $jobPath);
+                $conditions = isset($job['status']['conditions']) ? $job['status']['conditions'] : array();
+                foreach ($conditions as $cond) {
+                    if (isset($cond['type']) && $cond['type'] === 'Complete' && $cond['status'] === 'True') {
+                        $succeeded = true; break 2;
+                    }
+                    if (isset($cond['type']) && $cond['type'] === 'Failed' && $cond['status'] === 'True') {
+                        $failed = true; break 2;
+                    }
+                }
+                RancherFleet\Logger::info("takeBackup: waiting for Job... " . (($i + 1) * 5) . "s elapsed");
+            } catch (\Exception $e) {
+                RancherFleet\Logger::error("takeBackup: error polling Job: " . $e->getMessage());
+                break;
+            }
+        }
+
+        // Clean up the Job
+        try {
+            $rancher->rawRequest('DELETE', $jobPath);
+        } catch (\Exception $e) {
+            RancherFleet\Logger::info("takeBackup: Job cleanup note: " . $e->getMessage());
+        }
+
+        if ($succeeded) {
+            // Clear cached manifest so card refreshes with new backup
+            try {
+                \WHMCS\Database\Capsule::table('tbladdonmodules')
+                    ->where('module', 'rancherfleet_backups')
+                    ->where('setting', 'manifest_' . $serviceId)
+                    ->delete();
+                RancherFleet\Logger::info("takeBackup: cleared backup manifest cache for service {$serviceId}");
+            } catch (\Exception $cacheEx) {
+                RancherFleet\Logger::error("takeBackup: warning - failed to clear cache: " . $cacheEx->getMessage());
+            }
+
+            RancherFleet\Logger::info("takeBackup: SUCCESS");
+            rancherfleet_logHistory($params, 'Backup Taken', 'Manual backup completed');
+            return 'backup_success:Backup completed successfully. Your files are now available for download.';
+        } elseif ($failed) {
+            RancherFleet\Logger::error("takeBackup: Job failed");
+            rancherfleet_logHistory($params, 'Backup Failed', 'Backup job failed');
+            return 'backup_error:Backup failed. Please try again or contact support.';
+        } else {
+            RancherFleet\Logger::error("takeBackup: Job timed out after 300s");
+            rancherfleet_logHistory($params, 'Backup Timeout', 'Job timeout after 5 minutes');
+            return 'backup_error:Backup timed out after 5 minutes. Please try again or contact support.';
+        }
+
+    } catch (\Exception $e) {
+        RancherFleet\Logger::error("takeBackup: exception — " . $e->getMessage());
+        rancherfleet_logHistory($params, 'Backup Error', $e->getMessage());
+        return 'backup_error:' . $e->getMessage();
     }
 }
 
@@ -3918,6 +4172,24 @@ function rancherfleet_PatchBackupStorage(array $params)
         $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
         RancherFleet\Logger::info("PatchBackupStorage: updated BACKUP_DIR in {$namespace}");
 
+        // Step 4: Strip automatic cron scheduling from backup sidecar (if present)
+        // This removes the old dcron-based automatic daily backups, leaving only manual Job-based backups
+        if (preg_match('/- name:\s+backup\s*\n.*?apk add --no-cache curl dcron/is', $updated)) {
+            // Remove dcron from apk install
+            $updated = preg_replace(
+                '/apk add --no-cache curl dcron/',
+                'apk add --no-cache curl',
+                $updated
+            );
+            RancherFleet\Logger::info("PatchBackupStorage: removed dcron package from backup sidecar in {$namespace}");
+
+            // Remove crontab scheduling and crond daemon
+            $cronRemovalPattern = '/echo "0 3 \* \* \* \/backup\.sh.*?\n.*?crond -f -l 2\s*\n/s';
+            $cronReplacement = '# Backups are now triggered manually via Job, not automatic cron\n          tail -f /dev/null' . "\n";
+            $updated = preg_replace($cronRemovalPattern, $cronReplacement, $updated);
+            RancherFleet\Logger::info("PatchBackupStorage: removed cron scheduling and crond from backup sidecar in {$namespace}");
+        }
+
         // Verify changes were made
         if ($updated === $odooYaml) {
             RancherFleet\Logger::error("PatchBackupStorage: changes failed to apply to {$namespace}");
@@ -4003,55 +4275,10 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
         command: [sh, -c]
         args:
         - |
-          apk add --no-cache curl dcron
-          cat > /backup.sh << \'SCRIPT\'
-          #!/bin/sh
-          set -e
-          DATE=$(date +%Y-%m-%d)
-          ORDER_NUM=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "' . $orderNum . '")
-          DB_NAME="odoo-${ORDER_NUM}"
-          BACKUP_DIR="/backups/odoo-${ORDER_NUM}"
-          mkdir -p "$BACKUP_DIR"
-          pg_dump -Fc -d "$DB_NAME" \
-            -h postgres16.default.svc.cluster.local \
-            -U $(cat /etc/rfm-db/username) \
-            -f "$BACKUP_DIR/db-${ORDER_NUM}-${DATE}.dump"
-          tar -czf "$BACKUP_DIR/filestore-${ORDER_NUM}-${DATE}.tar.gz" \
-            -C /var/lib/odoo . 2>/dev/null || true
-          find "$BACKUP_DIR" -maxdepth 1 \
-            \( -name "db-${ORDER_NUM}-*.dump" \
-            -o -name "filestore-${ORDER_NUM}-*.tar.gz" \) \
-            -mtime +3 -delete
-          MANIFEST="$BACKUP_DIR/manifest.json"
-          printf \'[\n\' > "$MANIFEST"
-          FIRST=1
-          for FILE in $(ls -t "$BACKUP_DIR"/db-${ORDER_NUM}-*.dump \
-            "$BACKUP_DIR"/filestore-${ORDER_NUM}-*.tar.gz 2>/dev/null); do
-            FNAME=$(basename "$FILE")
-            FSIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-            FMTIME=$(stat -c%Y "$FILE" 2>/dev/null || echo 0)
-            TYPE="db"
-            echo "$FNAME" | grep -q "^filestore-" && TYPE="filestore"
-            if [ "$FIRST" = "0" ]; then printf \',\n\' >> "$MANIFEST"; fi
-            printf \'  {"name":"%s","size":%s,"mtime":%s,"type":"%s"}\' \
-              "$FNAME" "$FSIZE" "$FMTIME" "$TYPE" >> "$MANIFEST"
-            FIRST=0
-          done
-          printf \']\n\' >> "$MANIFEST"
-          URL=$(cat /etc/rfm-webhook/url 2>/dev/null || echo "")
-          SECRET=$(cat /etc/rfm-webhook/secret 2>/dev/null || echo "")
-          SID=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "")
-          if [ -n "$URL" ] && [ -n "$SECRET" ] && [ -n "$SID" ]; then
-            PAYLOAD=$(printf \
-              \'{"service_id":%s,"order_num":"%s","secret":"%s","files":%s}\' \
-              "$SID" "$ORDER_NUM" "$SECRET" "$(cat $MANIFEST)")
-            curl -sf -X POST -H "Content-Type: application/json" \
-              -d "$PAYLOAD" "$URL" || true
-          fi
-          SCRIPT
-          chmod +x /backup.sh
-          echo "0 3 * * * /backup.sh >> /var/log/backup.log 2>&1" | crontab -
-          crond -f -l 2
+          apk add --no-cache curl
+          # Backups are now triggered manually via Job, not automatic cron
+          # Sidecar stays alive for future enhancements
+          tail -f /dev/null
         env:
         - name: PGPASSWORD
           valueFrom:
@@ -5183,6 +5410,8 @@ function rancherfleet_ClientArea(array $params)
         } else {
             $message = 'error:Invalid backup file or type';
         }
+    } elseif ($action === 'take_backup') {
+        $message = rancherfleet_handleTakeBackup($params, $namespace, $orderNum);
     } elseif ($action === 'custom_url_connect') {
         $message = rancherfleet_handleCustomUrlConnect($params, $namespace, $orderNum);
     } elseif ($action === 'odoo_password_reset') {
