@@ -1820,20 +1820,6 @@ function rancherfleet_handleTakeBackup(array $params, $namespace, $orderNum)
         }
 
         if ($succeeded) {
-            // Clear cached manifest so card refreshes with new backup
-            try {
-                \WHMCS\Database\Capsule::table('tbladdonmodules')
-                    ->where('module', 'rancherfleet_backups')
-                    ->where('setting', 'manifest_' . $serviceId)
-                    ->delete();
-                RancherFleet\Logger::info("takeBackup: cleared backup manifest cache for service {$serviceId}");
-            } catch (\Exception $cacheEx) {
-                RancherFleet\Logger::error("takeBackup: warning - failed to clear cache: " . $cacheEx->getMessage());
-            }
-
-            RancherFleet\Logger::info("takeBackup: waiting for webhook to repopulate cache");
-            sleep(3);
-
             RancherFleet\Logger::info("takeBackup: SUCCESS");
             rancherfleet_logHistory($params, 'Backup Taken', 'Manual backup completed');
             return 'backup_success:Backup completed successfully. Your files are now available for download.';
