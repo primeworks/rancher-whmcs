@@ -6497,7 +6497,8 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-error">&#10007; Restore failed: ' . htmlspecialchars(substr($message, strlen('backup_restore_error:'))) . '</div>';
     } elseif (strpos($message, 'backup_success:') === 0) {
         $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars(substr($message, strlen('backup_success:'))) . '</div>';
-        $html .= '<script>setTimeout(function(){ window.location.reload(); }, 2000);</script>';
+        // Auto-reload page after 3 seconds to display newly created backup files
+        $html .= '<script>setTimeout(function(){ if (location.hash !== "#reloaded") { location.hash = "#reloaded"; location.reload(); } }, 3000);</script>';
     } elseif (strpos($message, 'backup_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('backup_error:'))) . '</div>';
     } elseif (strpos($message, 'custom_url_success:') === 0) {
