@@ -1615,6 +1615,9 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
  */
 function rancherfleet_handleTakeBackup(array $params, $namespace, $orderNum)
 {
+    RancherFleet\Logger::info('handleTakeBackup: entered function');
+    RancherFleet\Logger::info('handleTakeBackup: namespace=' . $namespace . ' orderNum=' . $orderNum);
+
     try {
         RancherFleet\Logger::info("takeBackup: starting for {$namespace}");
 
