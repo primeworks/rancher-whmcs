@@ -686,7 +686,7 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
 
     // Add "Take Backup Now" button
     $html .= '<div style="margin-bottom:14px;">';
-    $html .= '<form method="post" action="' . htmlspecialchars($serviceUrl) . '" '
+    $html .= '<form method="post" action="' . $serviceUrl . '" '
            . 'onsubmit="return confirm(\'This will back up your database and filestore. This may take a few minutes. Continue?\');">';
     $html .= '<input type="hidden" name="clientaction" value="take_backup">';
     $html .= '<button type="submit" style="background:#27ae60;color:#fff;border:none;border-radius:4px;'
