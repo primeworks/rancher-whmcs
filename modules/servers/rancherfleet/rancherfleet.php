@@ -4175,24 +4175,6 @@ function rancherfleet_PatchBackupStorage(array $params)
         $updated = str_replace($oldBackupDir, $newBackupDir, $updated);
         RancherFleet\Logger::info("PatchBackupStorage: updated BACKUP_DIR in {$namespace}");
 
-        // Step 4: Strip automatic cron scheduling from backup sidecar (if present)
-        // This removes the old dcron-based automatic daily backups, leaving only manual Job-based backups
-        if (preg_match('/- name:\s+backup\s*\n.*?apk add --no-cache curl dcron/is', $updated)) {
-            // Remove dcron from apk install
-            $updated = preg_replace(
-                '/apk add --no-cache curl dcron/',
-                'apk add --no-cache curl',
-                $updated
-            );
-            RancherFleet\Logger::info("PatchBackupStorage: removed dcron package from backup sidecar in {$namespace}");
-
-            // Remove crontab scheduling and crond daemon
-            $cronRemovalPattern = '/echo "0 3 \* \* \* \/backup\.sh.*?\n.*?crond -f -l 2\s*\n/s';
-            $cronReplacement = '# Backups are now triggered manually via Job, not automatic cron\n          tail -f /dev/null' . "\n";
-            $updated = preg_replace($cronRemovalPattern, $cronReplacement, $updated);
-            RancherFleet\Logger::info("PatchBackupStorage: removed cron scheduling and crond from backup sidecar in {$namespace}");
-        }
-
         // Verify changes were made
         if ($updated === $odooYaml) {
             RancherFleet\Logger::error("PatchBackupStorage: changes failed to apply to {$namespace}");
@@ -4278,10 +4260,55 @@ function rancherfleet_injectBackupSidecar($yamlContent, $orderNum)
         command: [sh, -c]
         args:
         - |
-          apk add --no-cache curl
-          # Backups are now triggered manually via Job, not automatic cron
-          # Sidecar stays alive for future enhancements
-          tail -f /dev/null
+          apk add --no-cache curl dcron
+          cat > /backup.sh << \'SCRIPT\'
+          #!/bin/sh
+          set -e
+          DATE=$(date +%Y-%m-%d)
+          ORDER_NUM=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "' . $orderNum . '")
+          DB_NAME="odoo-${ORDER_NUM}"
+          BACKUP_DIR="/backups/odoo-${ORDER_NUM}"
+          mkdir -p "$BACKUP_DIR"
+          pg_dump -Fc -d "$DB_NAME" \
+            -h postgres16.default.svc.cluster.local \
+            -U $(cat /etc/rfm-db/username) \
+            -f "$BACKUP_DIR/db-${ORDER_NUM}-${DATE}.dump"
+          tar -czf "$BACKUP_DIR/filestore-${ORDER_NUM}-${DATE}.tar.gz" \
+            -C /var/lib/odoo . 2>/dev/null || true
+          find "$BACKUP_DIR" -maxdepth 1 \
+            \( -name "db-${ORDER_NUM}-*.dump" \
+            -o -name "filestore-${ORDER_NUM}-*.tar.gz" \) \
+            -mtime +3 -delete
+          MANIFEST="$BACKUP_DIR/manifest.json"
+          printf \'[\n\' > "$MANIFEST"
+          FIRST=1
+          for FILE in $(ls -t "$BACKUP_DIR"/db-${ORDER_NUM}-*.dump \
+            "$BACKUP_DIR"/filestore-${ORDER_NUM}-*.tar.gz 2>/dev/null); do
+            FNAME=$(basename "$FILE")
+            FSIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+            FMTIME=$(stat -c%Y "$FILE" 2>/dev/null || echo 0)
+            TYPE="db"
+            echo "$FNAME" | grep -q "^filestore-" && TYPE="filestore"
+            if [ "$FIRST" = "0" ]; then printf \',\n\' >> "$MANIFEST"; fi
+            printf \'  {"name":"%s","size":%s,"mtime":%s,"type":"%s"}\' \
+              "$FNAME" "$FSIZE" "$FMTIME" "$TYPE" >> "$MANIFEST"
+            FIRST=0
+          done
+          printf \']\n\' >> "$MANIFEST"
+          URL=$(cat /etc/rfm-webhook/url 2>/dev/null || echo "")
+          SECRET=$(cat /etc/rfm-webhook/secret 2>/dev/null || echo "")
+          SID=$(cat /etc/rfm-webhook/service_id 2>/dev/null || echo "")
+          if [ -n "$URL" ] && [ -n "$SECRET" ] && [ -n "$SID" ]; then
+            PAYLOAD=$(printf \
+              \'{"service_id":%s,"order_num":"%s","secret":"%s","files":%s}\' \
+              "$SID" "$ORDER_NUM" "$SECRET" "$(cat $MANIFEST)")
+            curl -sf -X POST -H "Content-Type: application/json" \
+              -d "$PAYLOAD" "$URL" || true
+          fi
+          SCRIPT
+          chmod +x /backup.sh
+          echo "0 3 * * * /backup.sh >> /var/log/backup.log 2>&1" | crontab -
+          crond -f -l 2
         env:
         - name: PGPASSWORD
           valueFrom:
