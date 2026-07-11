@@ -1831,6 +1831,9 @@ function rancherfleet_handleTakeBackup(array $params, $namespace, $orderNum)
                 RancherFleet\Logger::error("takeBackup: warning - failed to clear cache: " . $cacheEx->getMessage());
             }
 
+            RancherFleet\Logger::info("takeBackup: waiting for webhook to repopulate cache");
+            sleep(3);
+
             RancherFleet\Logger::info("takeBackup: SUCCESS");
             rancherfleet_logHistory($params, 'Backup Taken', 'Manual backup completed');
             return 'backup_success:Backup completed successfully. Your files are now available for download.';
@@ -6502,6 +6505,7 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-error">&#10007; Restore failed: ' . htmlspecialchars(substr($message, strlen('backup_restore_error:'))) . '</div>';
     } elseif (strpos($message, 'backup_success:') === 0) {
         $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars(substr($message, strlen('backup_success:'))) . '</div>';
+        $html .= '<script>setTimeout(function(){ window.location.reload(); }, 2000);</script>';
     } elseif (strpos($message, 'backup_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('backup_error:'))) . '</div>';
     } elseif (strpos($message, 'custom_url_success:') === 0) {
