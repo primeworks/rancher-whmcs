@@ -1615,9 +1615,9 @@ function rancherfleet_handleBackupRestore(array $params, $namespace, $orderNum, 
  */
 function rancherfleet_handleTakeBackup(array $params, $namespace, $orderNum)
 {
-    RancherFleet\Logger::info("takeBackup: starting for {$namespace}");
-
     try {
+        RancherFleet\Logger::info("takeBackup: starting for {$namespace}");
+
         list($rancher) = rancherfleet_buildClients($params);
         $serviceId = (int)$params['serviceid'];
 
@@ -6470,6 +6470,10 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
         $html .= '<div class="rfm-alert-success">&#10003; Backup restored successfully. Your instance will be back online shortly.</div>';
     } elseif (strpos($message, 'backup_restore_error:') === 0) {
         $html .= '<div class="rfm-alert-error">&#10007; Restore failed: ' . htmlspecialchars(substr($message, strlen('backup_restore_error:'))) . '</div>';
+    } elseif (strpos($message, 'backup_success:') === 0) {
+        $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars(substr($message, strlen('backup_success:'))) . '</div>';
+    } elseif (strpos($message, 'backup_error:') === 0) {
+        $html .= '<div class="rfm-alert-error">&#10007; ' . htmlspecialchars(substr($message, strlen('backup_error:'))) . '</div>';
     } elseif (strpos($message, 'custom_url_success:') === 0) {
         $subdomain = substr($message, strlen('custom_url_success:'));
         $html .= '<div class="rfm-alert-success">&#10003; ' . htmlspecialchars($subdomain) . ' has been connected. Your SSL certificate will be issued automatically within a few minutes.</div>';
