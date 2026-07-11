@@ -6720,7 +6720,7 @@ function rancherfleet_clientAreaHtml(array $params, $namespace, $message = '')
 
         // Pod rows
         if (!empty($status['pods'])) {
-            $html .= '<div style="margin-top:12px;">';
+            $html .= '<div style="margin-top:12px;max-height:200px;overflow-y:auto;border:1px solid #f0f0f0;border-radius:4px;padding:8px;">';
             foreach ($status['pods'] as $pod) {
                 $readyIcon  = $pod['ready']  ? '<span style="color:#27ae60;">&#10003;</span>' : '<span style="color:#e74c3c;">&#10007;</span>';
                 $restartStr = $pod['restarts'] > 0
