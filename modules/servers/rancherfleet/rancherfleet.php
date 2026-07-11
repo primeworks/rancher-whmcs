@@ -721,14 +721,16 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
             $fname    = isset($f['name']) ? $f['name'] : '';
             $fsize    = isset($f['size']) ? (int)$f['size'] : 0;
             $ftype    = isset($f['type']) ? $f['type'] : 'unknown';
+            $fmtime   = isset($f['mtime']) ? (int)$f['mtime'] : 0;
             $sizeStr  = $fsize > 1048576
                 ? number_format($fsize / 1048576, 1) . ' MB'
                 : number_format($fsize / 1024, 1) . ' KB';
+            $timeStr  = $fmtime ? date('M j, Y g:i A', $fmtime) : 'Unknown';
             $typeLabel = $ftype === 'db' ? '&#128200; Database' : '&#128196; Filestore';
             $typeColor = $ftype === 'db' ? '#2980b9' : '#27ae60';
 
-            $html .= '<div style="display:flex;align-items:center;justify-content:space-between;'
-                   . 'padding:7px 0;border-bottom:1px solid #f8f8f8;font-size:12px;">';
+            $html .= '<div style="display:flex;flex-direction:column;gap:2px;padding:7px 0;border-bottom:1px solid #f8f8f8;font-size:12px;">';
+            $html .= '<div style="display:flex;align-items:center;justify-content:space-between;">';
             $html .= '<span><span style="color:' . $typeColor . ';font-weight:bold;">' . $typeLabel . '</span>'
                    . ' &mdash; <span style="color:#888;">' . htmlspecialchars($sizeStr) . '</span></span>';
 
@@ -760,6 +762,10 @@ function rancherfleet_backupPanelHtml(array $params, $namespace, $orderNum, $ser
             } else {
                 $html .= '<span style="font-size:11px;color:#aaa;">Actions unavailable — Backup Auth Secret not configured</span>';
             }
+
+            $html .= '</div>';
+
+            $html .= '<span style="color:#aaa;font-size:11px;">' . htmlspecialchars($timeStr) . '</span>';
 
             $html .= '</div>';
         }
