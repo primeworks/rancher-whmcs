@@ -2,7 +2,7 @@ name: Deploy to cPanel
 
 on:
   push:
-    branches: [ main ]
+    branches: [ whmcs-module ]
 
 jobs:
   deploy:

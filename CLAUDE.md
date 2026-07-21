@@ -1,8 +1,19 @@
 # RancherFleet WHMCS Module — Repository Overview
 
-## What this repo is
+## Repository Structure
 
-This repository contains the WHMCS provisioning module (`rancherfleet`) that manages
+**Primary Repo:** `primeworks/rancher` (single unified repository)
+**This Branch:** `whmcs-module` (WHMCS server provisioning module)
+**Related Branches:** 
+- `backup-server` — cluster infrastructure (nginx, openupgrade pipeline)
+- `odoo-0000` — Odoo instance template for Fleet
+- `whmcs-client-{orderNum}` — per-client Fleet manifests (dynamically created)
+
+**Local Path:** `Z:\git\RancherFleet` (all branches cloned from primeworks/rancher)
+
+## What this branch contains
+
+The `whmcs-module` branch contains the WHMCS provisioning module (`rancherfleet`) that manages
 Odoo instances deployed via Rancher Fleet GitOps on a Kubernetes cluster. It handles:
 
 - Automated provisioning of Odoo instances (namespace, GitHub branch, Fleet GitRepo)
@@ -56,13 +67,35 @@ Odoo instances deployed via Rancher Fleet GitOps on a Kubernetes cluster. It han
 
 ## Deployment
 
-**Automated:** Every push to `main` triggers GitHub Actions (`.github/workflows/deploy.yml`)
+**Automated:** Every push to the `whmcs-module` branch triggers GitHub Actions (`.github/workflows/deploy.yml`)
 which FTPs the changed files to the cPanel server at `/www/host.webdiscode.com/`.
 
 **Manual:** Upload files via cPanel File Manager if Actions is unavailable.
 
 After deploying `rancherfleet.php`, no WHMCS cache flush is needed — PHP files are
 read on each request.
+
+## Related repositories and branches
+
+All code is now consolidated in `primeworks/rancher`. The repository contains multiple
+branches for different purposes:
+
+| Branch | Purpose | Content |
+|--------|---------|---------|
+| `whmcs-module` | WHMCS server provisioning module | `modules/servers/rancherfleet/`, `includes/hooks/` |
+| `backup-server` | Cluster infrastructure | nginx, openupgrade pipeline, support containers |
+| `odoo-0000` | Odoo instance template | Fleet-managed manifests, backup sidecar, pod specs |
+| `whmcs-client-{orderNum}` | Per-client Fleet manifests | Client-specific deployments (dynamically created) |
+
+**Previous separate repositories (now consolidated):**
+- `primeworks/rancher-whmcs` → `whmcs-module` branch in `primeworks/rancher`
+
+**Cloning for local development:**
+```bash
+git clone https://github.com/primeworks/rancher.git
+cd rancher
+git checkout whmcs-module
+```
 
 ## Key infrastructure
 
