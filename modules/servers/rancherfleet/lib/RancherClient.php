@@ -862,7 +862,7 @@ class RancherClient
      * Rancher level, not through the kubectl-proxy cluster endpoint.
      *
      * @param  string $method
-     * @param  string $path    e.g. /v1/fleet.cattle.io.gitrepos/fleet-default
+     * @param  string $path    e.g. /v1/fleet.cattle.io.gitrepos/cattle-fleet-system
      * @param  array  $body
      * @return array
      */

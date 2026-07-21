@@ -93,6 +93,9 @@ class FleetHelper
             ),
         );
 
+        // Use the pre-created private repo secret in cattle-fleet-system
+        $spec['clientSecretName'] = 'rancher-private-repo-secret';
+
         if ($this->repoPrivate) {
             if (!empty($this->gitSshKey)) {
                 $this->createSshSecret($gitRepoName . '-ssh');

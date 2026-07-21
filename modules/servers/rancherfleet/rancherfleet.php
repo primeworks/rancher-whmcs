@@ -929,7 +929,7 @@ function rancherfleet_buildClients(array $params)
     $fleet = new RancherFleet\FleetHelper(
         $rancher,
         $targetClusterName,
-        isset($cfg['fleet_namespace'])     ? $cfg['fleet_namespace']    : 'fleet-default',
+        isset($cfg['fleet_namespace'])     ? $cfg['fleet_namespace']    : 'cattle-fleet-system',
         isset($cfg['github_owner'])        ? $cfg['github_owner']       : '',
         isset($cfg['github_repo'])         ? $cfg['github_repo']        : '',
         isset($cfg['github_branch'])       ? $cfg['github_branch']      : 'main',
@@ -3446,7 +3446,7 @@ function rancherfleet_CreateGitRepo(array $params)
  * argument list, which caused:
  *   - GitRepo objects to be created in the wrong Fleet namespace
  *     (the downstream cluster ID was used as the namespace instead of
- *     the configured fleet_namespace, e.g. 'fleet-default')
+ *     the configured fleet_namespace, e.g. 'cattle-fleet-system')
  *   - spec.targets[].clusterName to be set to the Fleet management cluster
  *     ID/name ('local' by default) instead of the target cluster's
  *     DISPLAY NAME — so Fleet never matched the bundle to any registered
@@ -8626,7 +8626,7 @@ function rancherfleet_CleanupStaging(array $params)
 
         // 3. Delete Fleet GitRepo
         try {
-            $rancher->deleteFleetGitRepo('fleet-default', $gitrepo);
+            $rancher->deleteFleetGitRepo('cattle-fleet-system', $gitrepo);
             RancherFleet\Logger::info("CleanupStaging: GitRepo deleted");
         } catch (\Exception $gitrepoEx) {
             RancherFleet\Logger::error("CleanupStaging: GitRepo deletion error (non-fatal): " . $gitrepoEx->getMessage());
